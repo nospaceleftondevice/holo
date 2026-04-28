@@ -1,0 +1,12 @@
+{
+  "name": "@holo/bookmarklet",
+  "private": true,
+  "type": "module",
+  "description": "In-page agent for the holo browser-automation primitive (bookmarklet payload).",
+  "scripts": {
+    "test": "node --test test/framing.test.js"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
