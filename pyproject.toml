@@ -21,7 +21,9 @@ classifiers = [
   "Programming Language :: Python :: 3.12",
   "Topic :: Software Development :: Testing",
 ]
-dependencies = []
+dependencies = [
+  "pyobjc-framework-Quartz>=10.0; sys_platform == 'darwin'",
+]
 
 [project.optional-dependencies]
 dev = [
