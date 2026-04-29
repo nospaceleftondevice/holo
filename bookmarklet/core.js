@@ -17,22 +17,28 @@
 // from Node tests without a DOM. Browser access is gated behind
 // install() / installInPopup().
 
+import qrcode from "qrcode-generator";
+
 import { decodeFrame, encodeFrame } from "./framing.js";
 import { DispatchError, dispatch } from "./dispatch.js";
-import { encodeFramedTitle, encodePlainMarker } from "./title.js";
+import { encodePlainMarker } from "./title.js";
 
 const POPUP_NAME = "holo_console";
-// Width matters for correctness, not just looks: macOS visually
-// truncates the title bar with a Unicode ellipsis when it doesn't
-// fit, and `kCGWindowName` (what the daemon reads) returns the
-// truncated form on Chrome. 800 px fits ~120 chars of title at
-// default font size, which covers calibration plus single-frame
-// replies for short payloads. Larger payloads use Reassembler to
-// chunk across multiple title frames.
-const POPUP_FEATURES = "popup=yes,width=800,height=200,resizable=yes";
+// Width is no longer load-bearing for the title channel — replies
+// now go via QR code rendered into a canvas, so OS-level title
+// truncation is irrelevant. The popup just needs to be tall enough
+// to fit a readable QR plus the paste textarea.
+const POPUP_FEATURES = "popup=yes,width=520,height=560,resizable=yes";
 const POPUP_TITLE = "holo console";
 const READY_TEXT = "holo console — keep this window open";
 const HOLO_MARKER_TAIL_RE = /\s*\[holo:[^\]]+\]\s*$/;
+// QR canvas size in pixels. Larger canvas = more reliable Vision
+// decode at the cost of a bigger popup. 480 px gives the daemon
+// plenty of margin to find and decode the symbol.
+const QR_CANVAS_PX = 480;
+// QR error correction. "M" gives ~15 % redundancy — comfortable for
+// in-popup rendering where the daemon captures pristine pixels.
+const QR_ECL = "M";
 
 /**
  * Strip a trailing holo marker (framed or plain) from a title string.
@@ -83,14 +89,22 @@ export function install() {
  */
 export function installInPopup(popupWindow, openerWindow, session) {
   const popupDoc = popupWindow.document;
-  const panel = buildPopupBody(popupDoc);
+  const { textarea: panel, canvas: qrCanvas } = buildPopupBody(popupDoc);
 
   const state = {
     session,
     popupWindow,
     openerWindow,
     panel,
-    originalTitle: POPUP_TITLE,
+    qrCanvas,
+    // The OS truncates window titles longer than ~70 chars with U+2026.
+    // "holo console " (13) + "[holo:cal:" (10) + 36-char UUID + "]" (1)
+    // + " - Google Chrome" (16) ≈ 76 — over the limit. Dropping the
+    // prefix makes the cal/bye markers ≈ 63 chars, safely under. The
+    // visible window title becomes the marker itself, which is fine
+    // for a transient tool popup and incidentally signals to the user
+    // that the daemon is connected.
+    originalTitle: "",
     titleObserver: null,
     lastWrittenTitle: null,
   };
@@ -166,8 +180,9 @@ export function installInPopup(popupWindow, openerWindow, session) {
 }
 
 /**
- * Build the popup's paste target — a <textarea> filling the body.
- * Returns the textarea so callers can attach listeners.
+ * Build the popup body: a small <textarea> paste target on top, and a
+ * <canvas> below where reply QR codes are rendered for the daemon to
+ * capture via Vision. Returns both elements.
  *
  * Why a textarea (not body[contenteditable="true"]): Chromium routes
  * synthetic Cmd+V keystrokes (from osascript / pyautogui / CGEvent)
@@ -175,6 +190,12 @@ export function installInPopup(popupWindow, openerWindow, session) {
  * Real textareas pick up both reliably; contenteditable on body has
  * been observed to drop the synthetic ones, breaking the daemon →
  * page channel.
+ *
+ * Why a canvas QR for replies: macOS WindowServer truncates window
+ * titles longer than ~70 chars with a U+2026 ellipsis — that
+ * truncation happens at the OS level and is independent of popup
+ * width, breaking the title-channel for any non-trivial reply
+ * payload. Pixel capture has no such limit and works under any CSP.
  */
 export function buildPopupBody(popupDoc) {
   popupDoc.title = POPUP_TITLE;
@@ -184,6 +205,8 @@ export function buildPopupBody(popupDoc) {
     padding: "0",
     background: "rgb(15, 30, 15)",
     overflow: "hidden",
+    display: "flex",
+    flexDirection: "column",
   });
 
   const textarea = popupDoc.createElement("textarea");
@@ -194,9 +217,9 @@ export function buildPopupBody(popupDoc) {
   Object.assign(textarea.style, {
     display: "block",
     width: "100%",
-    height: "100vh",
+    height: "60px",
     margin: "0",
-    padding: "12px",
+    padding: "8px 12px",
     border: "none",
     background: "rgb(15, 30, 15)",
     color: "rgb(120, 200, 120)",
@@ -207,9 +230,26 @@ export function buildPopupBody(popupDoc) {
     outline: "none",
     resize: "none",
     caretColor: "transparent",
+    flex: "0 0 auto",
   });
   body.appendChild(textarea);
-  return textarea;
+
+  const canvas = popupDoc.createElement("canvas");
+  canvas.id = "__holo_qr__";
+  canvas.width = QR_CANVAS_PX;
+  canvas.height = QR_CANVAS_PX;
+  canvas.setAttribute("aria-label", "holo reply channel");
+  Object.assign(canvas.style, {
+    display: "block",
+    width: `${QR_CANVAS_PX}px`,
+    height: `${QR_CANVAS_PX}px`,
+    margin: "8px auto",
+    background: "white",
+    flex: "0 0 auto",
+  });
+  body.appendChild(canvas);
+
+  return { textarea, canvas };
 }
 
 function onPaste(event, state) {
@@ -285,17 +325,41 @@ function sendReply(state, originalFrame, result, log = () => {}) {
     id: originalFrame.id,
   });
   log("sendReply frame encoded", { replyLen: replyJson.length, preview: replyJson.slice(0, 60) });
-  writeFramedTitle(state, replyJson, log);
+  renderQR(state.qrCanvas, replyJson, log);
   log("sendReply done");
 }
 
-function writeFramedTitle(state, frameJson, log = () => {}) {
-  log("writeFramedTitle enter", { jsonLen: frameJson.length, originalTitle: state.originalTitle });
-  const title = encodeFramedTitle(frameJson, state.originalTitle);
-  log("writeFramedTitle encoded", { titleLen: title.length, preview: title.slice(0, 80) });
-  state.lastWrittenTitle = title;
-  state.popupWindow.document.title = title;
-  log("writeFramedTitle title now", { actual: state.popupWindow.document.title.slice(0, 80) });
+/**
+ * Render `text` as a QR code into `canvas`, filling the canvas with a
+ * white background so any prior reply is fully overwritten and the
+ * daemon never decodes a stale frame.
+ *
+ * Uses `qrcode-generator`'s automatic version selection (typeNumber=0)
+ * with ECC level "M" (~15 % redundancy). Frames up to ~1.6 KB fit at
+ * v20-M; larger payloads will throw, which surfaces as a SENDREPLY
+ * error in the popup console — Phase 1 will move large payloads onto
+ * the HTTP channel before that becomes a real concern.
+ */
+function renderQR(canvas, text, log = () => {}) {
+  log("renderQR enter", { textLen: text.length });
+  const qr = qrcode(0, QR_ECL);
+  qr.addData(text);
+  qr.make();
+  const ctx = canvas.getContext("2d");
+  const moduleCount = qr.getModuleCount();
+  const moduleSize = Math.floor(canvas.width / (moduleCount + 2));
+  const offset = Math.floor((canvas.width - moduleSize * moduleCount) / 2);
+  ctx.fillStyle = "white";
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+  ctx.fillStyle = "black";
+  for (let r = 0; r < moduleCount; r++) {
+    for (let c = 0; c < moduleCount; c++) {
+      if (qr.isDark(r, c)) {
+        ctx.fillRect(offset + c * moduleSize, offset + r * moduleSize, moduleSize, moduleSize);
+      }
+    }
+  }
+  log("renderQR done", { moduleCount, moduleSize });
 }
 
 function writePlainMarker(state, marker) {

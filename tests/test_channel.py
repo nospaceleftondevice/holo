@@ -24,7 +24,13 @@ def _w(id, title, owner="Google Chrome", pid=0, bounds=None):
 
 
 def _make_reply_title(*, frame_id, session, result, original_title="Page"):
-    """Build a [holo:1:...] title that core.js would produce in response to a cmd."""
+    """Build a [holo:1:...] title that the legacy bookmarklet would produce.
+
+    Still used by the non-darwin / title-channel send_command path. On
+    darwin the bookmarklet renders replies as QR codes and the daemon
+    captures pixels via `_poll_reply_qr`; tests on that path use
+    `_make_reply_qr` instead.
+    """
     reply_frame = framing.Frame(
         session=session,
         type="result",
@@ -33,6 +39,23 @@ def _make_reply_title(*, frame_id, session, result, original_title="Page"):
     )
     encoded = base64.b64encode(reply_frame.encode().encode("utf-8")).decode("ascii")
     return f"{original_title} [holo:1:{encoded}]"
+
+
+def _make_reply_qr(*, frame_id, session, result):
+    """Encode a reply frame the way the bookmarklet would draw into its QR canvas.
+
+    On darwin, `_poll_reply_qr` calls `capture_window_qr`, which returns
+    the QR's payload string — a frame-encoded JSON envelope. Tests that
+    patch `capture_window_qr` use this helper to stand in for what the
+    bookmarklet would render.
+    """
+    reply_frame = framing.Frame(
+        session=session,
+        type="result",
+        data=json.dumps(result).encode("utf-8"),
+        id=frame_id,
+    )
+    return reply_frame.encode()
 
 
 @pytest.fixture
@@ -109,9 +132,11 @@ class TestSendCommand:
         # exercised by clipboard.paste, which is what these tests mock.
         ch._window_owner = ""
 
-        # Initially the window shows just the calibration beacon.
+        # Window stays in the list so existence checks pass; the reply
+        # arrives via QR (darwin) or title (other platforms).
         current_title = {"value": "Page [holo:cal:sess-1]"}
         fake_list_windows.side_effect = lambda: [_w(42, current_title["value"])]
+        qr_payload = {"value": None}
 
         def respond(text):
             sent = framing.decode(text)
@@ -120,10 +145,16 @@ class TestSendCommand:
                 session="sess-1",
                 result={"pong": True},
             )
+            qr_payload["value"] = _make_reply_qr(
+                frame_id=sent.id,
+                session="sess-1",
+                result={"pong": True},
+            )
 
         fake_paste.side_effect = respond
 
-        assert ch.send_command({"op": "ping"}) == {"pong": True}
+        with patch("holo._macos.capture_window_qr", side_effect=lambda _w: qr_payload["value"]):
+            assert ch.send_command({"op": "ping"}) == {"pong": True}
         fake_paste.assert_called_once()
 
     def test_ignores_replies_with_mismatched_id(self, fake_list_windows, fake_paste):
@@ -134,9 +165,13 @@ class TestSendCommand:
         stale_title = _make_reply_title(
             frame_id="stale-id", session="sess", result={"pong": True}
         )
+        stale_qr = _make_reply_qr(
+            frame_id="stale-id", session="sess", result={"pong": True}
+        )
         fake_list_windows.return_value = [_w(42, stale_title)]
-        with pytest.raises(CommandError):
-            ch.send_command({"op": "ping"})
+        with patch("holo._macos.capture_window_qr", return_value=stale_qr):
+            with pytest.raises(CommandError):
+                ch.send_command({"op": "ping"})
 
     def test_ignores_replies_with_mismatched_session(self, fake_list_windows, fake_paste):
         ch = Channel(poll_interval=0.001, default_timeout=0.1)
@@ -145,6 +180,7 @@ class TestSendCommand:
         # A reply from a different session — ignored.
         cur_title = {"value": "Page"}
         fake_list_windows.side_effect = lambda: [_w(42, cur_title["value"])]
+        qr_payload = {"value": None}
 
         def respond(text):
             sent = framing.decode(text)
@@ -153,10 +189,16 @@ class TestSendCommand:
                 session="sess-B",  # wrong session
                 result={"pong": True},
             )
+            qr_payload["value"] = _make_reply_qr(
+                frame_id=sent.id,
+                session="sess-B",
+                result={"pong": True},
+            )
 
         fake_paste.side_effect = respond
-        with pytest.raises(CommandError):
-            ch.send_command({"op": "ping"})
+        with patch("holo._macos.capture_window_qr", side_effect=lambda _w: qr_payload["value"]):
+            with pytest.raises(CommandError):
+                ch.send_command({"op": "ping"})
 
     def test_raises_if_not_calibrated(self):
         ch = Channel()
@@ -179,6 +221,7 @@ class TestSendCommand:
         cur_title = {"value": "Page"}
         fake_list_windows.side_effect = lambda: [_w(42, cur_title["value"])]
         captured = {}
+        qr_payload = {"value": None}
 
         def respond(text):
             sent = framing.decode(text)
@@ -186,10 +229,14 @@ class TestSendCommand:
             cur_title["value"] = _make_reply_title(
                 frame_id=sent.id, session="sess", result={"ok": True}
             )
+            qr_payload["value"] = _make_reply_qr(
+                frame_id=sent.id, session="sess", result={"ok": True}
+            )
 
         fake_paste.side_effect = respond
 
-        ch.send_command({"op": "read_global", "path": "R2D2_VERSION"})
+        with patch("holo._macos.capture_window_qr", side_effect=lambda _w: qr_payload["value"]):
+            ch.send_command({"op": "read_global", "path": "R2D2_VERSION"})
 
         sent = captured["frame"]
         assert sent.session == "sess"
@@ -221,11 +268,15 @@ class TestActivation:
             _w(42, cur_title["value"], pid=1234, bounds=(100.0, 50.0, 320.0, 160.0)),
         ]
         order = []
+        qr_payload = {"value": None}
 
         def respond(text):
             order.append(("paste", text[:8]))
             sent = framing.decode(text)
             cur_title["value"] = _make_reply_title(
+                frame_id=sent.id, session="sess", result={"pong": True}
+            )
+            qr_payload["value"] = _make_reply_qr(
                 frame_id=sent.id, session="sess", result={"pong": True}
             )
 
@@ -240,6 +291,7 @@ class TestActivation:
                 "holo._macos.click_at",
                 side_effect=lambda x, y: order.append(("click", x, y)),
             ),
+            patch("holo._macos.capture_window_qr", side_effect=lambda _w: qr_payload["value"]),
             patch("holo.channel.ACTIVATE_SETTLE_S", 0.0),
             patch("holo.channel.CLICK_SETTLE_S", 0.0),
         ):
@@ -262,16 +314,23 @@ class TestActivation:
         cur_title = {"value": "Page"}
         fake_list_windows.side_effect = lambda: [_w(42, cur_title["value"])]
         called = []
+        qr_payload = {"value": None}
 
         def respond(text):
             sent = framing.decode(text)
             cur_title["value"] = _make_reply_title(
                 frame_id=sent.id, session="sess", result={"pong": True}
             )
+            qr_payload["value"] = _make_reply_qr(
+                frame_id=sent.id, session="sess", result={"pong": True}
+            )
 
         fake_paste.side_effect = respond
 
-        with patch("holo._macos.activate_pid", side_effect=lambda p: called.append(p)):
+        with (
+            patch("holo._macos.activate_pid", side_effect=lambda p: called.append(p)),
+            patch("holo._macos.capture_window_qr", side_effect=lambda _w: qr_payload["value"]),
+        ):
             ch.send_command({"op": "ping"})
 
         assert called == []
@@ -292,10 +351,14 @@ class TestActivation:
             _w(42, cur_title["value"], pid=1234, bounds=None),
         ]
         clicks = []
+        qr_payload = {"value": None}
 
         def respond(text):
             sent = framing.decode(text)
             cur_title["value"] = _make_reply_title(
+                frame_id=sent.id, session="sess", result={"pong": True}
+            )
+            qr_payload["value"] = _make_reply_qr(
                 frame_id=sent.id, session="sess", result={"pong": True}
             )
 
@@ -304,6 +367,7 @@ class TestActivation:
         with (
             patch("holo._macos.activate_pid", return_value=True),
             patch("holo._macos.click_at", side_effect=lambda x, y: clicks.append((x, y))),
+            patch("holo._macos.capture_window_qr", side_effect=lambda _w: qr_payload["value"]),
             patch("holo.channel.ACTIVATE_SETTLE_S", 0.0),
             patch("holo.channel.CLICK_SETTLE_S", 0.0),
         ):
@@ -334,6 +398,7 @@ class TestActivation:
         order = []
 
         captured = {}
+        qr_payload = {"value": None}
 
         def fake_write(text):
             order.append(("clipboard_write", text[:8]))
@@ -341,9 +406,14 @@ class TestActivation:
 
         def fake_keystroke(name):
             order.append(("keystroke", name))
-            # Simulate the popup receiving the paste and writing the
-            # reply to its title, using the same frame id we just sent.
+            # Simulate the popup receiving the paste and rendering the
+            # reply as a QR code, using the same frame id we just sent.
             cur_title["value"] = _make_reply_title(
+                frame_id=captured["frame"].id,
+                session="sess",
+                result={"ok": True},
+            )
+            qr_payload["value"] = _make_reply_qr(
                 frame_id=captured["frame"].id,
                 session="sess",
                 result={"ok": True},
@@ -357,6 +427,7 @@ class TestActivation:
             ),
             patch("holo._macos.click_at", side_effect=lambda x, y: order.append(("click", x, y))),
             patch("holo._macos.keystroke_paste", side_effect=fake_keystroke),
+            patch("holo._macos.capture_window_qr", side_effect=lambda _w: qr_payload["value"]),
             patch("holo.clipboard.write", side_effect=fake_write),
             patch("holo.channel.ACTIVATE_SETTLE_S", 0.0),
             patch("holo.channel.CLICK_SETTLE_S", 0.0),

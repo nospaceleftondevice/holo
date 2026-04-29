@@ -111,6 +111,66 @@ def keystroke_paste(app_name: str | None = None) -> bool:
         return False
 
 
+def capture_window_qr(window_id: int) -> str | None:
+    """Capture the given window's pixels and decode any QR code present.
+
+    The popup renders its replies as QR codes on a canvas because the
+    title channel is OS-truncated for any payload longer than ~70
+    characters. Pixel capture has no such limit and is CSP-immune,
+    so it works as the universal page → daemon channel.
+
+    Returns the QR's payload string, or None if:
+    - the window can't be captured (closed, off-screen, no permission)
+    - no QR is detected in the captured image
+    - more than one QR is detected (we expect exactly one)
+
+    Uses the macOS Vision framework, which ships with the OS — no
+    third-party native dependency.
+    """
+    from Quartz import (  # type: ignore[import-not-found]
+        CGWindowListCreateImage,
+        kCGNullWindowID,  # noqa: F401  (kept for type-stub completeness)
+        kCGWindowImageBoundsIgnoreFraming,
+        kCGWindowImageDefault,
+        kCGWindowListOptionIncludingWindow,
+    )
+
+    image_ref = CGWindowListCreateImage(
+        ((0, 0), (0, 0)),  # CGRectNull — capture the whole window
+        kCGWindowListOptionIncludingWindow,
+        window_id,
+        kCGWindowImageDefault | kCGWindowImageBoundsIgnoreFraming,
+    )
+    if image_ref is None:
+        return None
+
+    from Vision import (  # type: ignore[import-not-found]
+        VNDetectBarcodesRequest,
+        VNImageRequestHandler,
+    )
+
+    request = VNDetectBarcodesRequest.alloc().init()
+    request.setSymbologies_(["VNBarcodeSymbologyQR"])
+
+    handler = VNImageRequestHandler.alloc().initWithCGImage_options_(image_ref, None)
+    success, _err = handler.performRequests_error_([request], None)
+    if not success:
+        return None
+
+    results = request.results() or []
+    if not results:
+        return None
+
+    # We expect exactly one QR per popup at any given time. If the
+    # popup is mid-render we may briefly see zero or two; caller
+    # retries on a poll, so being strict here is safe.
+    payloads = [obs.payloadStringValue() for obs in results]
+    payloads = [p for p in payloads if p]
+    if len(payloads) != 1:
+        return None
+    return str(payloads[0])
+
+
 def click_at(x: float, y: float) -> None:
     """Synthesize a left-click at screen coordinates (x, y).
 

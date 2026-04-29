@@ -142,12 +142,22 @@ describe("core.js module exports", () => {
 describe("buildPopupBody", () => {
   it("creates a textarea paste target inside the body", () => {
     const win = stubWindow();
-    const target = buildPopupBody(win.document);
-    assert.equal(target.tagName, "textarea");
-    assert.equal(win.document.body.children[0], target);
-    assert.equal(target.spellcheck, false);
-    assert.equal(target.attributes["aria-label"], "holo paste target");
-    assert.equal(target.attributes["id"] ?? target.id, "__holo_paste_target__");
+    const { textarea } = buildPopupBody(win.document);
+    assert.equal(textarea.tagName, "textarea");
+    assert.equal(win.document.body.children[0], textarea);
+    assert.equal(textarea.spellcheck, false);
+    assert.equal(textarea.attributes["aria-label"], "holo paste target");
+    assert.equal(textarea.attributes["id"] ?? textarea.id, "__holo_paste_target__");
+  });
+
+  it("creates a QR canvas as a sibling of the textarea", () => {
+    const win = stubWindow();
+    const { canvas } = buildPopupBody(win.document);
+    assert.equal(canvas.tagName, "canvas");
+    assert.equal(win.document.body.children[1], canvas);
+    assert.equal(canvas.attributes["aria-label"], "holo reply channel");
+    assert.ok(canvas.width > 0);
+    assert.equal(canvas.width, canvas.height);
   });
 
   it("sets the popup document title", () => {
@@ -158,8 +168,8 @@ describe("buildPopupBody", () => {
 
   it("seeds the textarea with a 'keep this window open' note", () => {
     const win = stubWindow();
-    const target = buildPopupBody(win.document);
-    assert.match(target.value, /keep this window open/);
+    const { textarea } = buildPopupBody(win.document);
+    assert.match(textarea.value, /keep this window open/);
   });
 });
 

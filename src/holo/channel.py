@@ -50,6 +50,9 @@ DEFAULT_BROWSERS: frozenset[str] = frozenset(
 
 DEFAULT_POLL_INTERVAL_S: float = 0.05
 DEFAULT_TIMEOUT_S: float = 5.0
+
+# Sentinel for `_poll_reply_*`: the locked window has disappeared.
+_WINDOW_GONE: object = object()
 # Time to wait after activating the target app before clicking, so
 # the OS has time to make it the key window. Empirically ~80–120 ms
 # is enough on a warm app; 200 ms gives generous headroom.
@@ -133,26 +136,55 @@ class Channel:
             clipboard.paste(text)
         budget = timeout if timeout is not None else self.default_timeout
         deadline = time.monotonic() + budget
+        # The reply channel is a QR code rendered into the popup's
+        # canvas. We capture the window's pixels and run Vision QR
+        # detection on each poll. QR-decode round-trip is ~50–100 ms
+        # vs ~1 ms for a title read, so we use a slower poll interval.
+        qr_poll_interval = max(self.poll_interval, 0.15)
+        reply_poller = self._poll_reply_qr if sys.platform == "darwin" else self._poll_reply_title
         while time.monotonic() < deadline:
-            current = self._read_window_title()
-            if current is None:
-                # Window has been closed or moved; abort with a clear error.
+            reply = reply_poller()
+            if reply == _WINDOW_GONE:
                 raise CommandError("locked window is no longer present")
-            framed_json = title_mod.decode_framed(current)
-            if framed_json:
-                try:
-                    reply = framing.decode(framed_json)
-                except framing.FrameError:
-                    time.sleep(self.poll_interval)
-                    continue
-                if (
-                    reply.id == frame.id
-                    and reply.session == self.session
-                    and reply.type == "result"
-                ):
-                    return json.loads(reply.data.decode("utf-8"))
-            time.sleep(self.poll_interval)
+            if (
+                reply is not None
+                and reply.id == frame.id
+                and reply.session == self.session
+                and reply.type == "result"
+            ):
+                return json.loads(reply.data.decode("utf-8"))
+            time.sleep(qr_poll_interval)
         raise CommandError(f"no reply for cmd within {budget}s")
+
+    def _poll_reply_qr(self) -> framing.Frame | object | None:
+        """Capture the locked window and decode any QR code present."""
+        from holo._macos import capture_window_qr
+
+        # Confirm the window still exists; capture_window_qr returns
+        # None for both 'window gone' and 'no QR yet', so we
+        # disambiguate by listing windows separately.
+        if self._read_window_title() is None:
+            return _WINDOW_GONE
+        payload = capture_window_qr(self._window_id) if self._window_id else None
+        if not payload:
+            return None
+        try:
+            return framing.decode(payload)
+        except framing.FrameError:
+            return None
+
+    def _poll_reply_title(self) -> framing.Frame | object | None:
+        """Legacy title-channel poll, kept for non-darwin platforms."""
+        current = self._read_window_title()
+        if current is None:
+            return _WINDOW_GONE
+        framed_json = title_mod.decode_framed(current)
+        if not framed_json:
+            return None
+        try:
+            return framing.decode(framed_json)
+        except framing.FrameError:
+            return None
 
     def _list_browser_windows(self) -> list[WindowInfo]:
         return [w for w in list_windows() if w.owner in self.browsers]
