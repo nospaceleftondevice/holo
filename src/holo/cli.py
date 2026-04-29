@@ -106,14 +106,20 @@ def _cmd_doctor() -> int:
     return 0
 
 
+_MANUAL_COUNTDOWN_S: int = 5
+
+
 def _cmd_demo(*, manual: bool = False) -> int:
     """End-to-end smoke test: read R2D2_VERSION through the channel.
 
     Pass `manual=True` (or run `holo demo --manual`) to skip the
-    automatic activate-and-click step. Useful when cross-app
-    activation is being denied by the OS — you click the popup body
-    yourself and press Enter to fire the paste.
+    automatic activate-and-click step and instead use a fixed
+    countdown: you click into the popup body and don't touch the
+    keyboard until the paste fires. Useful when cross-app activation
+    is being denied by the OS.
     """
+    import time
+
     from holo.channel import CalibrationError, Channel, CommandError
 
     print("holo demo — Phase 0 walking-skeleton" + (" (manual)" if manual else ""))
@@ -129,9 +135,13 @@ def _cmd_demo(*, manual: bool = False) -> int:
     print("     A small dark green 'holo console' popup will open — leave it.")
     if manual:
         print(
-            "     In manual mode, you'll be asked to click into the popup body"
+            f"     In manual mode, you'll have {_MANUAL_COUNTDOWN_S} s after"
+            " calibration to click"
         )
-        print("     and press Enter before the command is sent.")
+        print(
+            "     into the popup body. The paste fires automatically — don't"
+        )
+        print("     touch the keyboard once you've clicked.")
     else:
         print("     The daemon will raise it before each command, so you don't")
         print("     have to babysit focus.")
@@ -156,12 +166,16 @@ def _cmd_demo(*, manual: bool = False) -> int:
 
     if manual:
         # Disable the auto activate+click so the user can drive focus
-        # by hand. We just paste — whatever has keyboard focus when
-        # Cmd+V fires is what the bytes go to.
+        # by hand. We countdown without reading stdin — pressing Enter
+        # would steal focus back from the popup.
         ch._window_pid = 0
         print()
-        print("Manual mode: click anywhere in the green popup body to focus it,")
-        input("then press Enter here to send read_global(R2D2_VERSION)... ")
+        print("Manual mode: click anywhere in the GREEN popup body NOW.")
+        print("Don't touch the keyboard or any other window.")
+        print("The paste will fire automatically after the countdown.")
+        for i in range(_MANUAL_COUNTDOWN_S, 0, -1):
+            print(f"  {i}…", flush=True)
+            time.sleep(1.0)
 
     print()
     print("Sending read_global(R2D2_VERSION)…")
@@ -173,14 +187,52 @@ def _cmd_demo(*, manual: bool = False) -> int:
         print(f"❌ {e}", file=sys.stderr)
         print("   Possible causes:", file=sys.stderr)
         print("   - The popup didn't have OS keyboard focus when Cmd+V fired", file=sys.stderr)
-        print("     (try `holo demo --manual` to drive focus by hand)", file=sys.stderr)
+        print("     (try `holo demo --manual` and click the popup body yourself)", file=sys.stderr)
         print(
             "   - Accessibility permission missing (System Settings → Privacy & Security)",
             file=sys.stderr,
         )
+        print("   - osascript Automation prompt was denied — re-allow in", file=sys.stderr)
+        print("     System Settings → Privacy & Security → Automation", file=sys.stderr)
         return 1
 
     print(f"✓ result: {result}")
+    return 0
+
+
+def _cmd_focus() -> int:
+    """Diagnostic: activate + click into the locked window's body, no paste.
+
+    Calibrates against the live bookmarklet, then runs the same
+    activate-and-click sequence the demo uses before pasting — without
+    sending any keystroke. Lets you see *visually* whether the popup
+    comes to the foreground and whether the click hits the body.
+    """
+    import time
+
+    from holo.channel import CalibrationError, Channel
+
+    print("holo focus — diagnostic activate-and-click (no paste)")
+    print()
+    print("Open the holo console popup first (run holo demo, click the bookmark)")
+    print("and leave it visible. This command will calibrate against it, then")
+    print("activate + click. Watch whether the popup comes to the front and")
+    print("whether the click lands inside the green body.")
+    print()
+
+    ch = Channel(default_timeout=15.0)
+    print("Polling for calibration beacon (15s timeout)…")
+    try:
+        sid = ch.wait_for_calibration()
+    except CalibrationError as e:
+        print(f"❌ {e}", file=sys.stderr)
+        return 1
+    print(f"✓ calibrated · session={sid} window={ch._window_id} pid={ch._window_pid}")
+    print()
+    print("Activating + clicking in 3s — watch the popup…")
+    time.sleep(3.0)
+    ch._activate_target()
+    print("✓ done. Did the popup come to the front and receive the click?")
     return 0
 
 
@@ -188,6 +240,7 @@ COMMANDS = {
     "windows": _cmd_windows,
     "doctor": _cmd_doctor,
     "demo": _cmd_demo,
+    "focus": _cmd_focus,
 }
 
 
@@ -196,7 +249,7 @@ def main(argv: list[str] | None = None) -> int:
     if not args:
         print(
             f"holo {__version__} — try `holo --version`, `holo windows`, "
-            "`holo doctor`, or `holo demo`"
+            "`holo doctor`, `holo demo`, or `holo focus`"
         )
         return 0
     cmd = args[0]
