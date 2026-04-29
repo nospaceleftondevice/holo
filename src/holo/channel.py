@@ -22,6 +22,7 @@ channel when a Phase 1 caller actually needs it; today's commands
 from __future__ import annotations
 
 import json
+import sys
 import time
 from dataclasses import dataclass, field
 from typing import Any
@@ -49,6 +50,10 @@ DEFAULT_BROWSERS: frozenset[str] = frozenset(
 
 DEFAULT_POLL_INTERVAL_S: float = 0.05
 DEFAULT_TIMEOUT_S: float = 5.0
+# Time to wait after activating the target app before sending Cmd+V,
+# so the OS has time to make it the key window. Empirically ~80–120 ms
+# is enough on a warm app; 200 ms gives generous headroom.
+ACTIVATE_SETTLE_S: float = 0.2
 
 
 class CalibrationError(RuntimeError):
@@ -66,6 +71,7 @@ class Channel:
     default_timeout: float = DEFAULT_TIMEOUT_S
     session: str | None = None
     _window_id: int | None = None
+    _window_pid: int = 0
 
     def wait_for_calibration(self, *, timeout: float | None = None) -> str:
         """Poll browser windows for a `[holo:cal:<sid>]` beacon.
@@ -81,6 +87,7 @@ class Channel:
                 if marker and marker.startswith("cal:"):
                     self.session = marker[len("cal:") :]
                     self._window_id = win.id
+                    self._window_pid = win.pid
                     return self.session
             time.sleep(self.poll_interval)
         raise CalibrationError(f"no calibration beacon within {budget}s")
@@ -97,6 +104,7 @@ class Channel:
             )
         data = json.dumps(cmd).encode("utf-8")
         frame = framing.Frame(session=self.session, type="cmd", data=data)
+        self._activate_target()
         clipboard.paste(frame.encode())
         budget = timeout if timeout is not None else self.default_timeout
         deadline = time.monotonic() + budget
@@ -129,3 +137,19 @@ class Channel:
             if w.id == self._window_id:
                 return w.title
         return None
+
+    def _activate_target(self) -> None:
+        """Bring the locked window's app to the foreground before pasting.
+
+        Without this step, the synthesized Cmd+V lands in whatever app
+        currently has keyboard focus (the terminal we're running from,
+        a different browser window, …). On non-darwin platforms or when
+        the pid is unknown this is a no-op — callers must keep the
+        target window focused themselves.
+        """
+        if sys.platform != "darwin" or self._window_pid <= 0:
+            return
+        from holo._macos import activate_pid
+
+        if activate_pid(self._window_pid):
+            time.sleep(ACTIVATE_SETTLE_S)

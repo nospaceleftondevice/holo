@@ -19,8 +19,8 @@ from holo.channel import CalibrationError, Channel, CommandError
 from holo.windows import WindowInfo
 
 
-def _w(id, title, owner="Google Chrome"):
-    return WindowInfo(id=id, title=title, owner=owner, layer=0)
+def _w(id, title, owner="Google Chrome", pid=0):
+    return WindowInfo(id=id, title=title, owner=owner, layer=0, pid=pid)
 
 
 def _make_reply_title(*, frame_id, session, result, original_title="Page"):
@@ -51,11 +51,12 @@ class TestWaitForCalibration:
     def test_returns_session_from_beacon_and_locks_window(self, fake_list_windows):
         fake_list_windows.return_value = [
             _w(1, "Other - Chrome"),
-            _w(42, "GitHub [holo:cal:abc-123]"),
+            _w(42, "GitHub [holo:cal:abc-123]", pid=9876),
         ]
         ch = Channel(poll_interval=0.001, default_timeout=0.5)
         assert ch.wait_for_calibration() == "abc-123"
         assert ch._window_id == 42
+        assert ch._window_pid == 9876
 
     def test_ignores_non_browser_windows(self, fake_list_windows):
         fake_list_windows.return_value = [
@@ -193,3 +194,68 @@ class TestSendCommand:
             "op": "read_global",
             "path": "R2D2_VERSION",
         }
+
+
+class TestActivation:
+    """The daemon must activate the locked window's app before pasting,
+    otherwise the synthesized Cmd+V lands in whatever app currently has
+    keyboard focus (usually the terminal we're running from).
+    """
+
+    def test_activates_target_app_before_paste(self, fake_list_windows, fake_paste):
+        import sys
+
+        if sys.platform != "darwin":
+            pytest.skip("activation helper is darwin-only")
+        ch = Channel(poll_interval=0.001, default_timeout=2.0)
+        ch.session = "sess"
+        ch._window_id = 42
+        ch._window_pid = 1234
+        cur_title = {"value": "Page"}
+        fake_list_windows.side_effect = lambda: [_w(42, cur_title["value"])]
+        order = []
+
+        def fake_activate(pid):
+            order.append(("activate", pid))
+            return True
+
+        def respond(text):
+            order.append(("paste", text[:8]))
+            sent = framing.decode(text)
+            cur_title["value"] = _make_reply_title(
+                frame_id=sent.id, session="sess", result={"pong": True}
+            )
+
+        fake_paste.side_effect = respond
+
+        with (
+            patch("holo._macos.activate_pid", side_effect=fake_activate),
+            patch("holo.channel.ACTIVATE_SETTLE_S", 0.0),
+        ):
+            ch.send_command({"op": "ping"})
+
+        # Activation must come strictly before the paste keystroke.
+        assert order[0] == ("activate", 1234)
+        assert order[1][0] == "paste"
+
+    def test_skips_activation_when_pid_unknown(self, fake_list_windows, fake_paste):
+        ch = Channel(poll_interval=0.001, default_timeout=2.0)
+        ch.session = "sess"
+        ch._window_id = 42
+        ch._window_pid = 0  # unknown (e.g. older calibration path)
+        cur_title = {"value": "Page"}
+        fake_list_windows.side_effect = lambda: [_w(42, cur_title["value"])]
+        called = []
+
+        def respond(text):
+            sent = framing.decode(text)
+            cur_title["value"] = _make_reply_title(
+                frame_id=sent.id, session="sess", result={"pong": True}
+            )
+
+        fake_paste.side_effect = respond
+
+        with patch("holo._macos.activate_pid", side_effect=lambda p: called.append(p)):
+            ch.send_command({"op": "ping"})
+
+        assert called == []

@@ -23,6 +23,7 @@ def _entry(**overrides):
         "kCGWindowNumber": 42,
         "kCGWindowName": "Example - Chrome",
         "kCGWindowOwnerName": "Google Chrome",
+        "kCGWindowOwnerPID": 1234,
         "kCGWindowLayer": 0,
         "kCGWindowAlpha": 1.0,
     }
@@ -37,6 +38,7 @@ def test_parse_full_entry():
         title="Example - Chrome",
         owner="Google Chrome",
         layer=0,
+        pid=1234,
     )
 
 
@@ -51,6 +53,7 @@ def test_parse_missing_fields_use_defaults():
     assert info.title == ""
     assert info.owner == ""
     assert info.layer == 0
+    assert info.pid == 0
 
 
 def test_is_visible_filters_zero_alpha():
