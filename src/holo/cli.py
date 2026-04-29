@@ -106,11 +106,17 @@ def _cmd_doctor() -> int:
     return 0
 
 
-def _cmd_demo() -> int:
-    """End-to-end smoke test: read R2D2_VERSION through the channel."""
+def _cmd_demo(*, manual: bool = False) -> int:
+    """End-to-end smoke test: read R2D2_VERSION through the channel.
+
+    Pass `manual=True` (or run `holo demo --manual`) to skip the
+    automatic activate-and-click step. Useful when cross-app
+    activation is being denied by the OS — you click the popup body
+    yourself and press Enter to fire the paste.
+    """
     from holo.channel import CalibrationError, Channel, CommandError
 
-    print("holo demo — Phase 0 walking-skeleton")
+    print("holo demo — Phase 0 walking-skeleton" + (" (manual)" if manual else ""))
     print()
     print("Setup:")
     print("  1. (one-time) Build & install the bookmarklet:")
@@ -121,8 +127,14 @@ def _cmd_demo() -> int:
     print("  3. Open https://tai.sh (or any page exposing R2D2_VERSION).")
     print("  4. After this command starts polling, click the 🔧 holo bookmark.")
     print("     A small dark green 'holo console' popup will open — leave it.")
-    print("     The daemon will raise it before each command, so you don't")
-    print("     have to babysit focus.")
+    if manual:
+        print(
+            "     In manual mode, you'll be asked to click into the popup body"
+        )
+        print("     and press Enter before the command is sent.")
+    else:
+        print("     The daemon will raise it before each command, so you don't")
+        print("     have to babysit focus.")
     print()
     print("Run `holo doctor` first if you suspect a permissions issue.")
     print()
@@ -141,6 +153,16 @@ def _cmd_demo() -> int:
         return 1
 
     print(f"✓ calibrated · session={sid} window={ch._window_id}")
+
+    if manual:
+        # Disable the auto activate+click so the user can drive focus
+        # by hand. We just paste — whatever has keyboard focus when
+        # Cmd+V fires is what the bytes go to.
+        ch._window_pid = 0
+        print()
+        print("Manual mode: click anywhere in the green popup body to focus it,")
+        input("then press Enter here to send read_global(R2D2_VERSION)... ")
+
     print()
     print("Sending read_global(R2D2_VERSION)…")
     try:
@@ -150,10 +172,8 @@ def _cmd_demo() -> int:
     except CommandError as e:
         print(f"❌ {e}", file=sys.stderr)
         print("   Possible causes:", file=sys.stderr)
-        print(
-            "   - The holo paste target (top-right corner of the page) lost focus",
-            file=sys.stderr,
-        )
+        print("   - The popup didn't have OS keyboard focus when Cmd+V fired", file=sys.stderr)
+        print("     (try `holo demo --manual` to drive focus by hand)", file=sys.stderr)
         print(
             "   - Accessibility permission missing (System Settings → Privacy & Security)",
             file=sys.stderr,
@@ -180,9 +200,12 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 0
     cmd = args[0]
+    rest = args[1:]
     if cmd in {"-V", "--version"}:
         print(__version__)
         return 0
+    if cmd == "demo":
+        return _cmd_demo(manual="--manual" in rest)
     if cmd in COMMANDS:
         return COMMANDS[cmd]()
     print(f"holo: unknown command {cmd!r}", file=sys.stderr)
