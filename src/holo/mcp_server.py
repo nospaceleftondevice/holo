@@ -117,6 +117,67 @@ class HoloMCPServer:
             raise ValueError(f"no channel for sid {sid!r}")
         return ch
 
+    # ---- screen / SikuliX tools (no sid; drives whatever's foreground) ----
+
+    def _require_bridge(self) -> Any:
+        """Return the daemon's SikuliX bridge or raise a clean error."""
+        bridge = self.daemon.bridge
+        if bridge is None:
+            raise RuntimeError(
+                "SikuliX bridge unavailable. Start the daemon with "
+                "`use_bridge=True` (CLI: `holo mcp --bridge`) and ensure "
+                "OpenJDK 11+ + sikulix*.jar are installed."
+            )
+        return bridge
+
+    def app_activate(self, name: str) -> dict[str, Any]:
+        """Bring an application to the foreground by name."""
+        return self._require_bridge().activate(name)
+
+    def screen_click(
+        self, x: int, y: int, modifiers: list[str] | None = None
+    ) -> dict[str, Any]:
+        """Click at screen coordinates, optionally holding modifiers."""
+        return self._require_bridge().click(x, y, modifiers=modifiers or [])
+
+    def screen_type(self, text: str) -> dict[str, Any]:
+        """Type a literal string into whatever has keyboard focus."""
+        return self._require_bridge().type_text(text)
+
+    def screen_key(self, combo: str) -> dict[str, Any]:
+        """Send a key combo, e.g. 'cmd+v', 'enter', 'shift+tab'."""
+        return self._require_bridge().key(combo)
+
+    def screen_shot(
+        self, region: dict[str, int] | None = None
+    ) -> dict[str, Any]:
+        """Capture the screen (or a region) and return base64 PNG + size."""
+        import base64 as _b64
+
+        png = self._require_bridge().screenshot(region=region)
+        return {
+            "image": _b64.b64encode(png).decode("ascii"),
+            "format": "png",
+            "byte_count": len(png),
+        }
+
+    def screen_find_image(
+        self,
+        needle: str,
+        region: dict[str, int] | None = None,
+        score: float = 0.7,
+    ) -> dict[str, Any] | None:
+        """Find `needle` (base64-encoded PNG) on screen. Returns coords or null."""
+        import base64 as _b64
+
+        try:
+            needle_bytes = _b64.b64decode(needle, validate=True)
+        except Exception as e:
+            raise ValueError("needle must be base64-encoded PNG") from e
+        return self._require_bridge().find_image(
+            needle_bytes, region=region, score=score
+        )
+
 
 def _transport(ch: Channel) -> str:
     return "ws" if ch._ws_ready else "qr"
@@ -177,6 +238,58 @@ def build_server(
         sid: str, command: dict[str, Any], timeout: float = 5.0
     ) -> dict[str, Any]:
         return holo.send_command(sid, command, timeout=timeout)
+
+    @mcp.tool(description="Bring an application to the foreground by name (e.g. 'Google Chrome').")
+    def app_activate(name: str) -> dict[str, Any]:
+        return holo.app_activate(name)
+
+    @mcp.tool(
+        description=(
+            "Click at screen coordinates (top-left origin). "
+            "`modifiers` is an optional list like ['cmd'] or ['shift', 'ctrl']."
+        )
+    )
+    def screen_click(
+        x: int, y: int, modifiers: list[str] | None = None
+    ) -> dict[str, Any]:
+        return holo.screen_click(x, y, modifiers=modifiers)
+
+    @mcp.tool(description="Type a literal string into whatever has keyboard focus.")
+    def screen_type(text: str) -> dict[str, Any]:
+        return holo.screen_type(text)
+
+    @mcp.tool(
+        description=(
+            "Send a key combo (e.g. 'cmd+v', 'enter', 'shift+tab'). "
+            "Sikuli's Key constants are recognised (ENTER, TAB, ESC, F1-F12, …)."
+        )
+    )
+    def screen_key(combo: str) -> dict[str, Any]:
+        return holo.screen_key(combo)
+
+    @mcp.tool(
+        description=(
+            "Capture the screen (or a region) as a PNG. Returns "
+            "{image: base64, format: 'png', byte_count}. Pass `region` "
+            "as {x, y, width, height} to crop."
+        )
+    )
+    def screen_shot(region: dict[str, int] | None = None) -> dict[str, Any]:
+        return holo.screen_shot(region=region)
+
+    @mcp.tool(
+        description=(
+            "Find a base64-encoded PNG `needle` on screen. Returns "
+            "{x, y, width, height, score} or null if no match. "
+            "`score` is the minimum similarity threshold (0..1, default 0.7)."
+        )
+    )
+    def screen_find_image(
+        needle: str,
+        region: dict[str, int] | None = None,
+        score: float = 0.7,
+    ) -> dict[str, Any] | None:
+        return holo.screen_find_image(needle, region=region, score=score)
 
     return mcp, holo
 
