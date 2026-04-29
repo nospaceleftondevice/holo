@@ -26,6 +26,7 @@ dependencies = [
   "pyobjc-framework-Vision>=10.0; sys_platform == 'darwin'",
   "pyperclip>=1.8",
   "pyautogui>=0.9.54",
+  "websockets>=13.0",
 ]
 
 [project.optional-dependencies]
@@ -42,6 +43,10 @@ Repository = "https://github.com/nospaceleftondevice/holo"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/holo"]
+
+[tool.hatch.build.targets.wheel.force-include]
+"src/holo/static/popup.html" = "holo/static/popup.html"
+"src/holo/static/framing.js" = "holo/static/framing.js"
 
 [tool.ruff]
 line-length = 100

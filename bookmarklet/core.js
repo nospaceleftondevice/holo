@@ -39,6 +39,16 @@ const QR_CANVAS_PX = 480;
 // QR error correction. "M" gives ~15 % redundancy — comfortable for
 // in-popup rendering where the daemon captures pristine pixels.
 const QR_ECL = "M";
+// Stealth-mode QR colors. When the daemon sets `_hide_qr: true` on a
+// command, we paint the reply QR in these two near-identical greens
+// (~4-unit delta in the red channel only). Indistinguishable to the
+// human eye / external phone cameras; the daemon amplifies the delta
+// in software before handing the bitmap to Vision. Must stay in sync
+// with `STEALTH_PIVOT_R` in `holo._macos`.
+const QR_STEALTH_LIGHT = "rgb(120, 200, 120)";
+const QR_STEALTH_DARK = "rgb(124, 200, 120)";
+const QR_NORMAL_LIGHT = "white";
+const QR_NORMAL_DARK = "black";
 
 /**
  * Strip a trailing holo marker (framed or plain) from a title string.
@@ -74,11 +84,57 @@ export function install() {
     throw new Error("holo: popup blocked — allow popups for this site");
   }
 
-  installInPopup(popup, window, session);
-
-  const state = { session, popup };
+  const state = { session, popup, wsPopup: null };
   window.__holo = state;
+
+  installInPopup(popup, window, session);
+  installHostListener(window, state);
+
   return state;
+}
+
+/**
+ * Install a `message` listener on the host page so it can serve
+ * dispatch requests from the daemon-served WS popup.
+ *
+ * The about:blank popup is same-origin and reachable directly; the
+ * WS popup is cross-origin (loaded from `http://127.0.0.1:<port>`)
+ * and must talk to the host through `window.opener.postMessage`. We
+ * run `dispatch(cmd, {window})` against the host globals and post
+ * results back. The WS popup registers itself on `__holo.wsPopup`
+ * when it opens, so this handler ignores any other source — no
+ * stranger origin can drive dispatch.
+ *
+ * Idempotent over reinstalls: each install replaces the previous
+ * listener so a fresh popup gets fresh state.
+ */
+export function installHostListener(hostWindow, state) {
+  if (hostWindow.__holoHostListener) {
+    hostWindow.removeEventListener("message", hostWindow.__holoHostListener);
+  }
+  const handler = (event) => {
+    const wsPopup = state.wsPopup;
+    if (!wsPopup || event.source !== wsPopup) return;
+    const data = event.data;
+    if (!data || data.source !== "holo-popup" || data.type !== "cmd") return;
+    if (data.session && data.session !== state.session) return;
+    let result;
+    try {
+      result = dispatch(data.cmd, { window: hostWindow });
+    } catch (err) {
+      if (err instanceof DispatchError) {
+        result = { error: { code: err.code, message: err.message } };
+      } else {
+        result = { error: { code: "internal", message: String(err) } };
+      }
+    }
+    wsPopup.postMessage(
+      { source: "holo-host", type: "result", id: data.id, result },
+      event.origin,
+    );
+  };
+  hostWindow.addEventListener("message", handler);
+  hostWindow.__holoHostListener = handler;
 }
 
 /**
@@ -107,6 +163,7 @@ export function installInPopup(popupWindow, openerWindow, session) {
     originalTitle: "",
     titleObserver: null,
     lastWrittenTitle: null,
+    hideQr: false,
   };
 
   const log = (...args) => popupWindow.console?.log?.("[holo]", ...args);
@@ -287,21 +344,26 @@ function onPaste(event, state) {
     return;
   }
 
-  // Dispatch resolves read_global / read_dom / etc. against the
-  // *opener* (host page), not the popup's own globals.
-  const env = { window: state.openerWindow };
-  let result;
-  try {
-    result = dispatch(cmd, env);
-    log("dispatch ok", result);
-  } catch (err) {
-    if (err instanceof DispatchError) {
-      result = { error: { code: err.code, message: err.message } };
-    } else {
-      result = { error: { code: "internal", message: String(err) } };
-    }
-    log("dispatch err", result);
+  // Transport metadata: `_hide_qr` tells us to paint the reply QR in
+  // stealth colors. dispatch.js ignores fields it doesn't know about,
+  // so we don't need to strip it; we just remember the flag for this
+  // popup until the daemon sends a different value.
+  if (cmd && typeof cmd === "object") {
+    state.hideQr = cmd._hide_qr === true;
   }
+
+  // ws_handshake is a one-shot bootstrap op: navigate the popup from
+  // about:blank to the daemon's cross-origin popup.html so the popup
+  // escapes the host page's CSP and can WebSocket back. After this
+  // call the about:blank document (and this script's state) is gone;
+  // host-side dispatch routing takes over via the postMessage
+  // listener install() registered on the host window.
+  if (cmd && cmd.op === "ws_handshake") {
+    handleWsHandshake(state, cmd, log);
+    return;
+  }
+
+  const result = runDispatch(state, cmd, log);
 
   try {
     log("about to sendReply", { resultJSON: JSON.stringify(result) });
@@ -312,6 +374,73 @@ function onPaste(event, state) {
     state.popupWindow.console?.error?.("[holo] sendReply error:", err);
   }
   state.panel.focus();
+}
+
+function runDispatch(state, cmd, log) {
+  // Dispatch resolves read_global / read_dom / etc. against the
+  // *opener* (host page), not the popup's own globals.
+  const env = { window: state.openerWindow };
+  try {
+    const result = dispatch(cmd, env);
+    log("dispatch ok", result);
+    return result;
+  } catch (err) {
+    let result;
+    if (err instanceof DispatchError) {
+      result = { error: { code: err.code, message: err.message } };
+    } else {
+      result = { error: { code: "internal", message: String(err) } };
+    }
+    log("dispatch err", result);
+    return result;
+  }
+}
+
+function handleWsHandshake(state, cmd, log) {
+  // Open a *second* popup (the "ws popup") at the daemon's
+  // popup.html. We deliberately don't navigate this popup — it stays
+  // at about:blank with its paste handler + QR canvas intact, so if
+  // the ws popup can't establish (host page CSP, COOP severance,
+  // popup blocker, …) the daemon's WS_HANDSHAKE_WAIT_S timer fires
+  // and the channel falls back cleanly to the QR transport here.
+  //
+  // The ws popup is loaded from `http://127.0.0.1:<port>/popup.html`
+  // — daemon-served, so it has its own (permissive) CSP and can open
+  // a WebSocket back to the daemon on any host page no matter how
+  // strict the host's `connect-src` is.
+  const popupWindow = state.popupWindow;
+  let url;
+  try {
+    url = new popupWindow.URL(cmd.url);
+  } catch (err) {
+    log("ws popup url invalid", String(err));
+    return;
+  }
+  const parentOrigin = state.openerWindow.location?.origin || "*";
+  url.hash =
+    "sid=" + encodeURIComponent(state.session) +
+    "&token=" + encodeURIComponent(cmd.token) +
+    "&parentOrigin=" + encodeURIComponent(parentOrigin);
+  // Tiny window — the popup body just shows a status; it's a
+  // protocol endpoint, not a UI surface.
+  const features = "popup=yes,width=320,height=120";
+  let wsPopup;
+  try {
+    wsPopup = popupWindow.open(url.toString(), "holo_ws_popup", features);
+  } catch (err) {
+    log("ws popup open failed", String(err));
+    return;
+  }
+  if (!wsPopup) {
+    log("ws popup blocked");
+    return;
+  }
+  state.wsPopup = wsPopup;
+  // Register the ws popup on the host's __holo state so the host
+  // listener (set up at install time) accepts its dispatch postMessages.
+  const hostHolo = state.openerWindow.__holo;
+  if (hostHolo) hostHolo.wsPopup = wsPopup;
+  log("ws popup opened", { origin: url.origin });
 }
 
 function sendReply(state, originalFrame, result, log = () => {}) {
@@ -325,14 +454,20 @@ function sendReply(state, originalFrame, result, log = () => {}) {
     id: originalFrame.id,
   });
   log("sendReply frame encoded", { replyLen: replyJson.length, preview: replyJson.slice(0, 60) });
-  renderQR(state.qrCanvas, replyJson, log);
+  renderQR(state.qrCanvas, replyJson, !!state.hideQr, log);
   log("sendReply done");
 }
 
 /**
- * Render `text` as a QR code into `canvas`, filling the canvas with a
- * white background so any prior reply is fully overwritten and the
- * daemon never decodes a stale frame.
+ * Render `text` as a QR code into `canvas`, filling the canvas first
+ * so any prior reply is fully overwritten and the daemon never
+ * decodes a stale frame.
+ *
+ * `hideQr=true` switches to two near-identical greens — humans and
+ * external phone cameras can't pull modules out of the resulting
+ * near-uniform image. The daemon amplifies the red-channel delta in
+ * software (`holo._macos._amplify_stealth_qr`) before passing the
+ * bitmap to Vision.
  *
  * Uses `qrcode-generator`'s automatic version selection (typeNumber=0)
  * with ECC level "M" (~15 % redundancy). Frames up to ~1.6 KB fit at
@@ -340,8 +475,8 @@ function sendReply(state, originalFrame, result, log = () => {}) {
  * error in the popup console — Phase 1 will move large payloads onto
  * the HTTP channel before that becomes a real concern.
  */
-function renderQR(canvas, text, log = () => {}) {
-  log("renderQR enter", { textLen: text.length });
+function renderQR(canvas, text, hideQr = false, log = () => {}) {
+  log("renderQR enter", { textLen: text.length, hideQr });
   const qr = qrcode(0, QR_ECL);
   qr.addData(text);
   qr.make();
@@ -349,9 +484,11 @@ function renderQR(canvas, text, log = () => {}) {
   const moduleCount = qr.getModuleCount();
   const moduleSize = Math.floor(canvas.width / (moduleCount + 2));
   const offset = Math.floor((canvas.width - moduleSize * moduleCount) / 2);
-  ctx.fillStyle = "white";
+  const lightColor = hideQr ? QR_STEALTH_LIGHT : QR_NORMAL_LIGHT;
+  const darkColor = hideQr ? QR_STEALTH_DARK : QR_NORMAL_DARK;
+  ctx.fillStyle = lightColor;
   ctx.fillRect(0, 0, canvas.width, canvas.height);
-  ctx.fillStyle = "black";
+  ctx.fillStyle = darkColor;
   for (let r = 0; r < moduleCount; r++) {
     for (let c = 0; c < moduleCount; c++) {
       if (qr.isDark(r, c)) {

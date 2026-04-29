@@ -1,0 +1,164 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>holo console</title>
+<!--
+  Daemon-served popup body. Loaded into the bookmarklet's popup *after*
+  it navigates away from about:blank — the popup is now in the daemon's
+  loopback origin (http://127.0.0.1:<port>) with its own (permissive)
+  CSP, so it can open a WebSocket back to the daemon on any host page,
+  no matter how strict the host's `connect-src` / `default-src` is.
+
+  Wire protocol:
+
+    daemon (WS)  → popup        {"type": "cmd",    "frame": <wire frame>}
+    popup        → host (postMessage with parentOrigin)
+                                {source:"holo-popup", type:"cmd", id, cmd, session}
+    host         → popup        {source:"holo-host",  type:"result", id, result}
+    popup (WS)   → daemon       {"type": "result", "frame": <wire frame>}
+
+  The host-side bookmarklet runs `dispatch(cmd, {window: hostWindow})`
+  to resolve `read_global` / `read_dom` / etc. against the page's own
+  globals; the popup is just a daemon ↔ host relay.
+
+  sid + token + parentOrigin arrive in the URL fragment so they don't
+  hit the daemon's HTTP access log.
+-->
+<style>
+  body {
+    margin: 0;
+    padding: 12px;
+    background: rgb(15, 30, 15);
+    color: rgb(120, 200, 120);
+    font-family: ui-monospace, SFMono-Regular, monospace;
+    font-size: 13px;
+  }
+  #status {
+    padding: 6px 10px;
+    border: 1px solid rgb(60, 120, 60);
+    border-radius: 4px;
+  }
+  .err { color: rgb(220, 120, 120); border-color: rgb(160, 80, 80); }
+</style>
+<body>
+  <div id="status">holo: connecting…</div>
+<script type="module">
+import { decodeFrame, encodeFrame } from "./framing.js";
+
+const params = new URLSearchParams(location.hash.slice(1));
+const sid = params.get("sid");
+const token = params.get("token");
+const parentOrigin = params.get("parentOrigin") || "*";
+const statusEl = document.getElementById("status");
+
+function setStatus(text, isErr) {
+  statusEl.textContent = text;
+  statusEl.classList.toggle("err", !!isErr);
+}
+
+// We were opened by the bookmarklet's about:blank popup; the host
+// page is two hops up in the opener chain. window.opener.opener is
+// cross-origin from us, but `opener` is one of the few properties
+// accessible across origins, so this read is safe.
+const hostWindow = window.opener && !window.opener.closed
+  ? window.opener.opener
+  : null;
+
+if (!sid || !token) {
+  setStatus("holo: missing sid/token", true);
+} else if (!hostWindow || hostWindow.closed) {
+  // The host page set Cross-Origin-Opener-Policy: same-origin (or
+  // similar) which severs the opener chain for cross-origin popups,
+  // so we have no way to call dispatch on the host. Refuse to
+  // connect the WebSocket — the daemon's WS_HANDSHAKE_WAIT_S timer
+  // will expire and the channel falls back gracefully to QR.
+  setStatus("holo: host opener unavailable (COOP) — falling back", true);
+} else {
+  start();
+}
+
+function start() {
+  const ws = new WebSocket("ws://" + location.host + "/");
+  // Map of frame.id → frame envelope, awaiting the host's dispatch result.
+  const pending = new Map();
+
+  ws.addEventListener("open", () => {
+    ws.send(JSON.stringify({ type: "handshake", sid, token }));
+  });
+
+  ws.addEventListener("message", (event) => {
+    let msg;
+    try { msg = JSON.parse(event.data); } catch { return; }
+    if (msg.type === "handshake_ack") {
+      setStatus("holo: ready");
+      return;
+    }
+    if (msg.type === "cmd" && typeof msg.frame === "string") {
+      handleDaemonCmd(msg.frame, ws, pending);
+    }
+  });
+
+  ws.addEventListener("close", () => setStatus("holo: disconnected", true));
+  ws.addEventListener("error", () => setStatus("holo: connection error", true));
+
+  window.addEventListener("message", (event) => {
+    // Only accept replies from the host page. Origin-check is best-
+    // effort: cross-origin window references are available but their
+    // origin isn't readable, so we trust the source-window check +
+    // the explicit "holo-host" sentinel.
+    if (event.source !== hostWindow) return;
+    const data = event.data;
+    if (!data || data.source !== "holo-host" || data.type !== "result") return;
+    const cmdFrame = pending.get(data.id);
+    if (!cmdFrame) return;
+    pending.delete(data.id);
+    sendResult(ws, cmdFrame, data.result);
+  });
+}
+
+function handleDaemonCmd(frameJson, ws, pending) {
+  let frame;
+  try {
+    frame = decodeFrame(frameJson);
+  } catch {
+    return;
+  }
+  let cmd;
+  try {
+    cmd = JSON.parse(new TextDecoder().decode(frame.data));
+  } catch {
+    sendResult(ws, frame, {
+      error: { code: "bad_command", message: "command body is not valid JSON" },
+    });
+    return;
+  }
+  if (!hostWindow || hostWindow.closed) {
+    sendResult(ws, frame, {
+      error: { code: "no_opener", message: "host page is gone" },
+    });
+    return;
+  }
+  pending.set(frame.id, frame);
+  hostWindow.postMessage(
+    {
+      source: "holo-popup",
+      type: "cmd",
+      session: frame.session,
+      id: frame.id,
+      cmd,
+    },
+    parentOrigin,
+  );
+}
+
+function sendResult(ws, originalFrame, result) {
+  const dataBytes = new TextEncoder().encode(JSON.stringify(result));
+  const replyJson = encodeFrame({
+    session: originalFrame.session,
+    type: "result",
+    data: dataBytes,
+    id: originalFrame.id,
+  });
+  ws.send(JSON.stringify({ type: "result", frame: replyJson }));
+}
+</script>
+</body>

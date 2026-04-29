@@ -109,7 +109,7 @@ def _cmd_doctor() -> int:
 _MANUAL_COUNTDOWN_S: int = 5
 
 
-def _cmd_demo(*, manual: bool = False) -> int:
+def _cmd_demo(*, manual: bool = False, hide_qr: bool = False) -> int:
     """End-to-end smoke test: read R2D2_VERSION through the channel.
 
     Pass `manual=True` (or run `holo demo --manual`) to skip the
@@ -117,10 +117,16 @@ def _cmd_demo(*, manual: bool = False) -> int:
     countdown: you click into the popup body and don't touch the
     keyboard until the paste fires. Useful when cross-app activation
     is being denied by the OS.
+
+    Pass `hide_qr=True` (or `holo demo --hide-qr`) to render the QR
+    reply channel in two near-identical greens that humans / external
+    cameras can't decode; the daemon amplifies the subtle red-channel
+    delta in software just before running Vision QR detection.
     """
     import time
 
-    from holo.channel import CalibrationError, Channel, CommandError
+    from holo.channel import CalibrationError, CommandError
+    from holo.daemon import Daemon
 
     print("holo demo — Phase 0 walking-skeleton" + (" (manual)" if manual else ""))
     print()
@@ -149,10 +155,13 @@ def _cmd_demo(*, manual: bool = False) -> int:
     print("Run `holo doctor` first if you suspect a permissions issue.")
     print()
 
-    ch = Channel(default_timeout=60.0)
+    daemon = Daemon(hide_qr=hide_qr)
+    if hide_qr:
+        print("QR reply channel: stealth (camera-resistant)")
+    print(f"WS listener: {daemon.ws_server.url}")
     print("Polling for calibration beacon (60s timeout)…")
     try:
-        sid = ch.wait_for_calibration()
+        ch = daemon.calibrate(timeout=60.0)
     except CalibrationError as e:
         print(f"❌ {e}", file=sys.stderr)
         print(
@@ -162,7 +171,7 @@ def _cmd_demo(*, manual: bool = False) -> int:
         print("   Run `holo doctor` to check Screen Recording permission.", file=sys.stderr)
         return 1
 
-    print(f"✓ calibrated · session={sid} window={ch._window_id}")
+    print(f"✓ calibrated · session={ch.session} window={ch._window_id}")
 
     if manual:
         # Disable the auto activate+click so the user can drive focus
@@ -178,10 +187,10 @@ def _cmd_demo(*, manual: bool = False) -> int:
             time.sleep(1.0)
 
     print()
-    print("Sending read_global(R2D2_VERSION)…")
+    print("Sending read_global(document.title)…")
     try:
-        result = ch.send_command(
-            {"op": "read_global", "path": "R2D2_VERSION"}, timeout=10.0
+        title_result = ch.send_command(
+            {"op": "read_global", "path": "document.title"}, timeout=10.0
         )
     except CommandError as e:
         print(f"❌ {e}", file=sys.stderr)
@@ -196,7 +205,32 @@ def _cmd_demo(*, manual: bool = False) -> int:
         print("     System Settings → Privacy & Security → Automation", file=sys.stderr)
         return 1
 
-    print(f"✓ result: {result}")
+    transport = "ws" if ch._ws_ready else "qr"
+    print(f"✓ title: {title_result}  (transport: {transport})")
+
+    print("Sending read_global(R2D2_VERSION)…")
+    try:
+        result = ch.send_command(
+            {"op": "read_global", "path": "R2D2_VERSION"}, timeout=10.0
+        )
+    except CommandError as e:
+        print(f"❌ {e}", file=sys.stderr)
+        return 1
+
+    print(f"✓ result: {result}  (transport: {transport})")
+
+    # If WS came up, send a second command — should be near-instant and
+    # not steal focus. Confirms the post-handshake hot path works.
+    if ch._ws_ready:
+        print("Re-sending over WS to confirm hot path…")
+        try:
+            result2 = ch.send_command(
+                {"op": "read_global", "path": "R2D2_VERSION"}, timeout=5.0
+            )
+            print(f"✓ result: {result2}  (transport: ws)")
+        except CommandError as e:
+            print(f"❌ second send failed: {e}", file=sys.stderr)
+            return 1
     return 0
 
 
@@ -258,7 +292,7 @@ def main(argv: list[str] | None = None) -> int:
         print(__version__)
         return 0
     if cmd == "demo":
-        return _cmd_demo(manual="--manual" in rest)
+        return _cmd_demo(manual="--manual" in rest, hide_qr="--hide-qr" in rest)
     if cmd in COMMANDS:
         return COMMANDS[cmd]()
     print(f"holo: unknown command {cmd!r}", file=sys.stderr)

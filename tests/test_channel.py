@@ -58,6 +58,11 @@ def _make_reply_qr(*, frame_id, session, result):
     return reply_frame.encode()
 
 
+def _capture_returning(payload):
+    """side_effect helper that returns payload['value'] regardless of kwargs."""
+    return lambda _w, **_kw: payload['value']
+
+
 @pytest.fixture
 def fake_list_windows():
     with patch("holo.channel.list_windows") as m:
@@ -153,7 +158,7 @@ class TestSendCommand:
 
         fake_paste.side_effect = respond
 
-        with patch("holo._macos.capture_window_qr", side_effect=lambda _w: qr_payload["value"]):
+        with patch("holo._macos.capture_window_qr", side_effect=_capture_returning(qr_payload)):
             assert ch.send_command({"op": "ping"}) == {"pong": True}
         fake_paste.assert_called_once()
 
@@ -196,7 +201,7 @@ class TestSendCommand:
             )
 
         fake_paste.side_effect = respond
-        with patch("holo._macos.capture_window_qr", side_effect=lambda _w: qr_payload["value"]):
+        with patch("holo._macos.capture_window_qr", side_effect=_capture_returning(qr_payload)):
             with pytest.raises(CommandError):
                 ch.send_command({"op": "ping"})
 
@@ -235,7 +240,7 @@ class TestSendCommand:
 
         fake_paste.side_effect = respond
 
-        with patch("holo._macos.capture_window_qr", side_effect=lambda _w: qr_payload["value"]):
+        with patch("holo._macos.capture_window_qr", side_effect=_capture_returning(qr_payload)):
             ch.send_command({"op": "read_global", "path": "R2D2_VERSION"})
 
         sent = captured["frame"]
@@ -245,6 +250,46 @@ class TestSendCommand:
             "op": "read_global",
             "path": "R2D2_VERSION",
         }
+
+    def test_hide_qr_flag_propagates_to_payload_and_capture(self, fake_list_windows, fake_paste):
+        """When `Channel(hide_qr=True)`, each pasted command frame must
+        carry `_hide_qr: true` so the popup paints the reply QR in
+        stealth colors, AND the QR poller must pass `hide_qr=True`
+        through to `capture_window_qr` so the daemon amplifies the
+        captured pixels before running Vision.
+        """
+        ch = Channel(hide_qr=True, poll_interval=0.001, default_timeout=2.0)
+        ch.session = "sess"
+        ch._window_id = 42
+        cur_title = {"value": "Page"}
+        fake_list_windows.side_effect = lambda: [_w(42, cur_title["value"])]
+        captured: dict = {}
+        qr_payload = {"value": None}
+        capture_kwargs: list[dict] = []
+
+        def respond(text):
+            sent = framing.decode(text)
+            captured["frame"] = sent
+            qr_payload["value"] = _make_reply_qr(
+                frame_id=sent.id, session="sess", result={"ok": True}
+            )
+
+        def fake_capture(_window_id, **kw):
+            capture_kwargs.append(kw)
+            return qr_payload["value"]
+
+        fake_paste.side_effect = respond
+
+        with patch("holo._macos.capture_window_qr", side_effect=fake_capture):
+            ch.send_command({"op": "ping"})
+
+        # Pasted command body included the stealth flag.
+        assert json.loads(captured["frame"].data.decode("utf-8")) == {
+            "op": "ping",
+            "_hide_qr": True,
+        }
+        # capture_window_qr was called with hide_qr=True at least once.
+        assert any(kw.get("hide_qr") is True for kw in capture_kwargs)
 
 
 class TestActivation:
@@ -291,7 +336,7 @@ class TestActivation:
                 "holo._macos.click_at",
                 side_effect=lambda x, y: order.append(("click", x, y)),
             ),
-            patch("holo._macos.capture_window_qr", side_effect=lambda _w: qr_payload["value"]),
+            patch("holo._macos.capture_window_qr", side_effect=_capture_returning(qr_payload)),
             patch("holo.channel.ACTIVATE_SETTLE_S", 0.0),
             patch("holo.channel.CLICK_SETTLE_S", 0.0),
         ):
@@ -329,7 +374,7 @@ class TestActivation:
 
         with (
             patch("holo._macos.activate_pid", side_effect=lambda p: called.append(p)),
-            patch("holo._macos.capture_window_qr", side_effect=lambda _w: qr_payload["value"]),
+            patch("holo._macos.capture_window_qr", side_effect=_capture_returning(qr_payload)),
         ):
             ch.send_command({"op": "ping"})
 
@@ -367,7 +412,7 @@ class TestActivation:
         with (
             patch("holo._macos.activate_pid", return_value=True),
             patch("holo._macos.click_at", side_effect=lambda x, y: clicks.append((x, y))),
-            patch("holo._macos.capture_window_qr", side_effect=lambda _w: qr_payload["value"]),
+            patch("holo._macos.capture_window_qr", side_effect=_capture_returning(qr_payload)),
             patch("holo.channel.ACTIVATE_SETTLE_S", 0.0),
             patch("holo.channel.CLICK_SETTLE_S", 0.0),
         ):
@@ -427,7 +472,7 @@ class TestActivation:
             ),
             patch("holo._macos.click_at", side_effect=lambda x, y: order.append(("click", x, y))),
             patch("holo._macos.keystroke_paste", side_effect=fake_keystroke),
-            patch("holo._macos.capture_window_qr", side_effect=lambda _w: qr_payload["value"]),
+            patch("holo._macos.capture_window_qr", side_effect=_capture_returning(qr_payload)),
             patch("holo.clipboard.write", side_effect=fake_write),
             patch("holo.channel.ACTIVATE_SETTLE_S", 0.0),
             patch("holo.channel.CLICK_SETTLE_S", 0.0),
@@ -439,3 +484,152 @@ class TestActivation:
         kinds = [t[0] for t in order]
         assert kinds == ["activate", "click", "clipboard_write", "keystroke"]
         assert order[3] == ("keystroke", "Google Chrome")
+
+
+class TestWsPath:
+    """Once a Channel has a Daemon attached and a WebSocket has handshook
+    in, send_command should ride the socket — no clipboard, no QR poll.
+    The first send_command pastes a `ws_handshake` op via clipboard;
+    subsequent commands skip the paste entirely.
+    """
+
+    def test_first_send_pastes_handshake_then_uses_ws(self, fake_list_windows):
+        import json as _json
+        import queue as _queue
+        import threading
+
+        from websockets.sync.client import connect
+
+        from holo.daemon import Daemon
+
+        d = Daemon()
+        try:
+            ch = Channel(daemon=d, poll_interval=0.001, default_timeout=2.0)
+            ch.session = "sid-ws"
+            ch._window_id = 99
+            ch._window_owner = ""  # cross-platform paste path
+            d.registry.register("sid-ws", ch)
+
+            fake_list_windows.return_value = [_w(99, "Page")]
+
+            # Stand in for the bookmarklet: when the daemon pastes the
+            # ws_handshake frame, decode it, open a WS, send the handshake
+            # message, then echo subsequent cmd frames as result frames.
+            sent_via_paste: list[str] = []
+            page_thread_done = threading.Event()
+            page_results: dict[str, dict] = {}
+
+            def fake_paste(text):
+                sent_via_paste.append(text)
+                frame = framing.decode(text)
+                cmd = _json.loads(frame.data.decode("utf-8"))
+                assert cmd["op"] == "ws_handshake"
+                threading.Thread(
+                    target=_run_fake_page,
+                    args=(cmd["url"], cmd["token"], "sid-ws", page_results, page_thread_done),
+                    daemon=True,
+                ).start()
+
+            with patch("holo.clipboard.paste", side_effect=fake_paste):
+                # First send_command bootstraps WS via paste, then sends "ping" via WS.
+                result = ch.send_command({"op": "ping"})
+
+            assert result == {"pong": True}
+            assert len(sent_via_paste) == 1, "only the handshake should hit clipboard"
+            assert ch._ws_ready
+
+            # Second send_command must NOT paste again — it goes straight over WS.
+            with patch("holo.clipboard.paste", side_effect=AssertionError("no paste")):
+                result2 = ch.send_command({"op": "ping"})
+            assert result2 == {"pong": True}
+
+            # Let the fake page thread finish cleanly.
+            page_thread_done.wait(timeout=1.0)
+            _ = _queue, connect  # keep imports referenced
+        finally:
+            d.shutdown()
+
+    def test_ws_handshake_timeout_falls_back_to_qr(self, fake_list_windows, fake_paste):
+        """If no WS handshake lands within WS_HANDSHAKE_WAIT_S, the
+        channel must stay on the QR/title path instead of hanging.
+        """
+        from holo.daemon import Daemon
+
+        d = Daemon()
+        try:
+            ch = Channel(daemon=d, poll_interval=0.001, default_timeout=2.0)
+            ch.session = "sid-fallback"
+            ch._window_id = 7
+            ch._window_owner = ""
+            d.registry.register("sid-fallback", ch)
+
+            cur_title = {"value": "Page"}
+            fake_list_windows.side_effect = lambda: [_w(7, cur_title["value"])]
+            qr_payload = {"value": None}
+
+            def respond(text):
+                # Decode the *second* paste (the actual cmd) — the first
+                # paste is the ws_handshake which we deliberately ignore
+                # to exercise the fallback path.
+                sent = framing.decode(text)
+                cmd = json.loads(sent.data.decode("utf-8"))
+                if cmd.get("op") == "ws_handshake":
+                    return  # never connect — force timeout
+                cur_title["value"] = _make_reply_title(
+                    frame_id=sent.id, session="sid-fallback", result={"pong": True}
+                )
+                qr_payload["value"] = _make_reply_qr(
+                    frame_id=sent.id, session="sid-fallback", result={"pong": True}
+                )
+
+            fake_paste.side_effect = respond
+
+            with (
+                patch("holo._macos.capture_window_qr", side_effect=_capture_returning(qr_payload)),
+                patch("holo.channel.WS_HANDSHAKE_WAIT_S", 0.1),
+            ):
+                result = ch.send_command({"op": "ping"})
+
+            assert result == {"pong": True}
+            assert not ch._ws_ready
+        finally:
+            d.shutdown()
+
+
+def _run_fake_page(agent_url, token, sid, results, done_event):
+    """Stand-in for the in-page bookmarklet on the WS path.
+
+    `agent_url` is the http://… URL the daemon sends in the
+    `ws_handshake` op. The real bookmarklet would load it as an
+    iframe and the iframe would WebSocket back to its own origin;
+    this test shortcuts that by deriving the ws:// URL directly
+    and connecting from the test process.
+    """
+    import json as _json
+    from urllib.parse import urlparse
+
+    from websockets.sync.client import connect
+
+    parsed = urlparse(agent_url)
+    ws_url = f"ws://{parsed.netloc}/"
+    with connect(ws_url) as ws:
+        ws.send(_json.dumps({"type": "handshake", "sid": sid, "token": token}))
+        ack = _json.loads(ws.recv(timeout=2.0))
+        assert ack == {"type": "handshake_ack"}
+        # Answer cmd frames until the test closes the socket on us.
+        try:
+            for raw in ws:
+                msg = _json.loads(raw)
+                if msg.get("type") != "cmd":
+                    continue
+                inbound = framing.decode(msg["frame"])
+                reply = framing.Frame(
+                    session=inbound.session,
+                    type="result",
+                    data=_json.dumps({"pong": True}).encode("utf-8"),
+                    id=inbound.id,
+                )
+                ws.send(_json.dumps({"type": "result", "frame": reply.encode()}))
+                results[inbound.id] = {"pong": True}
+        finally:
+            done_event.set()
