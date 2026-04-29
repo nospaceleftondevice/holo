@@ -87,3 +87,25 @@ class TestInteropWithJsBookmarklet:
     )
     def test_decodes_js_produced_titles(self, title, expected):
         assert decode_framed(title) == expected
+
+
+class TestBrowserSuffix:
+    """OS-level window titles from browsers append a suffix like
+    " - Google Chrome" or " — Mozilla Firefox" after document.title.
+    The marker is then in the middle of the string, not the end.
+    """
+
+    def test_decode_framed_finds_marker_before_browser_suffix(self):
+        json_str = '{"v":1}'
+        encoded = base64.b64encode(json_str.encode("utf-8")).decode("ascii")
+        title = f"My Page [holo:1:{encoded}] - Google Chrome"
+        assert decode_framed(title) == json_str
+
+    def test_decode_plain_finds_marker_before_browser_suffix(self):
+        title = "tai.sh [holo:cal:abc-123] - Google Chrome"
+        assert decode_plain(title) == "cal:abc-123"
+
+    def test_decode_plain_finds_marker_with_em_dash_suffix(self):
+        # Firefox uses an em-dash separator
+        title = "GitHub [holo:cal:xyz] — Mozilla Firefox"
+        assert decode_plain(title) == "cal:xyz"

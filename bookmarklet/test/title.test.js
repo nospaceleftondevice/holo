@@ -49,6 +49,14 @@ describe("encodeFramedTitle / decodeFramedTitle", () => {
     assert.equal(decodeFramedTitle(title), "{}");
   });
 
+  it("finds a marker before a browser-appended suffix", () => {
+    // OS-level window titles get " - Google Chrome" / " — Firefox" added
+    // by the browser. Our regex must match the marker anywhere, not just
+    // at the end.
+    const title = "tai.sh [holo:1:e30=] - Google Chrome";
+    assert.equal(decodeFramedTitle(title), "{}");
+  });
+
   it("returns null for malformed base64 inside the marker", () => {
     assert.equal(decodeFramedTitle("page [holo:1:!!!notbase64!!!]"), null);
   });
@@ -76,6 +84,13 @@ describe("encodePlainMarker / decodePlainMarker", () => {
 
   it("returns null for titles without any marker", () => {
     assert.equal(decodePlainMarker("Just a regular title"), null);
+  });
+
+  it("finds a plain marker before a browser-appended suffix", () => {
+    assert.equal(
+      decodePlainMarker("tai.sh [holo:cal:abc-123] - Google Chrome"),
+      "cal:abc-123"
+    );
   });
 
   it("returns null for non-string inputs", () => {

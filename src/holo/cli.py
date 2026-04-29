@@ -1,8 +1,11 @@
-"""Minimal CLI surface for the Phase 0 walking skeleton.
+"""CLI surface for the Phase 0 walking skeleton.
 
-Subcommands grow as primitive layers land. For now: `--version` and
-`windows` (a smoke command that lists visible windows for manual
-verification of the windows reader).
+Subcommands:
+
+    holo --version         print version
+    holo windows           print visible windows (smoke for windows reader)
+    holo doctor            check macOS permissions / runtime environment
+    holo demo              end-to-end smoke test against the in-page agent
 """
 
 from __future__ import annotations
@@ -29,17 +32,156 @@ def _cmd_windows() -> int:
     return 0
 
 
+def _cmd_doctor() -> int:
+    """Check the daemon's environment: platform, permissions, deps."""
+    print(f"Python:    {sys.executable}")
+    print(f"Platform:  {sys.platform}")
+    print(f"Version:   holo {__version__}")
+    print()
+
+    if sys.platform != "darwin":
+        print(f"⚠ holo currently supports macOS only; running on {sys.platform}.")
+        return 1
+
+    try:
+        from holo.windows import list_windows
+    except Exception as e:  # noqa: BLE001 — surface anything that breaks the import
+        print(f"❌ holo.windows failed to import: {e}")
+        return 1
+
+    try:
+        windows = list_windows()
+    except Exception as e:  # noqa: BLE001
+        print(f"❌ list_windows() raised: {e}")
+        return 1
+
+    from holo.channel import DEFAULT_BROWSERS
+
+    total = len(windows)
+    browser_wins = [w for w in windows if w.owner in DEFAULT_BROWSERS]
+    browser_titled = sum(1 for w in browser_wins if w.title)
+    print(f"Windows:   {total} visible total, {len(browser_wins)} from a browser")
+
+    if total == 0:
+        print()
+        print("⚠ No visible windows reported. Is anything open?")
+        return 1
+
+    if not browser_wins:
+        print()
+        print("⚠ No browser windows visible. Open Chrome/Firefox/Safari/etc.")
+        print("  before running `holo demo`.")
+        return 1
+
+    if browser_titled == 0:
+        # System windows (e.g. WindowServer/StatusIndicator) have readable
+        # titles even without Screen Recording permission, so we check
+        # specifically that *browser* windows are readable.
+        print()
+        print("❌ Screen Recording permission appears to be missing.")
+        print(f"   Grant access for: {sys.executable}")
+        print("   System Settings → Privacy & Security → Screen Recording")
+        print("   You may need to restart the daemon after granting.")
+        return 1
+
+    print(f"✓ Screen Recording permission granted ({browser_titled} browser titles readable).")
+    print()
+
+    try:
+        import pyautogui  # noqa: F401
+    except Exception as e:  # noqa: BLE001
+        print(f"❌ pyautogui import failed: {e}")
+        return 1
+    try:
+        import pyperclip  # noqa: F401
+    except Exception as e:  # noqa: BLE001
+        print(f"❌ pyperclip import failed: {e}")
+        return 1
+    print("✓ pyautogui and pyperclip importable.")
+    print()
+    print("Accessibility permission (for keyboard simulation) cannot be")
+    print("detected without firing a keystroke. If `holo demo` fails to")
+    print("get a reply, grant Accessibility for the same Python binary at:")
+    print("  System Settings → Privacy & Security → Accessibility")
+    return 0
+
+
+def _cmd_demo() -> int:
+    """End-to-end smoke test: read R2D2_VERSION through the channel."""
+    from holo.channel import CalibrationError, Channel, CommandError
+
+    print("holo demo — Phase 0 walking-skeleton")
+    print()
+    print("Setup:")
+    print("  1. (one-time) Build & install the bookmarklet:")
+    print("       cd bookmarklet && npm install && npm run build")
+    print("       open bookmarklet/dist/install.html")
+    print("       drag the 🔧 holo link to your bookmarks bar")
+    print("  2. Open https://tai.sh in your browser (or any page exposing R2D2_VERSION)")
+    print("  3. After this command starts polling, click the 🔧 holo bookmark")
+    print("     and don't click anywhere else in the page")
+    print()
+    print("Run `holo doctor` first if you suspect a permissions issue.")
+    print()
+
+    ch = Channel(default_timeout=60.0)
+    print("Polling for calibration beacon (60s timeout)…")
+    try:
+        sid = ch.wait_for_calibration()
+    except CalibrationError as e:
+        print(f"❌ {e}", file=sys.stderr)
+        print(
+            "   Is the bookmarklet installed and clicked on a normal http(s) page?",
+            file=sys.stderr,
+        )
+        print("   Run `holo doctor` to check Screen Recording permission.", file=sys.stderr)
+        return 1
+
+    print(f"✓ calibrated · session={sid} window={ch._window_id}")
+    print()
+    print("Sending read_global(R2D2_VERSION)…")
+    try:
+        result = ch.send_command(
+            {"op": "read_global", "path": "R2D2_VERSION"}, timeout=10.0
+        )
+    except CommandError as e:
+        print(f"❌ {e}", file=sys.stderr)
+        print("   Possible causes:", file=sys.stderr)
+        print(
+            "   - The holo paste target (top-right corner of the page) lost focus",
+            file=sys.stderr,
+        )
+        print(
+            "   - Accessibility permission missing (System Settings → Privacy & Security)",
+            file=sys.stderr,
+        )
+        return 1
+
+    print(f"✓ result: {result}")
+    return 0
+
+
+COMMANDS = {
+    "windows": _cmd_windows,
+    "doctor": _cmd_doctor,
+    "demo": _cmd_demo,
+}
+
+
 def main(argv: list[str] | None = None) -> int:
     args = argv if argv is not None else sys.argv[1:]
     if not args:
-        print(f"holo {__version__} — try `holo --version` or `holo windows`")
+        print(
+            f"holo {__version__} — try `holo --version`, `holo windows`, "
+            "`holo doctor`, or `holo demo`"
+        )
         return 0
     cmd = args[0]
     if cmd in {"-V", "--version"}:
         print(__version__)
         return 0
-    if cmd == "windows":
-        return _cmd_windows()
+    if cmd in COMMANDS:
+        return COMMANDS[cmd]()
     print(f"holo: unknown command {cmd!r}", file=sys.stderr)
     return 2
 

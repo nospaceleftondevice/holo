@@ -18,8 +18,12 @@ import base64
 import binascii
 import re
 
-_FRAMED_RE = re.compile(r"\[holo:1:([A-Za-z0-9+/=]+)\]\s*$")
-_PLAIN_RE = re.compile(r"\[holo:([^\]]+)\]\s*$")
+# Browsers append "- Google Chrome" / "— Firefox" / etc. to the OS-level
+# window title, so our marker (which the bookmarklet writes at the end of
+# document.title) ends up in the middle of the OS title we read via Quartz.
+# Match the marker anywhere; only one is present per title in practice.
+_FRAMED_RE = re.compile(r"\[holo:1:([A-Za-z0-9+/=]+)\]")
+_PLAIN_RE = re.compile(r"\[holo:([^\]]+)\]")
 
 
 def decode_framed(title: str) -> str | None:
