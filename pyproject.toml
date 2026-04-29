@@ -53,6 +53,11 @@ packages = ["src/holo"]
 line-length = 100
 target-version = "py311"
 src = ["src", "tests"]
+# `bridge/` runs under SikuliX's bundled Jython 2.7. Linting it under
+# py311 rules would push us toward syntax (f-strings, walrus, type
+# hints) Jython can't parse — so the directory is hand-reviewed
+# instead.
+extend-exclude = ["bridge"]
 
 [tool.ruff.lint]
 select = [
