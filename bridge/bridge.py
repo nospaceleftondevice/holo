@@ -194,17 +194,11 @@ def serve_stdio():
 def serve_tcp(host, port, token):
     # Java's networking from Jython — keeps us off the OS-Python socket
     # module and consistent across platforms.
-    from java.io import (
-        BufferedReader,
-        BufferedWriter,
-        InputStreamReader,
-        OutputStreamWriter,
-    )
     from java.net import InetSocketAddress, ServerSocket
 
     server = ServerSocket()
     server.bind(InetSocketAddress(host, port))
-    sys.stderr.write("[bridge] tcp listening on %s:%d\n" % (host, port))
+    sys.stderr.write("[bridge] tcp listening on {0}:{1}\n".format(host, port))
     sys.stderr.flush()
     try:
         while True:
