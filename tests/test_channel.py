@@ -51,12 +51,13 @@ class TestWaitForCalibration:
     def test_returns_session_from_beacon_and_locks_window(self, fake_list_windows):
         fake_list_windows.return_value = [
             _w(1, "Other - Chrome"),
-            _w(42, "GitHub [holo:cal:abc-123]", pid=9876),
+            _w(42, "GitHub [holo:cal:abc-123]", pid=9876, owner="Google Chrome"),
         ]
         ch = Channel(poll_interval=0.001, default_timeout=0.5)
         assert ch.wait_for_calibration() == "abc-123"
         assert ch._window_id == 42
         assert ch._window_pid == 9876
+        assert ch._window_owner == "Google Chrome"
 
     def test_ignores_non_browser_windows(self, fake_list_windows):
         fake_list_windows.return_value = [
@@ -104,6 +105,9 @@ class TestSendCommand:
         ch = Channel(poll_interval=0.001, default_timeout=2.0)
         ch.session = "sess-1"
         ch._window_id = 42
+        # Empty owner forces the cross-platform / pyautogui path
+        # exercised by clipboard.paste, which is what these tests mock.
+        ch._window_owner = ""
 
         # Initially the window shows just the calibration beacon.
         current_title = {"value": "Page [holo:cal:sess-1]"}
@@ -281,6 +285,7 @@ class TestActivation:
         ch.session = "sess"
         ch._window_id = 42
         ch._window_pid = 1234
+        ch._window_owner = ""  # force the pyautogui path
         cur_title = {"value": "Page"}
         # No bounds — _popup_body_click_point should return None.
         fake_list_windows.side_effect = lambda: [
@@ -306,3 +311,60 @@ class TestActivation:
 
         # Activate fired, but no click because bounds were unavailable.
         assert clicks == []
+
+    def test_darwin_path_uses_osascript_keystroke(self, fake_list_windows):
+        """On macOS, send_command should use the keystroke_paste path
+        (osascript + System Events) rather than pyautogui-via-clipboard.paste.
+        """
+        import sys
+
+        if sys.platform != "darwin":
+            pytest.skip("osascript keystroke path is darwin-only")
+
+        ch = Channel(poll_interval=0.001, default_timeout=2.0)
+        ch.session = "sess"
+        ch._window_id = 42
+        ch._window_pid = 1234
+        ch._window_owner = "Google Chrome"
+        cur_title = {"value": "Page"}
+        fake_list_windows.side_effect = lambda: [
+            _w(42, cur_title["value"], pid=1234, owner="Google Chrome",
+               bounds=(100.0, 50.0, 320.0, 160.0)),
+        ]
+        order = []
+
+        captured = {}
+
+        def fake_write(text):
+            order.append(("clipboard_write", text[:8]))
+            captured["frame"] = framing.decode(text)
+
+        def fake_keystroke(name):
+            order.append(("keystroke", name))
+            # Simulate the popup receiving the paste and writing the
+            # reply to its title, using the same frame id we just sent.
+            cur_title["value"] = _make_reply_title(
+                frame_id=captured["frame"].id,
+                session="sess",
+                result={"ok": True},
+            )
+            return True
+
+        with (
+            patch(
+                "holo._macos.activate_pid",
+                side_effect=lambda pid: order.append(("activate", pid)) or True,
+            ),
+            patch("holo._macos.click_at", side_effect=lambda x, y: order.append(("click", x, y))),
+            patch("holo._macos.keystroke_paste", side_effect=fake_keystroke),
+            patch("holo.clipboard.write", side_effect=fake_write),
+            patch("holo.channel.ACTIVATE_SETTLE_S", 0.0),
+            patch("holo.channel.CLICK_SETTLE_S", 0.0),
+        ):
+            result = ch.send_command({"op": "ping"})
+
+        assert result == {"ok": True}
+        # Strict ordering: activate → click → clipboard write → osascript keystroke
+        kinds = [t[0] for t in order]
+        assert kinds == ["activate", "click", "clipboard_write", "keystroke"]
+        assert order[3] == ("keystroke", "Google Chrome")

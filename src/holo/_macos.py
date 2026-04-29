@@ -73,6 +73,44 @@ def activate_pid(pid: int) -> bool:
     return front is not None and front.processIdentifier() == pid
 
 
+def keystroke_paste(app_name: str | None = None) -> bool:
+    """Send Cmd+V via osascript + System Events.
+
+    pyautogui's `hotkey('command', 'v')` works for keystrokes destined
+    for the terminal (proven in early demo runs), but the resulting
+    paste event has been observed to never reach a Chrome popup's
+    contenteditable. System Events / osascript keystrokes share the
+    same Automation pipeline that we're already using for activation,
+    and have been observed to land where the page's paste handler can
+    see them.
+
+    If `app_name` is given, the script activates that app first so
+    the keystroke targets it. Otherwise the keystroke goes to the
+    current frontmost app.
+
+    Returns True on success, False if osascript fails or isn't
+    available.
+    """
+    if app_name:
+        script = (
+            f'tell application "{app_name}" to activate\n'
+            'delay 0.2\n'
+            'tell application "System Events" to keystroke "v" using command down\n'
+        )
+    else:
+        script = 'tell application "System Events" to keystroke "v" using command down\n'
+    try:
+        result = subprocess.run(
+            ["osascript", "-e", script],
+            check=False,
+            capture_output=True,
+            timeout=5.0,
+        )
+        return result.returncode == 0
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return False
+
+
 def click_at(x: float, y: float) -> None:
     """Synthesize a left-click at screen coordinates (x, y).
 
