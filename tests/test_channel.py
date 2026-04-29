@@ -19,8 +19,8 @@ from holo.channel import CalibrationError, Channel, CommandError
 from holo.windows import WindowInfo
 
 
-def _w(id, title, owner="Google Chrome", pid=0):
-    return WindowInfo(id=id, title=title, owner=owner, layer=0, pid=pid)
+def _w(id, title, owner="Google Chrome", pid=0, bounds=None):
+    return WindowInfo(id=id, title=title, owner=owner, layer=0, pid=pid, bounds=bounds)
 
 
 def _make_reply_title(*, frame_id, session, result, original_title="Page"):
@@ -202,7 +202,7 @@ class TestActivation:
     keyboard focus (usually the terminal we're running from).
     """
 
-    def test_activates_target_app_before_paste(self, fake_list_windows, fake_paste):
+    def test_activates_then_clicks_then_pastes(self, fake_list_windows, fake_paste):
         import sys
 
         if sys.platform != "darwin":
@@ -212,12 +212,11 @@ class TestActivation:
         ch._window_id = 42
         ch._window_pid = 1234
         cur_title = {"value": "Page"}
-        fake_list_windows.side_effect = lambda: [_w(42, cur_title["value"])]
+        # Bounds so _popup_body_click_point computes a click point.
+        fake_list_windows.side_effect = lambda: [
+            _w(42, cur_title["value"], pid=1234, bounds=(100.0, 50.0, 320.0, 160.0)),
+        ]
         order = []
-
-        def fake_activate(pid):
-            order.append(("activate", pid))
-            return True
 
         def respond(text):
             order.append(("paste", text[:8]))
@@ -229,14 +228,26 @@ class TestActivation:
         fake_paste.side_effect = respond
 
         with (
-            patch("holo._macos.activate_pid", side_effect=fake_activate),
+            patch(
+                "holo._macos.activate_pid",
+                side_effect=lambda pid: order.append(("activate", pid)) or True,
+            ),
+            patch(
+                "holo._macos.click_at",
+                side_effect=lambda x, y: order.append(("click", x, y)),
+            ),
             patch("holo.channel.ACTIVATE_SETTLE_S", 0.0),
+            patch("holo.channel.CLICK_SETTLE_S", 0.0),
         ):
             ch.send_command({"op": "ping"})
 
-        # Activation must come strictly before the paste keystroke.
+        # Strict ordering: activate, then click into the body, then paste.
         assert order[0] == ("activate", 1234)
-        assert order[1][0] == "paste"
+        assert order[1][0] == "click"
+        # Click should be inside the popup body — left side, near bottom.
+        # bounds = (100, 50, 320, 160) → expect (130, 180).
+        assert order[1] == ("click", 130.0, 180.0)
+        assert order[2][0] == "paste"
 
     def test_skips_activation_when_pid_unknown(self, fake_list_windows, fake_paste):
         ch = Channel(poll_interval=0.001, default_timeout=2.0)
@@ -259,3 +270,38 @@ class TestActivation:
             ch.send_command({"op": "ping"})
 
         assert called == []
+
+    def test_skips_click_when_bounds_unknown(self, fake_list_windows, fake_paste):
+        import sys
+
+        if sys.platform != "darwin":
+            pytest.skip("activation helper is darwin-only")
+        ch = Channel(poll_interval=0.001, default_timeout=2.0)
+        ch.session = "sess"
+        ch._window_id = 42
+        ch._window_pid = 1234
+        cur_title = {"value": "Page"}
+        # No bounds — _popup_body_click_point should return None.
+        fake_list_windows.side_effect = lambda: [
+            _w(42, cur_title["value"], pid=1234, bounds=None),
+        ]
+        clicks = []
+
+        def respond(text):
+            sent = framing.decode(text)
+            cur_title["value"] = _make_reply_title(
+                frame_id=sent.id, session="sess", result={"pong": True}
+            )
+
+        fake_paste.side_effect = respond
+
+        with (
+            patch("holo._macos.activate_pid", return_value=True),
+            patch("holo._macos.click_at", side_effect=lambda x, y: clicks.append((x, y))),
+            patch("holo.channel.ACTIVATE_SETTLE_S", 0.0),
+            patch("holo.channel.CLICK_SETTLE_S", 0.0),
+        ):
+            ch.send_command({"op": "ping"})
+
+        # Activate fired, but no click because bounds were unavailable.
+        assert clicks == []

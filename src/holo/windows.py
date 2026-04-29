@@ -30,6 +30,11 @@ class WindowInfo:
     owner: str
     layer: int
     pid: int = 0
+    # On-screen bounds in screen coordinates: (x, y, width, height).
+    # macOS's coordinate space has the origin at the top-left of the
+    # primary display, growing right and down — same convention as
+    # Quartz event coordinates and pyautogui.
+    bounds: tuple[float, float, float, float] | None = None
 
 
 def list_windows() -> list[WindowInfo]:

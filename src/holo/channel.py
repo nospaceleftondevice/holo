@@ -50,10 +50,13 @@ DEFAULT_BROWSERS: frozenset[str] = frozenset(
 
 DEFAULT_POLL_INTERVAL_S: float = 0.05
 DEFAULT_TIMEOUT_S: float = 5.0
-# Time to wait after activating the target app before sending Cmd+V,
-# so the OS has time to make it the key window. Empirically ~80–120 ms
+# Time to wait after activating the target app before clicking, so
+# the OS has time to make it the key window. Empirically ~80–120 ms
 # is enough on a warm app; 200 ms gives generous headroom.
 ACTIVATE_SETTLE_S: float = 0.2
+# Time after the synthetic click before sending Cmd+V, so the
+# contenteditable has time to receive focus from the click event.
+CLICK_SETTLE_S: float = 0.1
 
 
 class CalibrationError(RuntimeError):
@@ -139,17 +142,44 @@ class Channel:
         return None
 
     def _activate_target(self) -> None:
-        """Bring the locked window's app to the foreground before pasting.
+        """Bring the locked popup to the foreground and put OS keyboard
+        focus inside its contenteditable body before pasting.
 
-        Without this step, the synthesized Cmd+V lands in whatever app
+        Without activation, the synthesized Cmd+V lands in whatever app
         currently has keyboard focus (the terminal we're running from,
-        a different browser window, …). On non-darwin platforms or when
-        the pid is unknown this is a no-op — callers must keep the
-        target window focused themselves.
+        a different browser window, …). Without the click, Chrome opens
+        new popups with OS focus on the address bar — JS `.focus()`
+        cannot move OS focus out of browser chrome, so we have to do it
+        with a synthetic mouse click. On non-darwin platforms or when
+        pid/bounds are unknown this degrades gracefully — callers must
+        keep the target window focused themselves.
         """
         if sys.platform != "darwin" or self._window_pid <= 0:
             return
-        from holo._macos import activate_pid
+        from holo._macos import activate_pid, click_at
 
-        if activate_pid(self._window_pid):
-            time.sleep(ACTIVATE_SETTLE_S)
+        if not activate_pid(self._window_pid):
+            return
+        time.sleep(ACTIVATE_SETTLE_S)
+
+        click_point = self._popup_body_click_point()
+        if click_point is not None:
+            click_at(*click_point)
+            time.sleep(CLICK_SETTLE_S)
+
+    def _popup_body_click_point(self) -> tuple[float, float] | None:
+        """Pick a point inside the popup body that is safely below the
+        URL bar and away from window controls.
+
+        Re-reads the locked window's current bounds — the user may
+        have moved or resized the popup since calibration.
+        """
+        for w in list_windows():
+            if w.id == self._window_id and w.bounds is not None:
+                x, y, width, height = w.bounds
+                # 30 px in from the left edge clears the traffic-light
+                # buttons; height - 30 puts us near the bottom of the
+                # popup, well below the address bar even on small
+                # popups (~160 px tall).
+                return (x + 30.0, y + height - 30.0)
+        return None

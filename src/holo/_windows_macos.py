@@ -42,4 +42,20 @@ def _parse(entry: dict[str, Any]) -> WindowInfo:
         owner=str(entry.get("kCGWindowOwnerName") or ""),
         layer=int(entry.get("kCGWindowLayer") or 0),
         pid=int(entry.get("kCGWindowOwnerPID") or 0),
+        bounds=_parse_bounds(entry.get("kCGWindowBounds")),
     )
+
+
+def _parse_bounds(b: Any) -> tuple[float, float, float, float] | None:
+    """Convert a kCGWindowBounds dict to an (x, y, w, h) tuple.
+
+    CGWindowListCopyWindowInfo returns bounds as a CFDictionary with
+    keys X, Y, Width, Height (numbers). We accept any duck-typed
+    mapping with those keys so tests can pass plain dicts.
+    """
+    if b is None:
+        return None
+    try:
+        return (float(b["X"]), float(b["Y"]), float(b["Width"]), float(b["Height"]))
+    except (KeyError, TypeError, ValueError):
+        return None
