@@ -12,5 +12,8 @@
   },
   "devDependencies": {
     "esbuild": "^0.24.0"
+  },
+  "dependencies": {
+    "qrcode-generator": "^2.0.4"
   }
 }
