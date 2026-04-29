@@ -75,6 +75,7 @@ class Channel:
     session: str | None = None
     _window_id: int | None = None
     _window_pid: int = 0
+    _window_owner: str = ""
 
     def wait_for_calibration(self, *, timeout: float | None = None) -> str:
         """Poll browser windows for a `[holo:cal:<sid>]` beacon.
@@ -91,6 +92,7 @@ class Channel:
                     self.session = marker[len("cal:") :]
                     self._window_id = win.id
                     self._window_pid = win.pid
+                    self._window_owner = win.owner
                     return self.session
             time.sleep(self.poll_interval)
         raise CalibrationError(f"no calibration beacon within {budget}s")
@@ -107,8 +109,28 @@ class Channel:
             )
         data = json.dumps(cmd).encode("utf-8")
         frame = framing.Frame(session=self.session, type="cmd", data=data)
-        self._activate_target()
-        clipboard.paste(frame.encode())
+        text = frame.encode()
+
+        # On macOS we use the osascript / System Events pipeline for
+        # both activation and the Cmd+V keystroke. pyautogui's
+        # synthetic keystrokes work for the terminal but have been
+        # observed to never reach a Chrome popup's contenteditable
+        # paste handler — System Events shares the same Automation
+        # pipeline that successfully activates the popup, so the
+        # keystroke and the activation can't race against each other.
+        # We don't restore the clipboard here: a fast restore can
+        # win the race against the OS-level paste, and the page's
+        # handler reads event.clipboardData (a snapshot) anyway.
+        if sys.platform == "darwin" and self._window_owner:
+            self._activate_target()
+            clipboard.write(text)
+            time.sleep(0.05)
+            from holo._macos import keystroke_paste
+
+            keystroke_paste(self._window_owner)
+        else:
+            self._activate_target()
+            clipboard.paste(text)
         budget = timeout if timeout is not None else self.default_timeout
         deadline = time.monotonic() + budget
         while time.monotonic() < deadline:
