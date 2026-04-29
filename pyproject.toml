@@ -27,6 +27,7 @@ dependencies = [
   "pyperclip>=1.8",
   "pyautogui>=0.9.54",
   "websockets>=13.0",
+  "mcp>=1.2",
 ]
 
 [project.optional-dependencies]

@@ -29,9 +29,18 @@ class ChannelRegistry:
         with self._lock:
             return self._channels.get(sid)
 
-    def unregister(self, sid: str) -> None:
+    def unregister(self, sid: str) -> Channel | None:
         with self._lock:
-            self._channels.pop(sid, None)
+            return self._channels.pop(sid, None)
+
+    def items(self) -> list[tuple[str, Channel]]:
+        """Snapshot the current sid → channel mapping.
+
+        Returns a list rather than a view so the caller can iterate
+        without holding the registry lock.
+        """
+        with self._lock:
+            return list(self._channels.items())
 
     def __len__(self) -> int:
         with self._lock:
