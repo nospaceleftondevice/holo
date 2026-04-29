@@ -80,6 +80,9 @@ CLICK_SETTLE_S: float = 0.1
 # message after we paste the `ws_handshake` op. If this runs out, we
 # stay on the QR path for this command and try again next time.
 WS_HANDSHAKE_WAIT_S: float = 2.0
+# Cross-platform paste keystroke. macOS uses Cmd+V; everywhere else
+# uses Ctrl+V. Sent through the SikuliX bridge.
+_PASTE_COMBO: str = "cmd+v" if sys.platform == "darwin" else "ctrl+v"
 
 # Process-wide lock around the macOS clipboard + keystroke pipeline.
 # Two QR-mode channels in the same process must not race on the
@@ -224,22 +227,32 @@ class Channel:
         raise CommandError(f"no reply for cmd within {budget}s")
 
     def _paste_text(self, text: str) -> None:
-        """Activate the popup, copy `text`, simulate Cmd+V into it.
+        """Activate the popup, copy `text`, simulate Cmd/Ctrl+V into it.
 
         Serialized process-wide so multiple channels in the same
         daemon don't race on the global clipboard / focus pipeline.
 
-        On macOS we use the osascript / System Events pipeline for
-        both activation and the Cmd+V keystroke. pyautogui's
-        synthetic keystrokes work for the terminal but have been
-        observed to never reach a Chrome popup's contenteditable
-        paste handler — System Events shares the same Automation
-        pipeline that successfully activates the popup, so the
-        keystroke and the activation can't race against each other.
-        We don't restore the clipboard here: a fast restore can
-        win the race against the OS-level paste, and the page's
-        handler reads event.clipboardData (a snapshot) anyway.
+        Two implementations:
+
+        * **Bridge path** (preferred). When a `Daemon` is attached and
+          its SikuliX bridge has come up, every step (activate → click
+          into popup body → write clipboard → paste keystroke) goes
+          through the bridge. Cross-platform; this is the path the
+          binary distribution will use.
+        * **Legacy path**. On macOS without a bridge, we use the
+          osascript / System Events pipeline (`_macos.py`). On other
+          platforms without a bridge we just write the clipboard and
+          assume the caller keeps the target focused.
+
+        We don't restore the clipboard here: a fast restore can win
+        the race against the OS-level paste, and the page's handler
+        reads event.clipboardData (a snapshot) anyway.
         """
+        bridge = self._bridge()
+        if bridge is not None:
+            self._paste_text_via_bridge(bridge, text)
+            return
+
         with _CLIPBOARD_LOCK:
             if sys.platform == "darwin" and self._window_owner:
                 self._activate_target()
@@ -251,6 +264,34 @@ class Channel:
             else:
                 self._activate_target()
                 clipboard.paste(text)
+
+    def _paste_text_via_bridge(self, bridge: Any, text: str) -> None:
+        """Drive the activate → click → clipboard → paste sequence through SikuliX."""
+        with _CLIPBOARD_LOCK:
+            if self._window_owner:
+                try:
+                    bridge.activate(self._window_owner)
+                    time.sleep(ACTIVATE_SETTLE_S)
+                except Exception:
+                    # If activation fails the click + paste still happen
+                    # against the foreground app — that's no worse than
+                    # the legacy path's silent degrade.
+                    pass
+
+            click_point = self._popup_body_click_point()
+            if click_point is not None:
+                bridge.click(int(click_point[0]), int(click_point[1]))
+                time.sleep(CLICK_SETTLE_S)
+
+            clipboard.write(text)
+            time.sleep(0.05)
+            bridge.key(_PASTE_COMBO)
+
+    def _bridge(self) -> Any:
+        """Return the daemon's SikuliX bridge, or None if unavailable."""
+        if self.daemon is None:
+            return None
+        return self.daemon.bridge
 
     def _on_ws_attached(self, conn: Any) -> None:
         """Called by the WS server thread once a handshake validates."""
