@@ -14,8 +14,12 @@
 // `<originalTitle>` is captured at install and never modified — the
 // page is free to update its own title; we re-append on each write.
 
-const FRAMED_RE = /\[holo:1:([A-Za-z0-9+/=]+)\]\s*$/;
-const PLAIN_RE = /\[holo:([^\]]+)\]\s*$/;
+// Browsers append "- Google Chrome" / "— Firefox" / etc. to the OS-level
+// window title, so our marker (written at the end of document.title) ends
+// up in the middle of the OS title the daemon reads. Match anywhere; only
+// one marker is present per title in practice.
+const FRAMED_RE = /\[holo:1:([A-Za-z0-9+/=]+)\]/;
+const PLAIN_RE = /\[holo:([^\]]+)\]/;
 
 export function encodeFramedTitle(frameJson, originalTitle = "") {
   if (typeof frameJson !== "string") {
