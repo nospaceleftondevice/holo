@@ -124,32 +124,50 @@ export function installInPopup(popupWindow, openerWindow, session) {
 }
 
 /**
- * Build the popup's contenteditable body. Returns the element so
- * callers can attach listeners.
+ * Build the popup's paste target — a <textarea> filling the body.
+ * Returns the textarea so callers can attach listeners.
+ *
+ * Why a textarea (not body[contenteditable="true"]): Chromium routes
+ * synthetic Cmd+V keystrokes (from osascript / pyautogui / CGEvent)
+ * through a slightly different paste path than user-generated keys.
+ * Real textareas pick up both reliably; contenteditable on body has
+ * been observed to drop the synthetic ones, breaking the daemon →
+ * page channel.
  */
 export function buildPopupBody(popupDoc) {
   popupDoc.title = POPUP_TITLE;
   const body = popupDoc.body;
   Object.assign(body.style, {
     margin: "0",
+    padding: "0",
+    background: "rgb(15, 30, 15)",
+    overflow: "hidden",
+  });
+
+  const textarea = popupDoc.createElement("textarea");
+  textarea.id = "__holo_paste_target__";
+  textarea.spellcheck = false;
+  textarea.setAttribute("aria-label", "holo paste target");
+  textarea.value = READY_TEXT;
+  Object.assign(textarea.style, {
+    display: "block",
+    width: "100%",
+    height: "100vh",
+    margin: "0",
     padding: "12px",
+    border: "none",
     background: "rgb(15, 30, 15)",
     color: "rgb(120, 200, 120)",
     fontFamily: "ui-monospace, SFMono-Regular, monospace",
     fontSize: "12px",
     lineHeight: "1.4",
-    cursor: "text",
-    minHeight: "100vh",
     boxSizing: "border-box",
-    overflow: "hidden",
     outline: "none",
+    resize: "none",
     caretColor: "transparent",
   });
-  body.contentEditable = "true";
-  body.spellcheck = false;
-  body.setAttribute("aria-label", "holo paste target");
-  body.textContent = READY_TEXT;
-  return body;
+  body.appendChild(textarea);
+  return textarea;
 }
 
 function onPaste(event, state) {
@@ -157,9 +175,9 @@ function onPaste(event, state) {
   event.stopPropagation();
 
   const raw = event.clipboardData?.getData("text/plain") ?? "";
-  // Defensively reset visible text so a future user paste doesn't
-  // see leftover bytes from our last command.
-  state.panel.textContent = READY_TEXT;
+  // Defensively reset the textarea value so a future user paste
+  // doesn't see leftover bytes from our last command.
+  state.panel.value = READY_TEXT;
 
   let frame;
   try {
