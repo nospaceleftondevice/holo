@@ -60,3 +60,7 @@ npm-debug.log*
 # OS
 .DS_Store
 Thumbs.db
+
+# Vendored binaries (provided per-environment, bundled at release time)
+vendor/*
+!vendor/.gitkeep

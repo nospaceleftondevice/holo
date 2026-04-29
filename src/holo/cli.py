@@ -7,6 +7,7 @@ Subcommands:
     holo doctor            check macOS permissions / runtime environment
     holo demo              end-to-end smoke test against the in-page agent
     holo mcp               run the MCP server over stdio
+    holo bridge <verb>     smoke-test the SikuliX bridge directly
 """
 
 from __future__ import annotations
@@ -288,6 +289,72 @@ def _cmd_mcp(*, hide_qr: bool = False) -> int:
     return 0
 
 
+_BRIDGE_USAGE = (
+    "usage: holo bridge <verb> [args]\n"
+    "  ping                          start the JVM bridge and ping it\n"
+    "  activate <app>                bring an app to the foreground\n"
+    "  click <x> <y>                 click at screen coordinates\n"
+    "  key <combo>                   send a key combo (e.g. 'cmd+v', 'enter')\n"
+    "  type <text>                   type a literal string"
+)
+
+
+def _cmd_bridge(rest: list[str]) -> int:
+    """Drive the SikuliX bridge directly — no calibration, no channel.
+
+    This is for sanity-checking the JVM + jar setup end-to-end. Each
+    invocation spawns a fresh JVM, runs one verb, exits. Slow for
+    everyday use; that's fine, this is a smoke tool.
+    """
+    from holo.bridge import BridgeClient, BridgeError, BridgeMissingError
+
+    if not rest:
+        print(_BRIDGE_USAGE, file=sys.stderr)
+        return 2
+    verb = rest[0]
+    args = rest[1:]
+
+    client = BridgeClient()
+    try:
+        client.start()
+    except BridgeMissingError as e:
+        print(f"holo bridge: {e}", file=sys.stderr)
+        print(
+            "Hint: install OpenJDK 11+ and drop sikulixapi.jar in vendor/ "
+            "or set HOLO_SIKULI_JAR.",
+            file=sys.stderr,
+        )
+        return 1
+    except (BridgeError, OSError) as e:
+        print(f"holo bridge: failed to start JVM: {e}", file=sys.stderr)
+        return 1
+
+    try:
+        if verb == "ping":
+            result = client.ping()
+        elif verb == "activate" and len(args) == 1:
+            result = client.activate(args[0])
+        elif verb == "click" and len(args) == 2:
+            result = client.click(int(args[0]), int(args[1]))
+        elif verb == "key" and len(args) == 1:
+            result = client.key(args[0])
+        elif verb == "type" and len(args) >= 1:
+            result = client.type_text(" ".join(args))
+        else:
+            print(_BRIDGE_USAGE, file=sys.stderr)
+            return 2
+    except BridgeError as e:
+        print(f"holo bridge: error {e.code}: {e.message}", file=sys.stderr)
+        if e.trace:
+            print(e.trace, file=sys.stderr)
+        return 1
+    finally:
+        client.stop()
+
+    print(result)
+    return 0
+
+
 COMMANDS = {
     "windows": _cmd_windows,
     "doctor": _cmd_doctor,
@@ -302,7 +369,7 @@ def main(argv: list[str] | None = None) -> int:
     if not args:
         print(
             f"holo {__version__} — try `holo --version`, `holo windows`, "
-            "`holo doctor`, `holo demo`, `holo focus`, or `holo mcp`"
+            "`holo doctor`, `holo demo`, `holo focus`, `holo mcp`, or `holo bridge`"
         )
         return 0
     cmd = args[0]
@@ -314,6 +381,8 @@ def main(argv: list[str] | None = None) -> int:
         return _cmd_demo(manual="--manual" in rest, hide_qr="--hide-qr" in rest)
     if cmd == "mcp":
         return _cmd_mcp(hide_qr="--hide-qr" in rest)
+    if cmd == "bridge":
+        return _cmd_bridge(rest)
     if cmd in COMMANDS:
         return COMMANDS[cmd]()
     print(f"holo: unknown command {cmd!r}", file=sys.stderr)
