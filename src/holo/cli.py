@@ -1,4 +1,4 @@
-"""CLI surface for the Phase 0 walking skeleton.
+"""CLI surface for holo.
 
 Subcommands:
 
@@ -6,6 +6,7 @@ Subcommands:
     holo windows           print visible windows (smoke for windows reader)
     holo doctor            check macOS permissions / runtime environment
     holo demo              end-to-end smoke test against the in-page agent
+    holo mcp               run the MCP server over stdio
 """
 
 from __future__ import annotations
@@ -270,11 +271,29 @@ def _cmd_focus() -> int:
     return 0
 
 
+def _cmd_mcp(*, hide_qr: bool = False) -> int:
+    """Run the MCP server over stdio.
+
+    Intended to be launched by an MCP client (Claude Code, Codex, Cursor)
+    rather than from a terminal. The client exchanges JSON-RPC over the
+    process's stdin/stdout, so anything we print to stdout corrupts the
+    protocol — keep output on stderr only.
+    """
+    from holo import mcp_server
+
+    print("holo mcp — starting MCP server over stdio", file=sys.stderr)
+    if hide_qr:
+        print("QR reply channel: stealth (camera-resistant)", file=sys.stderr)
+    mcp_server.run(hide_qr=hide_qr)
+    return 0
+
+
 COMMANDS = {
     "windows": _cmd_windows,
     "doctor": _cmd_doctor,
     "demo": _cmd_demo,
     "focus": _cmd_focus,
+    "mcp": _cmd_mcp,
 }
 
 
@@ -283,7 +302,7 @@ def main(argv: list[str] | None = None) -> int:
     if not args:
         print(
             f"holo {__version__} — try `holo --version`, `holo windows`, "
-            "`holo doctor`, `holo demo`, or `holo focus`"
+            "`holo doctor`, `holo demo`, `holo focus`, or `holo mcp`"
         )
         return 0
     cmd = args[0]
@@ -293,6 +312,8 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if cmd == "demo":
         return _cmd_demo(manual="--manual" in rest, hide_qr="--hide-qr" in rest)
+    if cmd == "mcp":
+        return _cmd_mcp(hide_qr="--hide-qr" in rest)
     if cmd in COMMANDS:
         return COMMANDS[cmd]()
     print(f"holo: unknown command {cmd!r}", file=sys.stderr)

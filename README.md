@@ -31,11 +31,37 @@ general tool.
 
 ## Status
 
-- [ ] Phase 0 — primitive layer (channel, framing protocol, bookmarklet payload)
-- [ ] Phase 1 — agent surface (MCP server)
+- [x] Phase 0 — primitive layer (channel, framing protocol, bookmarklet payload)
+- [x] Phase 1 — agent surface (MCP server, with WebSocket transport + stealth-QR fallback)
 - [ ] Phase 2 — per-origin assertion plugins
 - [ ] Phase 3 — cross-host registry + bridge
 - [ ] Phase 4 — opt-in CDP adapter
+
+## Use as an MCP server
+
+`holo mcp` runs a stdio MCP server that exposes the channel as a small
+set of tools. Wire it into Claude Code, Codex, or another MCP client by
+pointing at the entrypoint:
+
+```jsonc
+{
+  "mcpServers": {
+    "holo": { "command": "holo", "args": ["mcp"] }
+  }
+}
+```
+
+The agent calibrates a tab once (the user clicks the holo bookmarklet
+on whichever page should be driven), then issues commands by sid. Tools:
+
+| Tool            | What it does                                             |
+| ---             | ---                                                      |
+| `calibrate`     | Block until the bookmarklet beacon arrives, return its sid |
+| `list_channels` | Snapshot of currently calibrated tabs                    |
+| `drop_channel`  | Forget a channel (does not close the browser popup)      |
+| `ping`          | Round-trip ping over the channel                         |
+| `read_global`   | Read a dotted path off the page's global object          |
+| `send_command`  | Escape hatch — send any bookmarklet op (see `bookmarklet/dispatch.js`) |
 
 ## License
 
