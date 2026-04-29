@@ -47,7 +47,17 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: ${{ matrix.node-version }}
+          cache: npm
+          cache-dependency-path: bookmarklet/package-lock.json
+
+      - name: Install
+        working-directory: bookmarklet
+        run: npm ci
 
       - name: Test
         working-directory: bookmarklet
         run: npm test
+
+      - name: Build bookmarklet
+        working-directory: bookmarklet
+        run: npm run build
