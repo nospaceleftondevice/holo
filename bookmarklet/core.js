@@ -22,7 +22,14 @@ import { DispatchError, dispatch } from "./dispatch.js";
 import { encodeFramedTitle, encodePlainMarker } from "./title.js";
 
 const POPUP_NAME = "holo_console";
-const POPUP_FEATURES = "popup=yes,width=320,height=160,resizable=yes";
+// Width matters for correctness, not just looks: macOS visually
+// truncates the title bar with a Unicode ellipsis when it doesn't
+// fit, and `kCGWindowName` (what the daemon reads) returns the
+// truncated form on Chrome. 800 px fits ~120 chars of title at
+// default font size, which covers calibration plus single-frame
+// replies for short payloads. Larger payloads use Reassembler to
+// chunk across multiple title frames.
+const POPUP_FEATURES = "popup=yes,width=800,height=200,resizable=yes";
 const POPUP_TITLE = "holo console";
 const READY_TEXT = "holo console — keep this window open";
 const HOLO_MARKER_TAIL_RE = /\s*\[holo:[^\]]+\]\s*$/;

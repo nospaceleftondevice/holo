@@ -21,11 +21,31 @@
 const FRAMED_RE = /\[holo:1:([A-Za-z0-9+/=]+)\]/;
 const PLAIN_RE = /\[holo:([^\]]+)\]/;
 
+// btoa / atob only handle Latin1 (code points 0–255). Frame envelopes
+// or session ids that ever contain a non-Latin1 character — e.g., a
+// Unicode ellipsis from macOS visually truncating a long window title,
+// or a Unicode char in the host page's original title — would crash
+// btoa with InvalidCharacterError. Round-trip via UTF-8 bytes so any
+// JS string is encodable.
+function utf8Btoa(str) {
+  const bytes = new TextEncoder().encode(str);
+  let binary = "";
+  for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]);
+  return btoa(binary);
+}
+
+function utf8Atob(b64) {
+  const binary = atob(b64);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+  return new TextDecoder().decode(bytes);
+}
+
 export function encodeFramedTitle(frameJson, originalTitle = "") {
   if (typeof frameJson !== "string") {
     throw new TypeError("frameJson must be a string");
   }
-  const encoded = btoa(frameJson);
+  const encoded = utf8Btoa(frameJson);
   return originalTitle ? `${originalTitle} [holo:1:${encoded}]` : `[holo:1:${encoded}]`;
 }
 
@@ -34,7 +54,7 @@ export function decodeFramedTitle(title) {
   const m = title.match(FRAMED_RE);
   if (!m) return null;
   try {
-    return atob(m[1]);
+    return utf8Atob(m[1]);
   } catch {
     return null;
   }

@@ -109,3 +109,24 @@ class TestBrowserSuffix:
         # Firefox uses an em-dash separator
         title = "GitHub [holo:cal:xyz] — Mozilla Firefox"
         assert decode_plain(title) == "cal:xyz"
+
+
+class TestUtf8RoundTrip:
+    """The JS encoder now uses base64-of-UTF-8-bytes (utf8Btoa), so the
+    Python decoder must accept Unicode round-tripped that way. macOS
+    can sneak Unicode into our path by visually truncating long
+    window titles with `…` (U+2026), and host pages can have any
+    Unicode in their `originalTitle`.
+    """
+
+    def test_decodes_utf8_bytes_emitted_by_js_encoder(self):
+        json_str = '{"v":"héllo"}'
+        encoded = base64.b64encode(json_str.encode("utf-8")).decode("ascii")
+        title = f"page [holo:1:{encoded}]"
+        assert decode_framed(title) == json_str
+
+    def test_decodes_unicode_ellipsis(self):
+        json_str = '{"session":"a5421…65"}'
+        encoded = base64.b64encode(json_str.encode("utf-8")).decode("ascii")
+        title = f"page [holo:1:{encoded}]"
+        assert decode_framed(title) == json_str
