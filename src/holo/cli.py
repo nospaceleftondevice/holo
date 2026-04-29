@@ -111,7 +111,7 @@ def _cmd_doctor() -> int:
 _MANUAL_COUNTDOWN_S: int = 5
 
 
-def _cmd_demo(*, manual: bool = False, hide_qr: bool = False) -> int:
+def _cmd_demo(*, manual: bool = False, hide_qr: bool = False, use_bridge: bool = False) -> int:
     """End-to-end smoke test: read R2D2_VERSION through the channel.
 
     Pass `manual=True` (or run `holo demo --manual`) to skip the
@@ -157,9 +157,11 @@ def _cmd_demo(*, manual: bool = False, hide_qr: bool = False) -> int:
     print("Run `holo doctor` first if you suspect a permissions issue.")
     print()
 
-    daemon = Daemon(hide_qr=hide_qr)
+    daemon = Daemon(hide_qr=hide_qr, use_bridge=use_bridge)
     if hide_qr:
         print("QR reply channel: stealth (camera-resistant)")
+    if use_bridge:
+        print("Input pipeline: SikuliX bridge (cross-platform)")
     print(f"WS listener: {daemon.ws_server.url}")
     print("Polling for calibration beacon (60s timeout)…")
     try:
@@ -272,7 +274,7 @@ def _cmd_focus() -> int:
     return 0
 
 
-def _cmd_mcp(*, hide_qr: bool = False) -> int:
+def _cmd_mcp(*, hide_qr: bool = False, use_bridge: bool = False) -> int:
     """Run the MCP server over stdio.
 
     Intended to be launched by an MCP client (Claude Code, Codex, Cursor)
@@ -285,7 +287,9 @@ def _cmd_mcp(*, hide_qr: bool = False) -> int:
     print("holo mcp — starting MCP server over stdio", file=sys.stderr)
     if hide_qr:
         print("QR reply channel: stealth (camera-resistant)", file=sys.stderr)
-    mcp_server.run(hide_qr=hide_qr)
+    if use_bridge:
+        print("Input pipeline: SikuliX bridge (cross-platform)", file=sys.stderr)
+    mcp_server.run(hide_qr=hide_qr, use_bridge=use_bridge)
     return 0
 
 
@@ -378,9 +382,16 @@ def main(argv: list[str] | None = None) -> int:
         print(__version__)
         return 0
     if cmd == "demo":
-        return _cmd_demo(manual="--manual" in rest, hide_qr="--hide-qr" in rest)
+        return _cmd_demo(
+            manual="--manual" in rest,
+            hide_qr="--hide-qr" in rest,
+            use_bridge="--bridge" in rest,
+        )
     if cmd == "mcp":
-        return _cmd_mcp(hide_qr="--hide-qr" in rest)
+        return _cmd_mcp(
+            hide_qr="--hide-qr" in rest,
+            use_bridge="--bridge" in rest,
+        )
     if cmd == "bridge":
         return _cmd_bridge(rest)
     if cmd in COMMANDS:

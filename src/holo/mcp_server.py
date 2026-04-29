@@ -35,8 +35,9 @@ class HoloMCPServer:
     us one place to attach a fake daemon in tests.
     """
 
-    def __init__(self, *, hide_qr: bool = False) -> None:
+    def __init__(self, *, hide_qr: bool = False, use_bridge: bool = False) -> None:
         self.hide_qr = hide_qr
+        self.use_bridge = use_bridge
         self._daemon: Daemon | None = None
         self._daemon_lock = threading.Lock()
 
@@ -44,7 +45,7 @@ class HoloMCPServer:
     def daemon(self) -> Daemon:
         with self._daemon_lock:
             if self._daemon is None:
-                self._daemon = Daemon(hide_qr=self.hide_qr)
+                self._daemon = Daemon(hide_qr=self.hide_qr, use_bridge=self.use_bridge)
             return self._daemon
 
     def shutdown(self) -> None:
@@ -130,13 +131,15 @@ def _describe(ch: Channel) -> dict[str, Any]:
     }
 
 
-def build_server(*, hide_qr: bool = False) -> tuple[FastMCP, HoloMCPServer]:
+def build_server(
+    *, hide_qr: bool = False, use_bridge: bool = False
+) -> tuple[FastMCP, HoloMCPServer]:
     """Build a FastMCP instance with the holo tools registered.
 
     Returns the FastMCP server and the underlying `HoloMCPServer` so
     the caller can shut down the daemon after `mcp.run()` returns.
     """
-    holo = HoloMCPServer(hide_qr=hide_qr)
+    holo = HoloMCPServer(hide_qr=hide_qr, use_bridge=use_bridge)
     mcp = FastMCP("holo")
 
     @mcp.tool(description="Wait for the bookmarklet's calibration beacon and register a channel.")
@@ -178,9 +181,9 @@ def build_server(*, hide_qr: bool = False) -> tuple[FastMCP, HoloMCPServer]:
     return mcp, holo
 
 
-def run(*, hide_qr: bool = False) -> None:
+def run(*, hide_qr: bool = False, use_bridge: bool = False) -> None:
     """Entrypoint used by `holo mcp` — runs the server over stdio."""
-    mcp, holo = build_server(hide_qr=hide_qr)
+    mcp, holo = build_server(hide_qr=hide_qr, use_bridge=use_bridge)
     try:
         mcp.run()
     finally:

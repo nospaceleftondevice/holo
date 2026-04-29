@@ -633,3 +633,192 @@ def _run_fake_page(agent_url, token, sid, results, done_event):
                 results[inbound.id] = {"pong": True}
         finally:
             done_event.set()
+
+
+class _StubBridge:
+    """Minimal stand-in for `holo.bridge.BridgeClient` for tests."""
+
+    def __init__(self) -> None:
+        self.calls: list[tuple] = []
+
+    def activate(self, name: str):
+        self.calls.append(("activate", name))
+        return {"focused": True, "name": name}
+
+    def click(self, x: int, y: int, *, modifiers=None):
+        self.calls.append(("click", x, y))
+        return {"clicked": True, "x": x, "y": y}
+
+    def key(self, combo: str):
+        self.calls.append(("key", combo))
+        return {"sent": combo}
+
+    def type_text(self, text: str):
+        self.calls.append(("type_text", text))
+        return {"typed_chars": len(text)}
+
+
+class TestBridgePath:
+    """When a Daemon has `use_bridge=True` and its bridge has come up,
+    the paste pipeline must route every step (activate, click, paste
+    keystroke) through the SikuliX bridge — not through `_macos.py`."""
+
+    def test_paste_routes_activate_click_key_through_bridge(self, fake_list_windows):
+        from holo.daemon import Daemon
+
+        bridge = _StubBridge()
+        d = Daemon(use_bridge=True)
+        # Inject the stub bridge by short-circuiting the lazy-start.
+        d._bridge = bridge  # type: ignore[assignment]
+        d._bridge_attempted = True
+
+        try:
+            ch = Channel(daemon=d, poll_interval=0.001, default_timeout=2.0)
+            ch.session = "sid-bridge"
+            ch._window_id = 7
+            ch._window_pid = 9999
+            ch._window_owner = "Google Chrome"
+            # Skip the WS handshake bootstrap — that path is exercised in
+            # TestWsPath and would otherwise double the paste sequence.
+            ch._ws_attempted = True
+
+            cur_title = {"value": "Page"}
+            qr_payload = {"value": None}
+            fake_list_windows.side_effect = lambda: [
+                _w(
+                    7,
+                    cur_title["value"],
+                    pid=9999,
+                    owner="Google Chrome",
+                    bounds=(100.0, 50.0, 320.0, 160.0),
+                ),
+            ]
+            captured: dict = {}
+
+            def fake_clipboard_write(text):
+                bridge.calls.append(("clipboard_write", text[:8]))
+                captured["frame"] = framing.decode(text)
+                cur_title["value"] = _make_reply_title(
+                    frame_id=captured["frame"].id,
+                    session="sid-bridge",
+                    result={"pong": True},
+                )
+                qr_payload["value"] = _make_reply_qr(
+                    frame_id=captured["frame"].id,
+                    session="sid-bridge",
+                    result={"pong": True},
+                )
+
+            with (
+                patch("holo.clipboard.write", side_effect=fake_clipboard_write),
+                patch("holo._macos.capture_window_qr", side_effect=_capture_returning(qr_payload)),
+                patch("holo.channel.ACTIVATE_SETTLE_S", 0.0),
+                patch("holo.channel.CLICK_SETTLE_S", 0.0),
+                patch("holo.channel.WS_HANDSHAKE_WAIT_S", 0.05),
+            ):
+                result = ch.send_command({"op": "ping"})
+
+            assert result == {"pong": True}
+            kinds = [c[0] for c in bridge.calls]
+            # Strict ordering: activate → click → clipboard write → key
+            assert kinds == ["activate", "click", "clipboard_write", "key"]
+            assert bridge.calls[0] == ("activate", "Google Chrome")
+            # The click point is centred horizontally, 75% of the way down.
+            assert bridge.calls[1] == ("click", 260, 170)
+            # Paste combo is platform-specific — match either Cmd+V or Ctrl+V.
+            assert bridge.calls[3][0] == "key"
+            assert bridge.calls[3][1] in {"cmd+v", "ctrl+v"}
+        finally:
+            d._bridge = None  # don't let shutdown call into the stub
+            d.shutdown()
+
+    def test_use_bridge_false_keeps_legacy_macos_path(self, fake_list_windows):
+        """When `use_bridge=False`, channels must NEVER touch the bridge.
+
+        Existing macOS users without OpenJDK installed depend on this —
+        the legacy `_macos.py` path stays default until binary builds
+        bundle the JVM as a bundled dep.
+        """
+        import sys as _sys
+
+        from holo.daemon import Daemon
+
+        if _sys.platform != "darwin":
+            pytest.skip("legacy path is darwin-only")
+
+        d = Daemon(use_bridge=False)
+        try:
+            assert d.bridge is None  # never starts when opted out
+            ch = Channel(daemon=d, poll_interval=0.001, default_timeout=2.0)
+            ch.session = "sid-legacy"
+            ch._window_id = 8
+            ch._window_pid = 1234
+            ch._window_owner = "Google Chrome"
+            ch._ws_attempted = True  # skip handshake bootstrap (see TestWsPath)
+            cur_title = {"value": "Page"}
+            qr_payload = {"value": None}
+            fake_list_windows.side_effect = lambda: [
+                _w(8, cur_title["value"], pid=1234, owner="Google Chrome",
+                   bounds=(0.0, 0.0, 320.0, 160.0)),
+            ]
+            captured: dict = {}
+            order: list = []
+
+            def fake_keystroke(name):
+                order.append(("keystroke", name))
+                cur_title["value"] = _make_reply_title(
+                    frame_id=captured["frame"].id,
+                    session="sid-legacy",
+                    result={"ok": True},
+                )
+                qr_payload["value"] = _make_reply_qr(
+                    frame_id=captured["frame"].id,
+                    session="sid-legacy",
+                    result={"ok": True},
+                )
+
+            def fake_clipboard_write(text):
+                captured["frame"] = framing.decode(text)
+
+            def fake_activate(p):
+                order.append(("activate", p))
+                return True
+
+            def fake_click(x, y):
+                order.append(("click", x, y))
+
+            with (
+                patch("holo._macos.activate_pid", side_effect=fake_activate),
+                patch("holo._macos.click_at", side_effect=fake_click),
+                patch("holo._macos.keystroke_paste", side_effect=fake_keystroke),
+                patch("holo._macos.capture_window_qr", side_effect=_capture_returning(qr_payload)),
+                patch("holo.clipboard.write", side_effect=fake_clipboard_write),
+                patch("holo.channel.ACTIVATE_SETTLE_S", 0.0),
+                patch("holo.channel.CLICK_SETTLE_S", 0.0),
+                patch("holo.channel.WS_HANDSHAKE_WAIT_S", 0.05),
+            ):
+                result = ch.send_command({"op": "ping"})
+
+            assert result == {"ok": True}
+            kinds = [t[0] for t in order]
+            assert kinds == ["activate", "click", "keystroke"]
+        finally:
+            d.shutdown()
+
+    def test_use_bridge_true_but_unavailable_falls_back(self):
+        """If `use_bridge=True` but the bridge fails to start (no jar / no
+        JDK), `daemon.bridge` returns None and channels must fall through
+        cleanly to the legacy path."""
+        from unittest.mock import patch
+
+        from holo.bridge import BridgeMissingError
+        from holo.daemon import Daemon
+
+        d = Daemon(use_bridge=True)
+        try:
+            with patch("holo.bridge.BridgeClient.start", side_effect=BridgeMissingError("no jar")):
+                assert d.bridge is None
+                # Second call should not retry — `_bridge_attempted` is sticky.
+                assert d.bridge is None
+        finally:
+            d.shutdown()
