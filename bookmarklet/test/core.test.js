@@ -26,6 +26,7 @@ function stubElement(tagName) {
     contentEditable: "false",
     spellcheck: true,
     textContent: "",
+    value: "",
     setAttribute(k, v) {
       this.attributes[k] = v;
     },
@@ -62,6 +63,9 @@ function stubWindow() {
     querySelector(sel) {
       if (sel === "title") return titleEl;
       return null;
+    },
+    createElement(tag) {
+      return stubElement(tag);
     },
   };
   const win = {
@@ -136,13 +140,14 @@ describe("core.js module exports", () => {
 // ---------- buildPopupBody ----------
 
 describe("buildPopupBody", () => {
-  it("makes the body a contenteditable paste target", () => {
+  it("creates a textarea paste target inside the body", () => {
     const win = stubWindow();
-    const body = buildPopupBody(win.document);
-    assert.equal(body, win.document.body);
-    assert.equal(body.contentEditable, "true");
-    assert.equal(body.spellcheck, false);
-    assert.equal(body.attributes["aria-label"], "holo paste target");
+    const target = buildPopupBody(win.document);
+    assert.equal(target.tagName, "textarea");
+    assert.equal(win.document.body.children[0], target);
+    assert.equal(target.spellcheck, false);
+    assert.equal(target.attributes["aria-label"], "holo paste target");
+    assert.equal(target.attributes["id"] ?? target.id, "__holo_paste_target__");
   });
 
   it("sets the popup document title", () => {
@@ -151,10 +156,10 @@ describe("buildPopupBody", () => {
     assert.equal(win.document.title, "holo console");
   });
 
-  it("seeds the body with a 'keep this window open' note", () => {
+  it("seeds the textarea with a 'keep this window open' note", () => {
     const win = stubWindow();
-    const body = buildPopupBody(win.document);
-    assert.match(body.textContent, /keep this window open/);
+    const target = buildPopupBody(win.document);
+    assert.match(target.value, /keep this window open/);
   });
 });
 
@@ -177,17 +182,19 @@ describe("installInPopup", () => {
     assert.match(popup.document.title, /\[holo:bye:sid-1\]$/);
   });
 
-  it("registers a paste listener on the body", () => {
+  it("registers a paste listener on the textarea", () => {
     const popup = stubWindow();
     const opener = stubWindow();
     installInPopup(popup, opener, "sid");
-    assert.ok(popup.document.body.listeners.paste?.length >= 1);
+    const textarea = popup.document.body.children[0];
+    assert.ok(textarea.listeners.paste?.length >= 1);
   });
 
-  it("focuses the panel on install", () => {
+  it("focuses the textarea on install", () => {
     const popup = stubWindow();
     const opener = stubWindow();
     installInPopup(popup, opener, "sid");
-    assert.equal(popup.document.body._focused, true);
+    const textarea = popup.document.body.children[0];
+    assert.equal(textarea._focused, true);
   });
 });
