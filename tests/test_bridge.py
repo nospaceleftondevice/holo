@@ -11,6 +11,7 @@ There's a separate opt-in integration test under
 
 from __future__ import annotations
 
+import hashlib
 import io
 import json
 import threading
@@ -19,7 +20,14 @@ from unittest.mock import patch
 
 import pytest
 
-from holo.bridge import BridgeClient, BridgeError, BridgeMissingError
+import holo.bridge as bridge_mod
+from holo.bridge import (
+    SIKULI_JAR_NAME,
+    BridgeClient,
+    BridgeError,
+    BridgeMissingError,
+    ensure_jar,
+)
 
 
 class _FakeProc:
@@ -358,13 +366,108 @@ class TestResourceResolution:
         client = BridgeClient()
         assert client._resolve_jar() == api
 
-    def test_missing_jar_raises_clean_error(self, tmp_path, monkeypatch):
+    def test_missing_jar_with_no_download_raises(self, tmp_path, monkeypatch):
         monkeypatch.delenv("HOLO_SIKULI_JAR", raising=False)
         monkeypatch.setattr("holo.bridge._repo_root", lambda: tmp_path, raising=True)
         monkeypatch.setattr("holo.bridge._bundle_root", lambda: None)
+        monkeypatch.setenv("HOLO_BRIDGE_NO_DOWNLOAD", "1")
         client = BridgeClient()
-        with pytest.raises(BridgeMissingError, match="vendor/"):
+        with pytest.raises(BridgeMissingError, match="HOLO_BRIDGE_NO_DOWNLOAD"):
             client._resolve_jar()
+
+    def test_missing_jar_falls_through_to_ensure_jar(self, tmp_path, monkeypatch):
+        # When all explicit / env / repo paths come up empty, _resolve_jar
+        # is expected to call ensure_jar() rather than raise outright.
+        monkeypatch.delenv("HOLO_SIKULI_JAR", raising=False)
+        monkeypatch.delenv("HOLO_BRIDGE_NO_DOWNLOAD", raising=False)
+        monkeypatch.setattr("holo.bridge._repo_root", lambda: tmp_path, raising=True)
+        monkeypatch.setattr("holo.bridge._bundle_root", lambda: None)
+        downloaded = tmp_path / "from-download.jar"
+        downloaded.write_bytes(b"")
+        with patch.object(bridge_mod, "ensure_jar", return_value=downloaded) as fake:
+            client = BridgeClient()
+            assert client._resolve_jar() == downloaded
+        fake.assert_called_once()
+
+
+class TestEnsureJar:
+    """`ensure_jar()` is the cache-warming + download primitive used by
+    both `holo install-bridge` and the lazy fallback in `_resolve_jar()`.
+    """
+
+    def _patch_constants(self, monkeypatch, *, sha: str, body: bytes) -> None:
+        monkeypatch.setattr(bridge_mod, "SIKULI_JAR_SHA256", sha, raising=True)
+        # Stub the downloader so tests don't hit the network.
+        def fake_download(url, dest, *, on_progress=None):
+            with open(dest, "wb") as f:
+                f.write(body)
+            if on_progress is not None:
+                on_progress(len(body), len(body))
+
+        monkeypatch.setattr(bridge_mod, "_download", fake_download, raising=True)
+
+    def test_short_circuits_when_cached_and_valid(self, tmp_path, monkeypatch):
+        body = b"sikulix-jar-content"
+        sha = hashlib.sha256(body).hexdigest()
+        cache = tmp_path / "cache"
+        cache.mkdir()
+        (cache / SIKULI_JAR_NAME).write_bytes(body)
+
+        monkeypatch.setattr(bridge_mod, "SIKULI_JAR_SHA256", sha, raising=True)
+        downloaded: list[str] = []
+        monkeypatch.setattr(
+            bridge_mod,
+            "_download",
+            lambda url, dest, **_kw: downloaded.append(str(dest)),
+            raising=True,
+        )
+
+        path = ensure_jar(cache_dir=cache)
+        assert path == cache / SIKULI_JAR_NAME
+        assert downloaded == []  # never re-downloaded
+
+    def test_downloads_when_missing(self, tmp_path, monkeypatch):
+        body = b"sikulix-jar-content-fresh"
+        sha = hashlib.sha256(body).hexdigest()
+        cache = tmp_path / "cache"
+
+        self._patch_constants(monkeypatch, sha=sha, body=body)
+        progress_calls: list[tuple[int, int]] = []
+
+        path = ensure_jar(
+            cache_dir=cache,
+            on_progress=lambda r, t: progress_calls.append((r, t)),
+        )
+        assert path == cache / SIKULI_JAR_NAME
+        assert path.read_bytes() == body
+        assert progress_calls == [(len(body), len(body))]
+
+    def test_redownloads_when_cached_digest_mismatches(self, tmp_path, monkeypatch):
+        # A stale jar (wrong SHA) must be deleted and replaced.
+        cache = tmp_path / "cache"
+        cache.mkdir()
+        (cache / SIKULI_JAR_NAME).write_bytes(b"stale")
+        body = b"correct-content"
+        sha = hashlib.sha256(body).hexdigest()
+
+        self._patch_constants(monkeypatch, sha=sha, body=body)
+        path = ensure_jar(cache_dir=cache)
+        assert path.read_bytes() == body
+
+    def test_raises_on_post_download_sha_mismatch(self, tmp_path, monkeypatch):
+        # If the *downloaded* bytes don't match the pinned SHA, refuse
+        # to install the file and clean up the partial artifact.
+        body = b"tampered-content"
+        cache = tmp_path / "cache"
+        self._patch_constants(
+            monkeypatch,
+            sha="0" * 64,  # never matches
+            body=body,
+        )
+        with pytest.raises(BridgeMissingError, match="SHA-256 mismatch"):
+            ensure_jar(cache_dir=cache)
+        assert not (cache / SIKULI_JAR_NAME).exists()
+        assert not (cache / (SIKULI_JAR_NAME + ".part")).exists()
 
 
 class TestThreadSafety:
