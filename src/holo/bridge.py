@@ -3,38 +3,59 @@
 Spawns `java -jar sikulixapi.jar -r bridge/bridge.py` as a subprocess
 (stdio transport) and exchanges line-delimited JSON-RPC over its
 stdin/stdout. Methods on `BridgeClient` map to the bridge's handlers:
-`activate`, `click`, `key`, `type_text`. Used by `channel.py` to
-replace the macOS-specific input pipeline in `_macos.py`.
+`activate`, `click`, `key`, `type_text`, `screenshot`, `find_image`.
 
 A second transport — connecting to a remote bridge over TCP — is
 designed in but not yet implemented; it'll land alongside the cross-
 host work in Phase 3. The `BridgeClient` interface is independent of
 transport so the caller doesn't have to know which is in use.
 
-Resource resolution (where to find `sikulixapi.jar` and `bridge.py`):
+Resource resolution (where to find the SikuliX jar and `bridge.py`):
 
     1. Explicit kwargs (`jar_path=`, `script_path=`)
     2. Env vars `HOLO_SIKULI_JAR`, `HOLO_BRIDGE_SCRIPT`
     3. PyInstaller's `sys._MEIPASS` (release builds bundle both)
-    4. Repo-root fallback: `<repo>/vendor/sikulixapi.jar` and
+    4. Repo-root fallback: `<repo>/vendor/sikulix*.jar` and
        `<repo>/bridge/bridge.py` (development)
+    5. User cache dir: `~/Library/Caches/holo` (macOS) or
+       `~/.cache/holo` (Linux). `holo install-bridge` populates this
+       from the pinned GitHub Release; `BridgeClient` will also
+       auto-download on first start unless `HOLO_BRIDGE_NO_DOWNLOAD=1`.
 
-If the jar can't be found, `BridgeClient.start()` raises
-`BridgeMissingError` so callers can surface a clean diagnostic
-instead of an opaque `FileNotFoundError`.
+If the jar can't be found and auto-download is disabled, `start()`
+raises `BridgeMissingError` so callers can surface a clean
+diagnostic instead of an opaque `FileNotFoundError`.
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import subprocess
 import sys
 import threading
+import urllib.error
+import urllib.request
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+
+# --- Pinned SikuliX release ----------------------------------------------
+# Mirror of the upstream SikuliX 2.0.5 IDE jar, hosted on our own GitHub
+# Releases so version drift is our call. `holo install-bridge` and the
+# auto-download path both fetch this exact URL and verify the digest.
+SIKULI_VERSION: str = "2.0.5"
+SIKULI_JAR_NAME: str = "sikulixide-2.0.5.jar"
+SIKULI_JAR_URL: str = (
+    "https://github.com/nospaceleftondevice/holo/releases/download/"
+    "vendored-sikulix-2.0.5/sikulixide-2.0.5.jar"
+)
+SIKULI_JAR_SHA256: str = (
+    "f4b0b50c8e413094e78cd1d8fed02ae65f62f8c53ed00da0562fdedf4acff729"
+)
+SIKULI_JAR_BYTES: int = 128_949_200
 
 
 class BridgeError(RuntimeError):
@@ -236,17 +257,20 @@ class BridgeClient:
 
     def _resolve_jar(self) -> Path:
         if self.jar_path is not None:
-            return _require(Path(self.jar_path), "sikulixapi.jar")
+            return _require(Path(self.jar_path), "SikuliX jar")
         env = os.environ.get("HOLO_SIKULI_JAR")
         if env:
-            return _require(Path(env), "sikulixapi.jar (HOLO_SIKULI_JAR)")
+            return _require(Path(env), "SikuliX jar (HOLO_SIKULI_JAR)")
         for candidate in _candidate_jar_paths():
             if candidate.exists():
                 return candidate
-        raise BridgeMissingError(
-            "SikuliX jar not found. Set HOLO_SIKULI_JAR or drop "
-            "sikulixapi-*.jar / sikulixide-*.jar into vendor/ at the repo root."
-        )
+        if os.environ.get("HOLO_BRIDGE_NO_DOWNLOAD") == "1":
+            raise BridgeMissingError(
+                "SikuliX jar not found and HOLO_BRIDGE_NO_DOWNLOAD=1. "
+                "Drop sikulixide-*.jar in vendor/ or set HOLO_SIKULI_JAR."
+            )
+        # Last resort: download from the pinned release into the cache.
+        return ensure_jar()
 
     def _resolve_script(self) -> Path:
         if self.script_path is not None:
@@ -340,3 +364,75 @@ def _candidate_script_paths() -> list[Path]:
     repo = _repo_root()
     out.append(repo / "bridge" / "bridge.py")
     return out
+
+
+# ---- jar download -----------------------------------------------------
+
+
+def ensure_jar(
+    *,
+    cache_dir: Path | None = None,
+    on_progress: Any = None,
+) -> Path:
+    """Return the cached SikuliX jar path, downloading it if missing.
+
+    Verifies the SHA-256 digest after download (and re-downloads if a
+    cached copy's digest doesn't match the pinned value — corrupted
+    download or mismatched version). Idempotent: subsequent calls
+    return immediately when the cached file is already valid.
+
+    `on_progress` is an optional callable `(bytes_read, total_bytes)`
+    invoked during download for progress reporting (used by
+    `holo install-bridge`).
+    """
+    cache = cache_dir if cache_dir is not None else _user_cache_dir()
+    cache.mkdir(parents=True, exist_ok=True)
+    target = cache / SIKULI_JAR_NAME
+
+    if target.exists():
+        if _sha256(target) == SIKULI_JAR_SHA256:
+            return target
+        # Stale or corrupted — drop and re-download.
+        target.unlink(missing_ok=True)
+
+    tmp = target.with_suffix(target.suffix + ".part")
+    try:
+        _download(SIKULI_JAR_URL, tmp, on_progress=on_progress)
+        digest = _sha256(tmp)
+        if digest != SIKULI_JAR_SHA256:
+            raise BridgeMissingError(
+                f"SHA-256 mismatch for {SIKULI_JAR_URL}: "
+                f"expected {SIKULI_JAR_SHA256}, got {digest}"
+            )
+        tmp.replace(target)
+    finally:
+        # If the download or verification failed, leave nothing partial.
+        if tmp.exists():
+            tmp.unlink(missing_ok=True)
+    return target
+
+
+def _download(url: str, dest: Path, *, on_progress: Any = None) -> None:
+    try:
+        with urllib.request.urlopen(url) as response:  # noqa: S310 (pinned URL)
+            total = int(response.headers.get("Content-Length") or 0) or SIKULI_JAR_BYTES
+            with open(dest, "wb") as out:
+                read = 0
+                while True:
+                    chunk = response.read(64 * 1024)
+                    if not chunk:
+                        break
+                    out.write(chunk)
+                    read += len(chunk)
+                    if on_progress is not None:
+                        on_progress(read, total)
+    except urllib.error.URLError as e:
+        raise BridgeMissingError(f"download from {url} failed: {e}") from e
+
+
+def _sha256(path: Path) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()

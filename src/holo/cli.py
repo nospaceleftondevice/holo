@@ -8,6 +8,7 @@ Subcommands:
     holo demo              end-to-end smoke test against the in-page agent
     holo mcp               run the MCP server over stdio
     holo bridge <verb>     smoke-test the SikuliX bridge directly
+    holo install-bridge    pre-download the SikuliX jar into the user cache
 """
 
 from __future__ import annotations
@@ -359,12 +360,60 @@ def _cmd_bridge(rest: list[str]) -> int:
     return 0
 
 
+def _cmd_install_bridge() -> int:
+    """Pre-download the SikuliX jar into the user cache.
+
+    Useful in air-gapped / metered-bandwidth environments where you want
+    to stage the jar up front rather than letting the daemon fetch it on
+    first run. Idempotent: if the cached file is already valid, exits
+    immediately.
+    """
+    from holo.bridge import (
+        SIKULI_JAR_BYTES,
+        SIKULI_JAR_NAME,
+        SIKULI_JAR_URL,
+        BridgeMissingError,
+        ensure_jar,
+    )
+
+    print(f"holo install-bridge — fetching {SIKULI_JAR_NAME}")
+    print(f"  source: {SIKULI_JAR_URL}")
+
+    last_pct = {"value": -1}
+
+    def on_progress(read: int, total: int) -> None:
+        if not total:
+            return
+        pct = int(100 * read / total)
+        if pct != last_pct["value"]:
+            last_pct["value"] = pct
+            sys.stdout.write(
+                f"\r  progress: {pct:3d}%  ({read / 1_048_576:.1f} / "
+                f"{total / 1_048_576:.1f} MiB)"
+            )
+            sys.stdout.flush()
+
+    try:
+        path = ensure_jar(on_progress=on_progress)
+    except BridgeMissingError as e:
+        print()
+        print(f"holo install-bridge: {e}", file=sys.stderr)
+        return 1
+    finally:
+        if last_pct["value"] >= 0:
+            print()
+    print(f"✓ cached at {path}")
+    print(f"  size:   {path.stat().st_size} bytes (pinned: {SIKULI_JAR_BYTES})")
+    return 0
+
+
 COMMANDS = {
     "windows": _cmd_windows,
     "doctor": _cmd_doctor,
     "demo": _cmd_demo,
     "focus": _cmd_focus,
     "mcp": _cmd_mcp,
+    "install-bridge": _cmd_install_bridge,
 }
 
 
@@ -373,7 +422,8 @@ def main(argv: list[str] | None = None) -> int:
     if not args:
         print(
             f"holo {__version__} — try `holo --version`, `holo windows`, "
-            "`holo doctor`, `holo demo`, `holo focus`, `holo mcp`, or `holo bridge`"
+            "`holo doctor`, `holo demo`, `holo focus`, `holo mcp`, "
+            "`holo bridge`, or `holo install-bridge`"
         )
         return 0
     cmd = args[0]
