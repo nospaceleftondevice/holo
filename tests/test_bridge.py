@@ -248,6 +248,63 @@ class TestConvenienceVerbs:
         assert json.loads(sent[1])["method"] == "screen.type"
         assert json.loads(sent[1])["params"] == {"text": "hello"}
 
+    def test_screenshot_decodes_base64_to_png_bytes(self, tmp_path):
+        import base64 as _b64
+
+        png_bytes = b"\x89PNG\r\n\x1a\n..."  # not a real PNG; just bytes to round-trip
+        client, fake = self._client_for(
+            tmp_path,
+            [{"id": "REQ", "result": {"image": _b64.b64encode(png_bytes).decode()}}],
+        )
+        with patch("holo.bridge.uuid.uuid4") as uu:
+            uu.return_value.hex = "REQ"
+            out = client.screenshot()
+        assert out == png_bytes
+        sent = fake.stdin.getvalue().decode().strip().splitlines()
+        assert json.loads(sent[1])["method"] == "screen.shot"
+        assert json.loads(sent[1])["params"] == {}
+
+    def test_screenshot_passes_region(self, tmp_path):
+        import base64 as _b64
+
+        client, fake = self._client_for(
+            tmp_path,
+            [{"id": "REQ", "result": {"image": _b64.b64encode(b"X").decode()}}],
+        )
+        with patch("holo.bridge.uuid.uuid4") as uu:
+            uu.return_value.hex = "REQ"
+            client.screenshot(region={"x": 10, "y": 20, "width": 30, "height": 40})
+        sent = fake.stdin.getvalue().decode().strip().splitlines()
+        assert json.loads(sent[1])["params"] == {
+            "region": {"x": 10, "y": 20, "width": 30, "height": 40}
+        }
+
+    def test_find_image_encodes_needle_and_passes_score(self, tmp_path):
+        import base64 as _b64
+
+        needle = b"\x89PNG\r\n\x1a\nstub-needle"
+        client, fake = self._client_for(
+            tmp_path,
+            [{
+                "id": "REQ",
+                "result": {"x": 100, "y": 200, "width": 30, "height": 30, "score": 0.92},
+            }],
+        )
+        with patch("holo.bridge.uuid.uuid4") as uu:
+            uu.return_value.hex = "REQ"
+            out = client.find_image(needle, score=0.85)
+        assert out == {"x": 100, "y": 200, "width": 30, "height": 30, "score": 0.92}
+        sent = fake.stdin.getvalue().decode().strip().splitlines()
+        params = json.loads(sent[1])["params"]
+        assert params["needle"] == _b64.b64encode(needle).decode("ascii")
+        assert params["score"] == 0.85
+
+    def test_find_image_returns_none_for_no_match(self, tmp_path):
+        client, _ = self._client_for(tmp_path, [{"id": "REQ", "result": None}])
+        with patch("holo.bridge.uuid.uuid4") as uu:
+            uu.return_value.hex = "REQ"
+            assert client.find_image(b"PNG") is None
+
 
 class TestResourceResolution:
     def test_explicit_jar_path_must_exist(self, tmp_path):

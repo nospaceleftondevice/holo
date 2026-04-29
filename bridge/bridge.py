@@ -101,13 +101,107 @@ def handle_screen_type(params):
     return {"typed_chars": len(text)}
 
 
+def handle_screen_shot(params):
+    # Capture either a region {x, y, width, height} or the full primary screen.
+    region = params.get("region")
+    screen = sikuli.Screen()
+    if region:
+        capture = screen.capture(
+            int(region["x"]),
+            int(region["y"]),
+            int(region["width"]),
+            int(region["height"]),
+        )
+    else:
+        capture = screen.capture()
+    return {"image": _encode_png_b64(capture.getImage())}
+
+
+def handle_screen_find_image(params):
+    # Needle is a base64-encoded PNG. Score threshold (0..1) bounds the
+    # match's similarity; lower means we accept fuzzier matches.
+    import base64
+
+    needle_b64 = params["needle"]
+    score = float(params.get("score", 0.7))
+    needle_bytes = base64.b64decode(needle_b64)
+    needle_path = _write_temp_png(needle_bytes)
+    try:
+        target = sikuli.Screen()
+        if "region" in params and params["region"] is not None:
+            r = params["region"]
+            target = sikuli.Region(
+                int(r["x"]),
+                int(r["y"]),
+                int(r["width"]),
+                int(r["height"]),
+            )
+        try:
+            pattern = sikuli.Pattern(needle_path).similar(score)
+            match = target.exists(pattern, 0)
+        except Exception:
+            match = None
+        if match is None:
+            return None
+        return {
+            "x": int(match.getX()),
+            "y": int(match.getY()),
+            "width": int(match.getW()),
+            "height": int(match.getH()),
+            "score": float(match.getScore()),
+        }
+    finally:
+        _remove_quietly(needle_path)
+
+
 HANDLERS = {
     "ping": handle_ping,
     "app.activate": handle_app_activate,
     "screen.click": handle_screen_click,
     "screen.key": handle_screen_key,
     "screen.type": handle_screen_type,
+    "screen.shot": handle_screen_shot,
+    "screen.find_image": handle_screen_find_image,
 }
+
+
+# ---- image / file helpers ----------------------------------------------
+
+def _encode_png_b64(buffered_image):
+    # Encodes an `java.awt.image.BufferedImage` to a base64 PNG string.
+    import base64
+
+    from java.io import ByteArrayOutputStream
+    from javax.imageio import ImageIO
+
+    buf = ByteArrayOutputStream()
+    ImageIO.write(buffered_image, "PNG", buf)
+    return base64.b64encode(buf.toByteArray().tostring()).decode("ascii")
+
+
+def _write_temp_png(data):
+    # Write bytes to a tempfile and return its path. SikuliX matchers
+    # take filesystem paths or Pattern objects; ImageIO can decode
+    # in-memory but Pattern() is the smoothest entry point so we hit
+    # the disk briefly.
+    import os
+    import tempfile
+
+    fd, path = tempfile.mkstemp(suffix=".png", prefix="holo-needle-")
+    try:
+        os.write(fd, data)
+    finally:
+        os.close(fd)
+    return path
+
+
+def _remove_quietly(path):
+    import os
+
+    try:
+        os.unlink(path)
+    except OSError:
+        pass
 
 
 # ---- key/modifier resolution -------------------------------------------

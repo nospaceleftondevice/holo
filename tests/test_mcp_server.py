@@ -51,11 +51,51 @@ class _StubChannel:
         return item
 
 
-class _FakeDaemon:
+class _StubBridge:
+    """Stand-in for the SikuliX bridge — records calls, returns canned data."""
+
     def __init__(self) -> None:
+        self.calls: list[tuple[str, dict]] = []
+        self.next_screenshot: bytes = b"\x89PNG-stub"
+        self.next_find: dict | None = {
+            "x": 50,
+            "y": 60,
+            "width": 30,
+            "height": 30,
+            "score": 0.95,
+        }
+
+    def activate(self, name):
+        self.calls.append(("activate", {"name": name}))
+        return {"focused": True, "name": name}
+
+    def click(self, x, y, *, modifiers=None):
+        self.calls.append(("click", {"x": x, "y": y, "modifiers": modifiers or []}))
+        return {"clicked": True, "x": x, "y": y}
+
+    def key(self, combo):
+        self.calls.append(("key", {"combo": combo}))
+        return {"sent": combo}
+
+    def type_text(self, text):
+        self.calls.append(("type_text", {"text": text}))
+        return {"typed_chars": len(text)}
+
+    def screenshot(self, *, region=None, timeout=15.0):
+        self.calls.append(("screenshot", {"region": region}))
+        return self.next_screenshot
+
+    def find_image(self, needle, *, region=None, score=0.7, timeout=15.0):
+        self.calls.append(("find_image", {"needle": needle, "region": region, "score": score}))
+        return self.next_find
+
+
+class _FakeDaemon:
+    def __init__(self, *, bridge: _StubBridge | None = None) -> None:
         self.registry = ChannelRegistry()
         self.shutdown_called = False
         self.next_calibrations: list[Any] = []
+        self.bridge = bridge
 
     def calibrate(self, *, timeout: float | None = None) -> _StubChannel:
         if not self.next_calibrations:
@@ -250,6 +290,101 @@ class TestShutdownAndBuild:
                 "ping",
                 "read_global",
                 "send_command",
+                "app_activate",
+                "screen_click",
+                "screen_type",
+                "screen_key",
+                "screen_shot",
+                "screen_find_image",
             }
         finally:
             holo.shutdown()
+
+
+class TestScreenTools:
+    """SikuliX-backed tools that don't take a sid — they drive whatever's
+    in the foreground. Each delegates straight to `daemon.bridge`; the
+    server is responsible only for the bridge-availability check and
+    base64 marshalling."""
+
+    @pytest.fixture
+    def server_with_bridge(self):
+        bridge = _StubBridge()
+        server = HoloMCPServer(use_bridge=True)
+        fake = _FakeDaemon(bridge=bridge)
+        server._daemon = fake  # bypass lazy init
+        return server, bridge
+
+    def test_app_activate_delegates(self, server_with_bridge):
+        server, bridge = server_with_bridge
+        out = server.app_activate("Google Chrome")
+        assert out == {"focused": True, "name": "Google Chrome"}
+        assert bridge.calls == [("activate", {"name": "Google Chrome"})]
+
+    def test_screen_click_passes_modifiers(self, server_with_bridge):
+        server, bridge = server_with_bridge
+        server.screen_click(100, 200, modifiers=["cmd"])
+        assert bridge.calls == [
+            ("click", {"x": 100, "y": 200, "modifiers": ["cmd"]})
+        ]
+
+    def test_screen_type_and_key(self, server_with_bridge):
+        server, bridge = server_with_bridge
+        server.screen_type("hello")
+        server.screen_key("cmd+v")
+        assert bridge.calls == [
+            ("type_text", {"text": "hello"}),
+            ("key", {"combo": "cmd+v"}),
+        ]
+
+    def test_screen_shot_returns_base64_payload(self, server_with_bridge):
+        import base64
+
+        server, bridge = server_with_bridge
+        bridge.next_screenshot = b"PNG-bytes-here"
+        out = server.screen_shot()
+        assert out["format"] == "png"
+        assert out["byte_count"] == len(b"PNG-bytes-here")
+        assert base64.b64decode(out["image"]) == b"PNG-bytes-here"
+        assert bridge.calls == [("screenshot", {"region": None})]
+
+    def test_screen_shot_passes_region(self, server_with_bridge):
+        server, bridge = server_with_bridge
+        region = {"x": 10, "y": 20, "width": 30, "height": 40}
+        server.screen_shot(region=region)
+        assert bridge.calls[-1] == ("screenshot", {"region": region})
+
+    def test_screen_find_image_decodes_needle(self, server_with_bridge):
+        import base64
+
+        server, bridge = server_with_bridge
+        needle_bytes = b"\x89PNG-needle-bytes"
+        out = server.screen_find_image(
+            base64.b64encode(needle_bytes).decode("ascii"), score=0.9
+        )
+        assert out == {"x": 50, "y": 60, "width": 30, "height": 30, "score": 0.95}
+        assert bridge.calls[-1][0] == "find_image"
+        params = bridge.calls[-1][1]
+        assert params["needle"] == needle_bytes
+        assert params["score"] == 0.9
+        assert params["region"] is None
+
+    def test_screen_find_image_returns_none_for_no_match(self, server_with_bridge):
+        import base64
+
+        server, bridge = server_with_bridge
+        bridge.next_find = None
+        out = server.screen_find_image(base64.b64encode(b"x").decode())
+        assert out is None
+
+    def test_screen_find_image_rejects_bad_base64(self, server_with_bridge):
+        server, _ = server_with_bridge
+        with pytest.raises(ValueError, match="base64"):
+            server.screen_find_image("!!!not-base64!!!")
+
+    def test_no_bridge_raises_clean_error(self):
+        server = HoloMCPServer(use_bridge=False)
+        fake = _FakeDaemon(bridge=None)
+        server._daemon = fake
+        with pytest.raises(RuntimeError, match="SikuliX bridge unavailable"):
+            server.screen_click(0, 0)

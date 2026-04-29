@@ -198,6 +198,40 @@ class BridgeClient:
         # Avoid clashing with the `type` builtin in callers' namespaces.
         return self.request("screen.type", {"text": text})
 
+    def screenshot(
+        self,
+        *,
+        region: dict[str, int] | None = None,
+        timeout: float = 15.0,
+    ) -> bytes:
+        """Capture the screen (or a region) and return raw PNG bytes."""
+        import base64 as _b64
+
+        params: dict[str, Any] = {}
+        if region is not None:
+            params["region"] = region
+        result = self.request("screen.shot", params, timeout=timeout)
+        return _b64.b64decode(result["image"])
+
+    def find_image(
+        self,
+        needle: bytes,
+        *,
+        region: dict[str, int] | None = None,
+        score: float = 0.7,
+        timeout: float = 15.0,
+    ) -> dict[str, Any] | None:
+        """Find `needle` (PNG bytes) on screen. Returns coords/score or None."""
+        import base64 as _b64
+
+        params: dict[str, Any] = {
+            "needle": _b64.b64encode(needle).decode("ascii"),
+            "score": score,
+        }
+        if region is not None:
+            params["region"] = region
+        return self.request("screen.find_image", params, timeout=timeout)
+
     # ---- resource resolution --------------------------------------------
 
     def _resolve_jar(self) -> Path:
