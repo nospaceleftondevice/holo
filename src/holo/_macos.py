@@ -10,6 +10,7 @@ platforms for tests / coverage.
 from __future__ import annotations
 
 import subprocess
+import sys as _sys
 
 
 def activate_pid(pid: int) -> bool:
@@ -111,13 +112,128 @@ def keystroke_paste(app_name: str | None = None) -> bool:
         return False
 
 
-def capture_window_qr(window_id: int) -> str | None:
+# Stealth-mode QR colors. The bookmarklet renders dark modules as
+# (124, 200, 120) and light modules as (120, 200, 120) — a 4-unit
+# delta in the red channel only, which is below the threshold a human
+# eye (or external phone camera with typical sensor noise) can pick
+# out from a meter away. The daemon thresholds the captured pixels'
+# red channel below before passing the bitmap to Vision.
+STEALTH_PIVOT_R: int = 122  # midpoint between the two reds
+
+
+def _amplify_stealth_qr(image_ref):
+    """Return a CGImage where the bookmarklet's two near-identical
+    greens have been mapped to black/white.
+
+    Renders the captured image into a CGBitmapContext we own (forced
+    to RGBA, device-RGB so values stay sRGB-numerically) and walks the
+    buffer thresholding the red channel against `STEALTH_PIVOT_R`:
+    above pivot → black (dark QR module), at-or-below → white. The
+    popup body, title text, and textarea all sit far below pivot, so
+    they collapse into the QR's quiet zone — Vision happily ignores
+    extra white space around the symbol.
+
+    Raw pixel iteration sidesteps Core Image's working-color-space
+    quirks (CI filters operate in linear-light by default, so an
+    sRGB-valued pivot produces wrong results without explicit color-
+    space handling). One pass through ~230 k pixels is comfortably
+    under our 150 ms poll cadence.
+    """
+    from Quartz import (  # type: ignore[import-not-found]
+        CGBitmapContextCreate,
+        CGBitmapContextCreateImage,
+        CGColorSpaceCreateDeviceRGB,
+        CGContextDrawImage,
+        CGImageGetHeight,
+        CGImageGetWidth,
+        kCGImageAlphaPremultipliedLast,
+    )
+
+    width = CGImageGetWidth(image_ref)
+    height = CGImageGetHeight(image_ref)
+    if width == 0 or height == 0:
+        return image_ref
+    bytes_per_row = width * 4
+    total = bytes_per_row * height
+
+    # Allocate a Python-side buffer. CGBitmapContextCreate aliases
+    # this buffer (it doesn't copy), so the bytes get written by
+    # CGContextDrawImage and read by CGBitmapContextCreateImage.
+    buf = bytearray(total)
+    color_space = CGColorSpaceCreateDeviceRGB()
+    ctx = CGBitmapContextCreate(
+        buf, width, height, 8, bytes_per_row, color_space,
+        kCGImageAlphaPremultipliedLast,
+    )
+    if ctx is None:
+        return image_ref
+    CGContextDrawImage(ctx, ((0, 0), (width, height)), image_ref)
+
+    pivot = STEALTH_PIVOT_R
+
+    # Optional one-shot histogram dump for debugging the threshold —
+    # set HOLO_DEBUG_STEALTH=1 in the env to see what the captured
+    # pixels look like before amplification.
+    if _STEALTH_DEBUG:
+        _dump_stealth_histogram(buf)
+
+    # RGBA layout: byte 0 = R, byte 3 = A. Step 4 bytes per pixel.
+    for i in range(0, total, 4):
+        if buf[i] > pivot:
+            buf[i] = 0
+            buf[i + 1] = 0
+            buf[i + 2] = 0
+        else:
+            buf[i] = 255
+            buf[i + 1] = 255
+            buf[i + 2] = 255
+
+    out = CGBitmapContextCreateImage(ctx)
+    return out if out is not None else image_ref
+
+
+import os as _os  # noqa: E402
+
+_STEALTH_DEBUG: bool = _os.environ.get("HOLO_DEBUG_STEALTH") == "1"
+
+
+def _dump_stealth_histogram(buf: bytearray) -> None:
+    """Print a one-shot R-channel histogram around the stealth pivot.
+
+    Helps diagnose 'amplified QR doesn't decode' failures: we want to
+    see two clear humps near 120 and 124 in the captured framebuffer.
+    Disables itself after the first call so we don't spam the log.
+    """
+    global _STEALTH_DEBUG
+    _STEALTH_DEBUG = False
+    counts: dict[int, int] = {}
+    for i in range(0, len(buf), 4):
+        r = buf[i]
+        counts[r] = counts.get(r, 0) + 1
+    pivot = STEALTH_PIVOT_R
+    near = sorted(
+        (k, v) for k, v in counts.items() if pivot - 10 <= k <= pivot + 10
+    )
+    print(f"[holo stealth] R-channel histogram around pivot={pivot}:", file=_sys.stderr)
+    for k, v in near:
+        print(f"  R={k:3d}: {v}", file=_sys.stderr)
+    above = sum(v for k, v in counts.items() if k > pivot)
+    below = sum(v for k, v in counts.items() if k <= pivot)
+    print(f"[holo stealth] above pivot: {above}, at-or-below: {below}", file=_sys.stderr)
+
+
+def capture_window_qr(window_id: int, *, hide_qr: bool = False) -> str | None:
     """Capture the given window's pixels and decode any QR code present.
 
     The popup renders its replies as QR codes on a canvas because the
     title channel is OS-truncated for any payload longer than ~70
     characters. Pixel capture has no such limit and is CSP-immune,
     so it works as the universal page → daemon channel.
+
+    When `hide_qr=True`, the popup paints the QR in two near-identical
+    greens that humans / external cameras can't decode. We amplify the
+    captured image's red-channel delta into a real black/white QR via
+    a CIColorMatrix filter before handing it to Vision.
 
     Returns the QR's payload string, or None if:
     - the window can't be captured (closed, off-screen, no permission)
@@ -143,6 +259,9 @@ def capture_window_qr(window_id: int) -> str | None:
     )
     if image_ref is None:
         return None
+
+    if hide_qr:
+        image_ref = _amplify_stealth_qr(image_ref)
 
     from Vision import (  # type: ignore[import-not-found]
         VNDetectBarcodesRequest,

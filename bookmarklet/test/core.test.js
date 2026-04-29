@@ -12,6 +12,7 @@ import {
   installInPopup,
   stripHoloMarker,
 } from "../core.js";
+import { encodeFrame } from "../framing.js";
 
 // ---------- DOM stub ----------
 
@@ -65,14 +66,39 @@ function stubWindow() {
       return null;
     },
     createElement(tag) {
-      return stubElement(tag);
+      // iframes need a `contentWindow` test hook so tests can capture
+      // postMessages going to the agent iframe.
+      const el = stubElement(tag);
+      if (tag === "iframe") {
+        el.contentWindow = {
+          posted: [],
+          postMessage(data, origin) {
+            this.posted.push({ data, origin });
+          },
+        };
+      }
+      return el;
     },
   };
   const win = {
     document: doc,
     listeners: {},
+    location: {
+      origin: "https://host.example",
+      _replaced: null,
+      replace(url) {
+        this._replaced = url;
+      },
+    },
+    URL: globalThis.URL,
     addEventListener(name, fn) {
       (this.listeners[name] ||= []).push(fn);
+    },
+    removeEventListener(name, fn) {
+      this.listeners[name] = (this.listeners[name] ?? []).filter((x) => x !== fn);
+    },
+    postMessage(data, origin) {
+      (this._posted ||= []).push({ data, origin });
     },
     setTimeout: (fn) => fn(),
     MutationObserver: class {
@@ -208,3 +234,146 @@ describe("installInPopup", () => {
     assert.equal(textarea._focused, true);
   });
 });
+
+// ---------- ws_handshake op (cross-origin popup navigation) ----------
+
+import { installHostListener } from "../core.js";
+
+describe("ws_handshake op (popup navigation)", () => {
+  function buildHandshakeFrame(session, url, token) {
+    return encodeFrame({
+      session,
+      type: "cmd",
+      data: new TextEncoder().encode(
+        JSON.stringify({ op: "ws_handshake", url, token }),
+      ),
+      id: "frame-1",
+    });
+  }
+
+  function deliverPaste(popup, frameJson) {
+    const textarea = popup.document.body.children[0];
+    textarea.fireEvent("paste", {
+      clipboardData: { getData: () => frameJson },
+      preventDefault() {},
+      stopPropagation() {},
+    });
+  }
+
+  it("opens a separate ws popup at the daemon URL, leaving the about:blank popup intact", () => {
+    const popup = stubWindow();
+    const opener = stubWindow();
+    // Stand in for a host-side __holo state object so handleWsHandshake
+    // can register the ws popup back on it.
+    opener.__holo = { session: "sid-x", popup, wsPopup: null };
+    const opened = [];
+    popup.open = (url, name, features) => {
+      opened.push({ url, name, features });
+      return stubWindow();
+    };
+    installInPopup(popup, opener, "sid-x");
+
+    deliverPaste(
+      popup,
+      buildHandshakeFrame("sid-x", "http://127.0.0.1:1234/popup.html", "TOK"),
+    );
+
+    // The about:blank popup must NOT have navigated — the QR fallback
+    // path depends on its paste handler + canvas staying alive.
+    assert.equal(popup.location._replaced, null, "about:blank popup was navigated; QR fallback would break");
+
+    // A separate ws popup was opened at the daemon URL.
+    assert.equal(opened.length, 1);
+    assert.equal(opened[0].name, "holo_ws_popup");
+    assert.match(opened[0].url, /^http:\/\/127\.0\.0\.1:1234\/popup\.html#/);
+    assert.match(opened[0].url, /sid=sid-x/);
+    assert.match(opened[0].url, /token=TOK/);
+    assert.match(opened[0].url, /parentOrigin=https%3A%2F%2Fhost\.example/);
+
+    // ws popup got registered on the host so dispatch routing accepts its postMessages.
+    assert.ok(opener.__holo.wsPopup);
+  });
+});
+
+describe("installHostListener (ws-popup → host dispatch relay)", () => {
+  function setup({ session = "sid-1", wsPopupRef } = {}) {
+    const host = stubWindow();
+    const wsPopup = wsPopupRef ?? stubWindow();
+    const state = { session, popup: stubWindow(), wsPopup };
+    installHostListener(host, state);
+    return { host, wsPopup, state };
+  }
+
+  it("runs dispatch on a holo-popup cmd and posts the result back", () => {
+    const { host, wsPopup } = setup();
+    host.R2D2_VERSION = "1.2.3";
+
+    fireMessage(host, "http://127.0.0.1:1234", {
+      source: "holo-popup",
+      type: "cmd",
+      session: "sid-1",
+      id: "frame-A",
+      cmd: { op: "read_global", path: "R2D2_VERSION" },
+    }, wsPopup);
+
+    const posts = wsPopup._posted ?? [];
+    assert.equal(posts.length, 1);
+    assert.equal(posts[0].origin, "http://127.0.0.1:1234");
+    assert.equal(posts[0].data.source, "holo-host");
+    assert.equal(posts[0].data.type, "result");
+    assert.equal(posts[0].data.id, "frame-A");
+    assert.deepEqual(posts[0].data.result, { value: "1.2.3" });
+  });
+
+  it("ignores messages whose source isn't the registered ws popup", () => {
+    const { host, wsPopup } = setup();
+    const stranger = stubWindow();
+
+    fireMessage(host, "http://attacker.example", {
+      source: "holo-popup",
+      type: "cmd",
+      session: "sid-1",
+      id: "frame-evil",
+      cmd: { op: "ping" },
+    }, stranger);
+
+    assert.equal((wsPopup._posted ?? []).length, 0);
+  });
+
+  it("ignores messages with a mismatched session id", () => {
+    const { host, wsPopup } = setup({ session: "sid-mine" });
+
+    fireMessage(host, "http://127.0.0.1:1234", {
+      source: "holo-popup",
+      type: "cmd",
+      session: "sid-other",
+      id: "frame-mismatch",
+      cmd: { op: "ping" },
+    }, wsPopup);
+
+    assert.equal((wsPopup._posted ?? []).length, 0);
+  });
+
+  it("returns a structured error when dispatch throws", () => {
+    const { host, wsPopup } = setup();
+
+    fireMessage(host, "http://127.0.0.1:1234", {
+      source: "holo-popup",
+      type: "cmd",
+      session: "sid-1",
+      id: "frame-err",
+      cmd: { op: "read_global", path: "" },
+    }, wsPopup);
+
+    const posts = wsPopup._posted ?? [];
+    assert.equal(posts.length, 1);
+    assert.ok(posts[0].data.result.error);
+    assert.equal(posts[0].data.result.error.code, "bad_arg");
+  });
+});
+
+function fireMessage(host, origin, data, source = null) {
+  for (const fn of host.listeners.message ?? []) {
+    fn({ origin, data, source });
+  }
+}

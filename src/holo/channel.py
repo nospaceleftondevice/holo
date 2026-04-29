@@ -13,6 +13,17 @@ The Channel locks onto a specific browser window at calibration and
 polls only that window's title for replies. Multi-window / multi-tab
 addressing is a Phase 2 concern.
 
+Two transports for command/result traffic, in order of preference:
+
+* WebSocket — opportunistically established on the first `send_command`
+  via a `ws_handshake` op pasted through the clipboard. Once the page
+  has connected back to the daemon's loopback `WSServer`, subsequent
+  commands skip the focus-stealing paste and ride the socket. Requires
+  a `Daemon` to own the channel (see `holo.daemon.Daemon`).
+* Clipboard + QR (the Phase 0 path) — kept as a hot fallback whenever
+  the WS handshake has not landed yet, the WS connection drops, or the
+  Channel was constructed standalone (no `Daemon` attached).
+
 Single-frame replies only in this layer. Multi-frame reassembly is
 implemented in `holo.framing.Reassembler` and will be wired into the
 channel when a Phase 1 caller actually needs it; today's commands
@@ -22,14 +33,19 @@ channel when a Phase 1 caller actually needs it; today's commands
 from __future__ import annotations
 
 import json
+import queue
 import sys
+import threading
 import time
 from dataclasses import dataclass, field
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from holo import clipboard, framing
 from holo import title as title_mod
 from holo.windows import WindowInfo, list_windows
+
+if TYPE_CHECKING:
+    from holo.daemon import Daemon
 
 # Common browser owner-name strings on macOS. Users with other browsers
 # can extend this via the `browsers` constructor arg.
@@ -60,6 +76,16 @@ ACTIVATE_SETTLE_S: float = 0.2
 # Time after the synthetic click before sending Cmd+V, so the
 # contenteditable has time to receive focus from the click event.
 CLICK_SETTLE_S: float = 0.1
+# Budget for the page to open the WebSocket and land its handshake
+# message after we paste the `ws_handshake` op. If this runs out, we
+# stay on the QR path for this command and try again next time.
+WS_HANDSHAKE_WAIT_S: float = 2.0
+
+# Process-wide lock around the macOS clipboard + keystroke pipeline.
+# Two QR-mode channels in the same process must not race on the
+# clipboard / focus-steal sequence; WS-mode channels send through
+# their own socket and don't touch this lock.
+_CLIPBOARD_LOCK: threading.Lock = threading.Lock()
 
 
 class CalibrationError(RuntimeError):
@@ -75,10 +101,17 @@ class Channel:
     browsers: frozenset[str] = field(default=DEFAULT_BROWSERS)
     poll_interval: float = DEFAULT_POLL_INTERVAL_S
     default_timeout: float = DEFAULT_TIMEOUT_S
+    daemon: Daemon | None = None
+    hide_qr: bool = False
     session: str | None = None
     _window_id: int | None = None
     _window_pid: int = 0
     _window_owner: str = ""
+    _ws_attempted: bool = False
+    _ws_ready: bool = False
+    _ws_conn: Any = None
+    _ws_attach_event: threading.Event = field(default_factory=threading.Event)
+    _ws_pending: dict[str, queue.Queue] = field(default_factory=dict)
 
     def wait_for_calibration(self, *, timeout: float | None = None) -> str:
         """Poll browser windows for a `[holo:cal:<sid>]` beacon.
@@ -110,31 +143,65 @@ class Channel:
             raise RuntimeError(
                 "Channel has not been calibrated; call wait_for_calibration() first"
             )
+        budget = timeout if timeout is not None else self.default_timeout
+
+        if self.daemon is not None and not self._ws_attempted:
+            self._bootstrap_ws()
+
+        if self._ws_ready and self._ws_conn is not None:
+            return self._send_via_ws(cmd, budget)
+        return self._send_via_paste(cmd, budget)
+
+    def _bootstrap_ws(self) -> None:
+        """Paste a `ws_handshake` op carrying the daemon's URL+token.
+
+        The page opens a `WebSocket`, sends back a handshake message,
+        and the WS server's `_on_ws_attached` flips `_ws_attach_event`.
+        We wait briefly here so the very next `_send_via_*` call can
+        ride the socket if the round-trip beat the budget.
+        """
+        self._ws_attempted = True
+        if self.daemon is None:
+            return
+        handshake = {
+            "op": "ws_handshake",
+            "url": self.daemon.ws_server.popup_url,
+            "token": self.daemon.ws_server.token,
+        }
+        data = json.dumps(handshake).encode("utf-8")
+        frame = framing.Frame(session=self.session, type="cmd", data=data)
+        self._paste_text(frame.encode())
+        if self._ws_attach_event.wait(timeout=WS_HANDSHAKE_WAIT_S):
+            self._ws_ready = True
+
+    def _send_via_ws(self, cmd: dict[str, Any], budget: float) -> dict[str, Any]:
         data = json.dumps(cmd).encode("utf-8")
         frame = framing.Frame(session=self.session, type="cmd", data=data)
-        text = frame.encode()
+        msg = json.dumps({"type": "cmd", "frame": frame.encode()})
 
-        # On macOS we use the osascript / System Events pipeline for
-        # both activation and the Cmd+V keystroke. pyautogui's
-        # synthetic keystrokes work for the terminal but have been
-        # observed to never reach a Chrome popup's contenteditable
-        # paste handler — System Events shares the same Automation
-        # pipeline that successfully activates the popup, so the
-        # keystroke and the activation can't race against each other.
-        # We don't restore the clipboard here: a fast restore can
-        # win the race against the OS-level paste, and the page's
-        # handler reads event.clipboardData (a snapshot) anyway.
-        if sys.platform == "darwin" and self._window_owner:
-            self._activate_target()
-            clipboard.write(text)
-            time.sleep(0.05)
-            from holo._macos import keystroke_paste
+        reply_q: queue.Queue = queue.Queue(maxsize=1)
+        self._ws_pending[frame.id] = reply_q
+        try:
+            self._ws_conn.send(msg)
+            try:
+                reply = reply_q.get(timeout=budget)
+            except queue.Empty as e:
+                raise CommandError(f"no reply for cmd within {budget}s") from e
+        finally:
+            self._ws_pending.pop(frame.id, None)
+        return json.loads(reply.data.decode("utf-8"))
 
-            keystroke_paste(self._window_owner)
-        else:
-            self._activate_target()
-            clipboard.paste(text)
-        budget = timeout if timeout is not None else self.default_timeout
+    def _send_via_paste(self, cmd: dict[str, Any], budget: float) -> dict[str, Any]:
+        # When stealth mode is on, the bookmarklet must use near-
+        # identical colors for the reply QR; piggyback the flag on the
+        # command payload. dispatch.js ignores fields it doesn't know,
+        # so prefixing with `_` (transport metadata) is safe.
+        payload = dict(cmd)
+        if self.hide_qr:
+            payload["_hide_qr"] = True
+        data = json.dumps(payload).encode("utf-8")
+        frame = framing.Frame(session=self.session, type="cmd", data=data)
+        self._paste_text(frame.encode())
         deadline = time.monotonic() + budget
         # The reply channel is a QR code rendered into the popup's
         # canvas. We capture the window's pixels and run Vision QR
@@ -156,6 +223,78 @@ class Channel:
             time.sleep(qr_poll_interval)
         raise CommandError(f"no reply for cmd within {budget}s")
 
+    def _paste_text(self, text: str) -> None:
+        """Activate the popup, copy `text`, simulate Cmd+V into it.
+
+        Serialized process-wide so multiple channels in the same
+        daemon don't race on the global clipboard / focus pipeline.
+
+        On macOS we use the osascript / System Events pipeline for
+        both activation and the Cmd+V keystroke. pyautogui's
+        synthetic keystrokes work for the terminal but have been
+        observed to never reach a Chrome popup's contenteditable
+        paste handler — System Events shares the same Automation
+        pipeline that successfully activates the popup, so the
+        keystroke and the activation can't race against each other.
+        We don't restore the clipboard here: a fast restore can
+        win the race against the OS-level paste, and the page's
+        handler reads event.clipboardData (a snapshot) anyway.
+        """
+        with _CLIPBOARD_LOCK:
+            if sys.platform == "darwin" and self._window_owner:
+                self._activate_target()
+                clipboard.write(text)
+                time.sleep(0.05)
+                from holo._macos import keystroke_paste
+
+                keystroke_paste(self._window_owner)
+            else:
+                self._activate_target()
+                clipboard.paste(text)
+
+    def _on_ws_attached(self, conn: Any) -> None:
+        """Called by the WS server thread once a handshake validates."""
+        self._ws_conn = conn
+        self._ws_attach_event.set()
+        self._ws_ready = True
+
+    def _on_ws_message(self, raw: Any) -> None:
+        """Called by the WS server thread for each post-handshake frame."""
+        if isinstance(raw, bytes | bytearray):
+            try:
+                raw = raw.decode("utf-8")
+            except UnicodeDecodeError:
+                return
+        if not isinstance(raw, str):
+            return
+        try:
+            msg = json.loads(raw)
+        except json.JSONDecodeError:
+            return
+        if not isinstance(msg, dict) or msg.get("type") != "result":
+            return
+        frame_str = msg.get("frame")
+        if not isinstance(frame_str, str):
+            return
+        try:
+            reply = framing.decode(frame_str)
+        except framing.FrameError:
+            return
+        if reply.session != self.session or reply.type != "result":
+            return
+        pending = self._ws_pending.get(reply.id)
+        if pending is not None:
+            try:
+                pending.put_nowait(reply)
+            except queue.Full:
+                pass
+
+    def _on_ws_detached(self) -> None:
+        """Called by the WS server thread when the socket closes."""
+        self._ws_ready = False
+        self._ws_conn = None
+        self._ws_attach_event.clear()
+
     def _poll_reply_qr(self) -> framing.Frame | object | None:
         """Capture the locked window and decode any QR code present."""
         from holo._macos import capture_window_qr
@@ -165,7 +304,11 @@ class Channel:
         # disambiguate by listing windows separately.
         if self._read_window_title() is None:
             return _WINDOW_GONE
-        payload = capture_window_qr(self._window_id) if self._window_id else None
+        payload = (
+            capture_window_qr(self._window_id, hide_qr=self.hide_qr)
+            if self._window_id
+            else None
+        )
         if not payload:
             return None
         try:
