@@ -88,15 +88,50 @@ export function installInPopup(popupWindow, openerWindow, session) {
     lastWrittenTitle: null,
   };
 
-  panel.addEventListener("paste", (event) => onPaste(event, state));
+  const log = (...args) => popupWindow.console?.log?.("[holo]", ...args);
+  log("install start", { session, sessionShort: session.slice(0, 8) });
+
+  panel.addEventListener("paste", (event) => {
+    log("paste event", {
+      isTrusted: event.isTrusted,
+      target: event.target?.tagName,
+      activeElement: popupDoc.activeElement?.tagName,
+      hasClipboardData: !!event.clipboardData,
+      textLen: event.clipboardData?.getData("text/plain")?.length ?? 0,
+    });
+    onPaste(event, state);
+  });
+
+  // Catch ALL keystrokes the popup receives — even ones that don't
+  // generate paste events. Diagnostic: if synthetic Cmd+V never even
+  // produces a keydown, the keystroke isn't reaching the popup at the
+  // OS level. If keydown fires but paste doesn't, Chrome is dropping
+  // the paste path specifically.
+  panel.addEventListener("keydown", (event) => {
+    log("keydown", {
+      key: event.key,
+      code: event.code,
+      metaKey: event.metaKey,
+      ctrlKey: event.ctrlKey,
+      isTrusted: event.isTrusted,
+      target: event.target?.tagName,
+    });
+  });
 
   // Keep focus pinned on the panel. Anything focusing the window or
   // blurring the panel snaps back so the next Cmd+V always lands here.
-  popupWindow.addEventListener("focus", () => panel.focus());
+  popupWindow.addEventListener("focus", () => {
+    log("window focus");
+    panel.focus();
+  });
+  popupWindow.addEventListener("blur", () => log("window blur"));
+  panel.addEventListener("focus", () => log("panel focus"));
   panel.addEventListener("blur", () => {
+    log("panel blur");
     popupWindow.setTimeout(() => panel.focus(), 0);
   });
   panel.focus();
+  log("panel focused, ready", { activeElement: popupDoc.activeElement?.tagName });
 
   const titleEl = popupDoc.querySelector("title");
   if (titleEl && popupWindow.MutationObserver) {
@@ -171,10 +206,12 @@ export function buildPopupBody(popupDoc) {
 }
 
 function onPaste(event, state) {
+  const log = (...args) => state.popupWindow.console?.log?.("[holo]", ...args);
   event.preventDefault();
   event.stopPropagation();
 
   const raw = event.clipboardData?.getData("text/plain") ?? "";
+  log("onPaste raw", { len: raw.length, preview: raw.slice(0, 60) });
   // Defensively reset the textarea value so a future user paste
   // doesn't see leftover bytes from our last command.
   state.panel.value = READY_TEXT;
@@ -182,7 +219,9 @@ function onPaste(event, state) {
   let frame;
   try {
     frame = decodeFrame(raw);
-  } catch {
+    log("decodeFrame ok", { id: frame.id, type: frame.type, session: frame.session?.slice(0, 8) });
+  } catch (err) {
+    log("decodeFrame failed", String(err));
     writePlainMarker(state, "err:decode");
     state.panel.focus();
     return;
@@ -191,7 +230,9 @@ function onPaste(event, state) {
   let cmd;
   try {
     cmd = JSON.parse(new TextDecoder().decode(frame.data));
+    log("cmd parsed", cmd);
   } catch {
+    log("cmd parse failed");
     sendReply(state, frame, {
       error: { code: "bad_command", message: "command body is not valid JSON" },
     });
@@ -205,15 +246,18 @@ function onPaste(event, state) {
   let result;
   try {
     result = dispatch(cmd, env);
+    log("dispatch ok", result);
   } catch (err) {
     if (err instanceof DispatchError) {
       result = { error: { code: err.code, message: err.message } };
     } else {
       result = { error: { code: "internal", message: String(err) } };
     }
+    log("dispatch err", result);
   }
 
   sendReply(state, frame, result);
+  log("reply sent, title is now", state.popupWindow.document.title.slice(0, 80));
   state.panel.focus();
 }
 
