@@ -244,9 +244,10 @@ class TestActivation:
         # Strict ordering: activate, then click into the body, then paste.
         assert order[0] == ("activate", 1234)
         assert order[1][0] == "click"
-        # Click should be inside the popup body — left side, near bottom.
-        # bounds = (100, 50, 320, 160) → expect (130, 180).
-        assert order[1] == ("click", 130.0, 180.0)
+        # Click should be inside the popup body — center horizontally,
+        # 75 % down vertically. bounds = (100, 50, 320, 160) →
+        # (100 + 160, 50 + 120) = (260, 170).
+        assert order[1] == ("click", 260.0, 170.0)
         assert order[2][0] == "paste"
 
     def test_skips_activation_when_pid_unknown(self, fake_list_windows, fake_paste):

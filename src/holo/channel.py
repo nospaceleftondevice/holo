@@ -173,13 +173,19 @@ class Channel:
 
         Re-reads the locked window's current bounds — the user may
         have moved or resized the popup since calibration.
+
+        The popup's vertical layout in Chrome:
+            0–28 px   titlebar (traffic-light buttons)
+            28–78 px  URL bar
+            78– px    body / content area
+
+        Targeting the horizontal center at 75 % of window height puts
+        the click well inside the body even on a tiny popup, with
+        plenty of margin from the URL bar above and the resize handle
+        below.
         """
         for w in list_windows():
             if w.id == self._window_id and w.bounds is not None:
                 x, y, width, height = w.bounds
-                # 30 px in from the left edge clears the traffic-light
-                # buttons; height - 30 puts us near the bottom of the
-                # popup, well below the address bar even on small
-                # popups (~160 px tall).
-                return (x + 30.0, y + height - 30.0)
+                return (x + width / 2.0, y + height * 0.75)
         return None
