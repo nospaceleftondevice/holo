@@ -1,27 +1,36 @@
-// In-page agent — DOM wiring.
+// In-page agent — opens a popup window that hosts the paste target and
+// title channel.
 //
-// This module ties framing.js (frame encoding), title.js (page → daemon
-// channel), and dispatch.js (command execution) into the working
-// bookmarklet payload. Loaded into the browser as the bookmarklet's
-// only side effect: install() sets up the paste target, listeners,
-// title observer, and emits a calibration beacon.
+// Why a popup: focus inside a host page like tai.sh competes with
+// xterm.js, chat inputs, and the page's own focus management. A
+// dedicated `about:blank` popup has nothing else to steal keyboard
+// focus from our paste target, gets its own OS-level window title (no
+// fighting with the host over `document.title`), and keeps the
+// bookmarklet's moving parts out of the host page entirely.
 //
-// Top-level code is intentionally side-effect-free so the module can
-// be imported and unit-tested in Node without a DOM. All browser
-// access is gated behind install().
+// `about:blank` popups are same-origin with their opener for cross-
+// document scripting, so dispatch can run against `window.opener`
+// directly — `read_global("R2D2_VERSION")` resolves on the host page,
+// not in the (empty) popup.
+//
+// Top-level code stays side-effect-free so the module can be imported
+// from Node tests without a DOM. Browser access is gated behind
+// install() / installInPopup().
 
 import { decodeFrame, encodeFrame } from "./framing.js";
 import { DispatchError, dispatch } from "./dispatch.js";
 import { encodeFramedTitle, encodePlainMarker } from "./title.js";
 
-const PANEL_ID = "__holo_paste_target__";
+const POPUP_NAME = "holo_console";
+const POPUP_FEATURES = "popup=yes,width=320,height=160,resizable=yes";
+const POPUP_TITLE = "holo console";
+const READY_TEXT = "holo console — keep this window open";
 const HOLO_MARKER_TAIL_RE = /\s*\[holo:[^\]]+\]\s*$/;
 
 /**
  * Strip a trailing holo marker (framed or plain) from a title string.
- * Used to capture the page's "natural" title before the bookmarklet
- * adds its own marker, and to re-capture if the page changes the
- * title at runtime.
+ * Used to capture a window's "natural" title so the next response
+ * keeps that prefix.
  */
 export function stripHoloMarker(title) {
   if (typeof title !== "string") return "";
@@ -29,36 +38,71 @@ export function stripHoloMarker(title) {
 }
 
 /**
- * Install the in-page agent. Idempotent — calling install() a second
- * time on the same window returns the existing state object.
+ * Install the in-page agent. Opens a popup window from the host page
+ * and installs the paste target + title channel inside it.
  *
- * Returns the state object (panel, session, originalTitle, …) for
- * inspection / smoke testing.
+ * Idempotent: a second click focuses the existing popup if it's still
+ * open, or opens a fresh one if the user closed it.
  */
 export function install() {
-  if (window.__holo) return window.__holo;
+  const existing = window.__holo;
+  if (existing && existing.popup && !existing.popup.closed) {
+    existing.popup.focus();
+    return existing;
+  }
+
+  const session = globalThis.crypto.randomUUID();
+  const popup = window.open("about:blank", POPUP_NAME, POPUP_FEATURES);
+  if (!popup) {
+    // Popup blocked — surface it via the host page's title so the
+    // daemon sees a clear error instead of waiting for a calibration
+    // beacon that will never arrive.
+    document.title = encodePlainMarker("err:popup-blocked", document.title);
+    throw new Error("holo: popup blocked — allow popups for this site");
+  }
+
+  installInPopup(popup, window, session);
+
+  const state = { session, popup };
+  window.__holo = state;
+  return state;
+}
+
+/**
+ * Wire up the paste target and title channel inside `popupWindow`.
+ *
+ * Exported separately so tests can drive it with stub window/document
+ * objects; production callers go through install().
+ */
+export function installInPopup(popupWindow, openerWindow, session) {
+  const popupDoc = popupWindow.document;
+  const panel = buildPopupBody(popupDoc);
 
   const state = {
-    session: globalThis.crypto.randomUUID(),
-    panel: null,
-    originalTitle: stripHoloMarker(document.title),
+    session,
+    popupWindow,
+    openerWindow,
+    panel,
+    originalTitle: POPUP_TITLE,
     titleObserver: null,
     lastWrittenTitle: null,
   };
 
-  state.panel = createPanel();
-  document.body.appendChild(state.panel);
-  state.panel.focus();
+  panel.addEventListener("paste", (event) => onPaste(event, state));
 
-  state.panel.addEventListener("paste", (event) => onPaste(event, state));
+  // Keep focus pinned on the panel. Anything focusing the window or
+  // blurring the panel snaps back so the next Cmd+V always lands here.
+  popupWindow.addEventListener("focus", () => panel.focus());
+  panel.addEventListener("blur", () => {
+    popupWindow.setTimeout(() => panel.focus(), 0);
+  });
+  panel.focus();
 
-  // Re-capture the user's title when the page itself updates it (SPA
-  // route changes, dynamic <title> writes). MutationObserver fires for
-  // both our writes and the page's writes; we distinguish via
-  // lastWrittenTitle so we don't flap.
-  const titleEl = document.querySelector("title");
-  if (titleEl) {
-    state.titleObserver = new MutationObserver(() => onTitleMutation(state));
+  const titleEl = popupDoc.querySelector("title");
+  if (titleEl && popupWindow.MutationObserver) {
+    state.titleObserver = new popupWindow.MutationObserver(() =>
+      onTitleMutation(state),
+    );
     state.titleObserver.observe(titleEl, {
       childList: true,
       subtree: true,
@@ -66,46 +110,46 @@ export function install() {
     });
   }
 
-  // Navigation sentinel — daemon stops typing into a page that's leaving.
-  window.addEventListener("pagehide", () => {
-    writePlainMarker(state, `bye:${state.session}`);
+  // pagehide fires when the popup is closed or navigates away —
+  // give the daemon a clear signal so it doesn't keep typing into a
+  // dead window.
+  popupWindow.addEventListener("pagehide", () => {
+    writePlainMarker(state, `bye:${session}`);
   });
 
-  // Calibration beacon — the daemon's first signal that we're alive.
-  writePlainMarker(state, `cal:${state.session}`);
+  // Calibration beacon — daemon's first signal that we're alive.
+  writePlainMarker(state, `cal:${session}`);
 
-  window.__holo = state;
   return state;
 }
 
-function createPanel() {
-  let panel = document.getElementById(PANEL_ID);
-  if (panel) return panel;
-  panel = document.createElement("div");
-  panel.id = PANEL_ID;
-  panel.contentEditable = "true";
-  panel.spellcheck = false;
-  panel.setAttribute("aria-label", "holo paste target");
-  panel.title = "holo: paste target";
-  Object.assign(panel.style, {
-    position: "fixed",
-    top: "0",
-    right: "0",
-    width: "16px",
-    height: "16px",
-    background: "rgba(0, 200, 0, 0.55)",
-    border: "1px solid rgba(0, 100, 0, 0.7)",
-    zIndex: "2147483647",
+/**
+ * Build the popup's contenteditable body. Returns the element so
+ * callers can attach listeners.
+ */
+export function buildPopupBody(popupDoc) {
+  popupDoc.title = POPUP_TITLE;
+  const body = popupDoc.body;
+  Object.assign(body.style, {
+    margin: "0",
+    padding: "12px",
+    background: "rgb(15, 30, 15)",
+    color: "rgb(120, 200, 120)",
+    fontFamily: "ui-monospace, SFMono-Regular, monospace",
+    fontSize: "12px",
+    lineHeight: "1.4",
+    cursor: "text",
+    minHeight: "100vh",
+    boxSizing: "border-box",
     overflow: "hidden",
     outline: "none",
-    cursor: "pointer",
-    // Make any pasted text invisible — the framed JSON is operational
-    // data, not user-readable content.
-    fontSize: "1px",
-    color: "transparent",
     caretColor: "transparent",
   });
-  return panel;
+  body.contentEditable = "true";
+  body.spellcheck = false;
+  body.setAttribute("aria-label", "holo paste target");
+  body.textContent = READY_TEXT;
+  return body;
 }
 
 function onPaste(event, state) {
@@ -113,9 +157,9 @@ function onPaste(event, state) {
   event.stopPropagation();
 
   const raw = event.clipboardData?.getData("text/plain") ?? "";
-  // Defensively clear the contenteditable so a future user paste
-  // doesn't see leftover bytes from our last command.
-  state.panel.textContent = "";
+  // Defensively reset visible text so a future user paste doesn't
+  // see leftover bytes from our last command.
+  state.panel.textContent = READY_TEXT;
 
   let frame;
   try {
@@ -137,9 +181,12 @@ function onPaste(event, state) {
     return;
   }
 
+  // Dispatch resolves read_global / read_dom / etc. against the
+  // *opener* (host page), not the popup's own globals.
+  const env = { window: state.openerWindow };
   let result;
   try {
-    result = dispatch(cmd);
+    result = dispatch(cmd, env);
   } catch (err) {
     if (err instanceof DispatchError) {
       result = { error: { code: err.code, message: err.message } };
@@ -149,9 +196,6 @@ function onPaste(event, state) {
   }
 
   sendReply(state, frame, result);
-  // Refocus for the next paste cycle. The daemon will also re-click
-  // before each subsequent paste, but keeping focus here covers the
-  // common case where nothing else has stolen it.
   state.panel.focus();
 }
 
@@ -169,24 +213,19 @@ function sendReply(state, originalFrame, result) {
 function writeFramedTitle(state, frameJson) {
   const title = encodeFramedTitle(frameJson, state.originalTitle);
   state.lastWrittenTitle = title;
-  document.title = title;
+  state.popupWindow.document.title = title;
 }
 
 function writePlainMarker(state, marker) {
   const title = encodePlainMarker(marker, state.originalTitle);
   state.lastWrittenTitle = title;
-  document.title = title;
+  state.popupWindow.document.title = title;
 }
 
 function onTitleMutation(state) {
-  const current = document.title;
-  // Our own writes — ignore. Comparing the full string is safe because
-  // we record exactly what we wrote.
+  const current = state.popupWindow.document.title;
   if (current === state.lastWrittenTitle) return;
-  // The page changed the title underneath us. Capture its new
-  // "natural" form (without any leftover holo marker, just in case)
-  // so the next response uses the up-to-date prefix. We don't attempt
-  // to re-emit a holo marker here — the next command/result will do
-  // that. The daemon polls and will see the marker reappear then.
+  // Nothing else is supposed to write the popup's title, but if
+  // something does we capture the new prefix and roll with it.
   state.originalTitle = stripHoloMarker(current);
 }

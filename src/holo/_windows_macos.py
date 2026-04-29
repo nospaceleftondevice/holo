@@ -41,4 +41,5 @@ def _parse(entry: dict[str, Any]) -> WindowInfo:
         title=str(entry.get("kCGWindowName") or ""),
         owner=str(entry.get("kCGWindowOwnerName") or ""),
         layer=int(entry.get("kCGWindowLayer") or 0),
+        pid=int(entry.get("kCGWindowOwnerPID") or 0),
     )

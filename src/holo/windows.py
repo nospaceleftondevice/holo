@@ -29,6 +29,7 @@ class WindowInfo:
     title: str
     owner: str
     layer: int
+    pid: int = 0
 
 
 def list_windows() -> list[WindowInfo]:
