@@ -256,26 +256,39 @@ function onPaste(event, state) {
     log("dispatch err", result);
   }
 
-  sendReply(state, frame, result);
-  log("reply sent, title is now", state.popupWindow.document.title.slice(0, 80));
+  try {
+    log("about to sendReply", { resultJSON: JSON.stringify(result) });
+    sendReply(state, frame, result, log);
+    log("reply sent, title is now", state.popupWindow.document.title.slice(0, 80));
+  } catch (err) {
+    log("SENDREPLY THREW", String(err), err && err.stack);
+    state.popupWindow.console?.error?.("[holo] sendReply error:", err);
+  }
   state.panel.focus();
 }
 
-function sendReply(state, originalFrame, result) {
+function sendReply(state, originalFrame, result, log = () => {}) {
+  log("sendReply enter", { id: originalFrame.id, session: originalFrame.session?.slice(0, 8) });
   const data = new TextEncoder().encode(JSON.stringify(result));
+  log("sendReply data encoded", { dataLen: data.length });
   const replyJson = encodeFrame({
     session: originalFrame.session,
     type: "result",
     data,
     id: originalFrame.id,
   });
-  writeFramedTitle(state, replyJson);
+  log("sendReply frame encoded", { replyLen: replyJson.length, preview: replyJson.slice(0, 60) });
+  writeFramedTitle(state, replyJson, log);
+  log("sendReply done");
 }
 
-function writeFramedTitle(state, frameJson) {
+function writeFramedTitle(state, frameJson, log = () => {}) {
+  log("writeFramedTitle enter", { jsonLen: frameJson.length, originalTitle: state.originalTitle });
   const title = encodeFramedTitle(frameJson, state.originalTitle);
+  log("writeFramedTitle encoded", { titleLen: title.length, preview: title.slice(0, 80) });
   state.lastWrittenTitle = title;
   state.popupWindow.document.title = title;
+  log("writeFramedTitle title now", { actual: state.popupWindow.document.title.slice(0, 80) });
 }
 
 function writePlainMarker(state, marker) {
