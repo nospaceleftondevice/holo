@@ -1,8 +1,8 @@
-"""macOS-only AppKit helpers (process activation).
+"""macOS-only AppKit / Quartz helpers (process activation, synthetic clicks).
 
 `pyobjc-framework-Cocoa` (which provides AppKit / NSRunningApplication)
 is a transitive dependency of `pyobjc-framework-Quartz`, so we don't
-need to add it to pyproject.toml separately. The import is local to
+need to add it to pyproject.toml separately. Imports are local to
 each call so this module can still be imported on non-darwin
 platforms for tests / coverage.
 """
@@ -36,3 +36,31 @@ def activate_pid(pid: int) -> bool:
     options = NSApplicationActivateAllWindows | NSApplicationActivateIgnoringOtherApps
     app.activateWithOptions_(options)
     return True
+
+
+def click_at(x: float, y: float) -> None:
+    """Synthesize a left-click at screen coordinates (x, y).
+
+    Posts CGEvent mouse-down + mouse-up events directly to the HID tap
+    so the visible mouse cursor doesn't move. Used to focus the
+    popup's contenteditable body before sending Cmd+V — Chrome opens
+    new popups with OS keyboard focus on the address bar, and JS
+    `.focus()` cannot move OS focus out of browser chrome.
+
+    Requires the same Accessibility permission as keystroke
+    synthesis; without it the events are silently dropped.
+    """
+    from Quartz import (  # type: ignore[import-not-found]
+        CGEventCreateMouseEvent,
+        CGEventPost,
+        kCGEventLeftMouseDown,
+        kCGEventLeftMouseUp,
+        kCGHIDEventTap,
+        kCGMouseButtonLeft,
+    )
+
+    point = (float(x), float(y))
+    down = CGEventCreateMouseEvent(None, kCGEventLeftMouseDown, point, kCGMouseButtonLeft)
+    CGEventPost(kCGHIDEventTap, down)
+    up = CGEventCreateMouseEvent(None, kCGEventLeftMouseUp, point, kCGMouseButtonLeft)
+    CGEventPost(kCGHIDEventTap, up)

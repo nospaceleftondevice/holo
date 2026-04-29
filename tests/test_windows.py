@@ -26,6 +26,7 @@ def _entry(**overrides):
         "kCGWindowOwnerPID": 1234,
         "kCGWindowLayer": 0,
         "kCGWindowAlpha": 1.0,
+        "kCGWindowBounds": {"X": 100, "Y": 50, "Width": 800, "Height": 600},
     }
     base.update(overrides)
     return base
@@ -39,7 +40,18 @@ def test_parse_full_entry():
         owner="Google Chrome",
         layer=0,
         pid=1234,
+        bounds=(100.0, 50.0, 800.0, 600.0),
     )
+
+
+def test_parse_missing_bounds_yields_none():
+    info = _parse(_entry(kCGWindowBounds=None))
+    assert info.bounds is None
+
+
+def test_parse_malformed_bounds_yields_none():
+    info = _parse(_entry(kCGWindowBounds={"X": 1}))  # missing Y/Width/Height
+    assert info.bounds is None
 
 
 def test_parse_none_title_yields_empty_string():
