@@ -370,18 +370,24 @@ class TestResourceResolution:
         monkeypatch.delenv("HOLO_SIKULI_JAR", raising=False)
         monkeypatch.setattr("holo.bridge._repo_root", lambda: tmp_path, raising=True)
         monkeypatch.setattr("holo.bridge._bundle_root", lambda: None)
+        monkeypatch.setattr(
+            "holo.bridge._user_cache_dir", lambda: tmp_path / "empty-cache"
+        )
         monkeypatch.setenv("HOLO_BRIDGE_NO_DOWNLOAD", "1")
         client = BridgeClient()
         with pytest.raises(BridgeMissingError, match="HOLO_BRIDGE_NO_DOWNLOAD"):
             client._resolve_jar()
 
     def test_missing_jar_falls_through_to_ensure_jar(self, tmp_path, monkeypatch):
-        # When all explicit / env / repo paths come up empty, _resolve_jar
-        # is expected to call ensure_jar() rather than raise outright.
+        # When all explicit / env / repo / cache paths come up empty,
+        # _resolve_jar is expected to call ensure_jar() as last resort.
         monkeypatch.delenv("HOLO_SIKULI_JAR", raising=False)
         monkeypatch.delenv("HOLO_BRIDGE_NO_DOWNLOAD", raising=False)
         monkeypatch.setattr("holo.bridge._repo_root", lambda: tmp_path, raising=True)
         monkeypatch.setattr("holo.bridge._bundle_root", lambda: None)
+        monkeypatch.setattr(
+            "holo.bridge._user_cache_dir", lambda: tmp_path / "empty-cache"
+        )
         downloaded = tmp_path / "from-download.jar"
         downloaded.write_bytes(b"")
         with patch.object(bridge_mod, "ensure_jar", return_value=downloaded) as fake:

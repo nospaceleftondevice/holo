@@ -1,0 +1,93 @@
+# PyInstaller build spec for the holo daemon binary.
+#
+# Produces a single `dist/holo` executable that bundles:
+#
+#   * the Python interpreter + holo package + transitive deps
+#   * src/holo/static/ (popup.html, framing.js — served by WSServer)
+#   * bridge/bridge.py (Jython script invoked by `java -jar sikulix*.jar -r ...`)
+#   * bookmarklet/dist/ (prebuilt JS + install.html — when present)
+#
+# What we do NOT bundle:
+#
+#   * sikulix*.jar (~128 MB) — fetched lazily by `BridgeClient` from a
+#     pinned GitHub Release, or pre-warmed via `holo install-bridge`.
+#   * OpenJDK — user installs separately.
+#
+# Build:    .venv/bin/pyinstaller --clean holo.spec
+# Output:   dist/holo (macOS / Linux) or dist/holo.exe (Windows)
+#
+# The `Analysis` step's `pathex=['src']` lets PyInstaller find the
+# `holo` package without a separate `pip install -e .` step in CI.
+
+# ruff: noqa  (this file runs under PyInstaller's bundled exec context)
+
+from pathlib import Path
+
+import PyInstaller.config
+
+ROOT = Path(SPECPATH).resolve()
+
+datas = [
+    (str(ROOT / "src" / "holo" / "static"), "holo/static"),
+    (str(ROOT / "bridge" / "bridge.py"), "bridge"),
+]
+
+bookmarklet_dist = ROOT / "bookmarklet" / "dist"
+if bookmarklet_dist.exists():
+    datas.append((str(bookmarklet_dist), "bookmarklet/dist"))
+
+# Hidden imports — modules PyInstaller's static analyser misses, mostly
+# because they're imported lazily inside framework code.
+hiddenimports = [
+    # MCP SDK loads its transports / handlers via dynamic dispatch.
+    "mcp.server.fastmcp",
+    "mcp.server.lowlevel",
+    "mcp.server.stdio",
+    "mcp.shared.context",
+    # FastMCP delegates to anyio + starlette under the hood.
+    "anyio._backends._asyncio",
+    "starlette.routing",
+    "uvicorn.lifespan.on",
+    "uvicorn.loops.auto",
+    "uvicorn.protocols.http.auto",
+    "uvicorn.protocols.websockets.auto",
+]
+
+a = Analysis(
+    [str(ROOT / "src" / "holo" / "__main__.py")],
+    pathex=[str(ROOT / "src")],
+    binaries=[],
+    datas=datas,
+    hiddenimports=hiddenimports,
+    hookspath=[],
+    runtime_hooks=[],
+    excludes=[
+        # We ship our own Jython script via SikuliX; no use for Tk in the
+        # daemon and it bloats the bundle by ~10 MB.
+        "tkinter",
+    ],
+    noarchive=False,
+)
+
+pyz = PYZ(a.pure, a.zipped_data)
+
+exe = EXE(
+    pyz,
+    a.scripts,
+    a.binaries,
+    a.datas,
+    [],
+    name="holo",
+    debug=False,
+    bootloader_ignore_signals=False,
+    strip=False,
+    upx=False,
+    upx_exclude=[],
+    runtime_tmpdir=None,
+    console=True,
+    disable_windowed_traceback=False,
+    argv_emulation=False,
+    target_arch=None,
+    codesign_identity=None,
+    entitlements_file=None,
+)
