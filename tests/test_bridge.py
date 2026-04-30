@@ -204,13 +204,43 @@ class TestRequest:
         client, fake = self._start_client(tmp_path, responses)
         # No more responses queued; the next readline returns b"".
         fake.stderr = io.BytesIO(b"some JVM trouble")
-        # read1 isn't on a vanilla BytesIO, monkey-patch it.
-        fake.stderr.read1 = lambda n=4096: b"some JVM trouble"  # type: ignore[attr-defined]
 
         with patch("holo.bridge.uuid.uuid4") as uu:
             uu.return_value.hex = "REQ1"
             with pytest.raises(BridgeError, match="some JVM trouble"):
                 client.request("ping")
+
+    def test_stdout_closed_with_raw_fileio_stderr(self, tmp_path):
+        """Regression: real subprocess.Popen with bufsize=0 returns raw
+        `_io.FileIO` streams which implement `read()` but not `read1()`.
+        The defensive stderr-tail grab must not crash with AttributeError
+        when the underlying error path is reached.
+        """
+        import os
+        import tempfile
+
+        responses = [{"id": "PING", "result": {"pong": True}}]
+        client, fake = self._start_client(tmp_path, responses)
+
+        # Build a real FileIO over a temp file containing the stderr
+        # bytes — this mirrors what Popen(bufsize=0) hands us, no
+        # buffered-IO methods like read1().
+        err_path = tempfile.NamedTemporaryFile(
+            delete=False, prefix="holo-test-stderr-"
+        )
+        err_path.write(b"real JVM crash details")
+        err_path.close()
+        try:
+            fd = os.open(err_path.name, os.O_RDONLY)
+            fake.stderr = io.FileIO(fd, "r", closefd=True)
+            assert not hasattr(fake.stderr, "read1")
+
+            with patch("holo.bridge.uuid.uuid4") as uu:
+                uu.return_value.hex = "REQ1"
+                with pytest.raises(BridgeError, match="real JVM crash details"):
+                    client.request("ping")
+        finally:
+            os.unlink(err_path.name)
 
 
 class TestConvenienceVerbs:
