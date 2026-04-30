@@ -117,6 +117,7 @@ on whichever page should be driven), then issues commands by sid. Tools:
 | `ping`          | Round-trip ping over the channel                         |
 | `read_global`   | Read a dotted path off the page's global object          |
 | `send_command`  | Escape hatch — send any bookmarklet op (see `bookmarklet/dispatch.js`) |
+| `browser_navigate` / `browser_new_tab` / `browser_list_tabs` / `browser_activate_tab` / `browser_close_active_tab` / `browser_read_active_url` / `browser_read_active_title` / `browser_reload` / `browser_back` / `browser_forward` | AppleScript-driven Chrome ops (macOS). Reliable navigation without keystroke simulation; bypasses `app_activate` + `screen_key` entirely. |
 
 ## License
 

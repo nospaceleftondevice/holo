@@ -195,6 +195,100 @@ class HoloMCPServer:
             needle_bytes, region=region, score=score
         )
 
+    # ---- Chrome browser tools (AppleScript; macOS-only) -----------------
+    #
+    # These bypass the SikuliX keystroke layer entirely — Chrome's
+    # AppleScript dictionary is synchronous and reliable, no focus
+    # races, no beeps. Use these instead of `app_activate` +
+    # `screen_key cmd+l` + `screen_type` + `screen_key enter` for any
+    # browser navigation. The bookmarklet channel is still the right
+    # tool for in-page DOM reads.
+
+    def browser_navigate(self, url: str) -> dict[str, Any]:
+        """Set the active tab's URL (Chrome, front window)."""
+        from holo import browser_chrome
+
+        try:
+            return browser_chrome.navigate(url)
+        except (browser_chrome.BrowserError, browser_chrome.BrowserNotAvailable) as e:
+            raise RuntimeError(str(e)) from e
+
+    def browser_new_tab(self, url: str | None = None) -> dict[str, Any]:
+        """Open a new tab in Chrome's front window. URL is optional."""
+        from holo import browser_chrome
+
+        try:
+            return browser_chrome.new_tab(url)
+        except (browser_chrome.BrowserError, browser_chrome.BrowserNotAvailable) as e:
+            raise RuntimeError(str(e)) from e
+
+    def browser_close_active_tab(self) -> dict[str, Any]:
+        """Close the active tab of Chrome's front window."""
+        from holo import browser_chrome
+
+        try:
+            return browser_chrome.close_active_tab()
+        except (browser_chrome.BrowserError, browser_chrome.BrowserNotAvailable) as e:
+            raise RuntimeError(str(e)) from e
+
+    def browser_activate_tab(self, index: int) -> dict[str, Any]:
+        """Make tab `index` (1-based) the active tab of the front window."""
+        from holo import browser_chrome
+
+        try:
+            return browser_chrome.activate_tab(index)
+        except (browser_chrome.BrowserError, browser_chrome.BrowserNotAvailable) as e:
+            raise RuntimeError(str(e)) from e
+
+    def browser_list_tabs(self) -> dict[str, Any]:
+        """List tabs in the front window: `{tabs: [{id,title,url,index}], active: index}`."""
+        from holo import browser_chrome
+
+        try:
+            return browser_chrome.list_tabs()
+        except (browser_chrome.BrowserError, browser_chrome.BrowserNotAvailable) as e:
+            raise RuntimeError(str(e)) from e
+
+    def browser_read_active_url(self) -> dict[str, Any]:
+        from holo import browser_chrome
+
+        try:
+            return browser_chrome.read_active_url()
+        except (browser_chrome.BrowserError, browser_chrome.BrowserNotAvailable) as e:
+            raise RuntimeError(str(e)) from e
+
+    def browser_read_active_title(self) -> dict[str, Any]:
+        from holo import browser_chrome
+
+        try:
+            return browser_chrome.read_active_title()
+        except (browser_chrome.BrowserError, browser_chrome.BrowserNotAvailable) as e:
+            raise RuntimeError(str(e)) from e
+
+    def browser_reload(self) -> dict[str, Any]:
+        from holo import browser_chrome
+
+        try:
+            return browser_chrome.reload()
+        except (browser_chrome.BrowserError, browser_chrome.BrowserNotAvailable) as e:
+            raise RuntimeError(str(e)) from e
+
+    def browser_back(self) -> dict[str, Any]:
+        from holo import browser_chrome
+
+        try:
+            return browser_chrome.go_back()
+        except (browser_chrome.BrowserError, browser_chrome.BrowserNotAvailable) as e:
+            raise RuntimeError(str(e)) from e
+
+    def browser_forward(self) -> dict[str, Any]:
+        from holo import browser_chrome
+
+        try:
+            return browser_chrome.go_forward()
+        except (browser_chrome.BrowserError, browser_chrome.BrowserNotAvailable) as e:
+            raise RuntimeError(str(e)) from e
+
 
 def _transport(ch: Channel) -> str:
     return "ws" if ch._ws_ready else "qr"
@@ -307,6 +401,72 @@ def build_server(
         score: float = 0.7,
     ) -> dict[str, Any] | None:
         return holo.screen_find_image(needle, region=region, score=score)
+
+    # ---- Chrome browser tools (AppleScript; macOS-only) ---------------------
+    #
+    # Prefer these over keystroke automation (`app_activate` + `screen_key`)
+    # for any browser navigation — they're synchronous and don't fight
+    # macOS focus.
+
+    @mcp.tool(
+        description=(
+            "Set the URL of Chrome's active tab in the front window. "
+            "Reliable navigation without keystroke simulation (macOS only)."
+        )
+    )
+    def browser_navigate(url: str) -> dict[str, Any]:
+        return holo.browser_navigate(url)
+
+    @mcp.tool(
+        description=(
+            "Open a new tab in Chrome's front window. "
+            "If `url` is omitted, the tab opens to the New Tab page."
+        )
+    )
+    def browser_new_tab(url: str | None = None) -> dict[str, Any]:
+        return holo.browser_new_tab(url)
+
+    @mcp.tool(description="Close the active tab of Chrome's front window.")
+    def browser_close_active_tab() -> dict[str, Any]:
+        return holo.browser_close_active_tab()
+
+    @mcp.tool(
+        description=(
+            "Make tab `index` (1-based) the active tab of Chrome's front "
+            "window and bring Chrome to the foreground."
+        )
+    )
+    def browser_activate_tab(index: int) -> dict[str, Any]:
+        return holo.browser_activate_tab(index)
+
+    @mcp.tool(
+        description=(
+            "List tabs in Chrome's front window. Returns "
+            "{tabs: [{id, title, url, index}], active: index}."
+        )
+    )
+    def browser_list_tabs() -> dict[str, Any]:
+        return holo.browser_list_tabs()
+
+    @mcp.tool(description="Read the URL of Chrome's active tab.")
+    def browser_read_active_url() -> dict[str, Any]:
+        return holo.browser_read_active_url()
+
+    @mcp.tool(description="Read the title of Chrome's active tab.")
+    def browser_read_active_title() -> dict[str, Any]:
+        return holo.browser_read_active_title()
+
+    @mcp.tool(description="Reload Chrome's active tab.")
+    def browser_reload() -> dict[str, Any]:
+        return holo.browser_reload()
+
+    @mcp.tool(description="Navigate back in Chrome's active tab history.")
+    def browser_back() -> dict[str, Any]:
+        return holo.browser_back()
+
+    @mcp.tool(description="Navigate forward in Chrome's active tab history.")
+    def browser_forward() -> dict[str, Any]:
+        return holo.browser_forward()
 
     return mcp, holo
 

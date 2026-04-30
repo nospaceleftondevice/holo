@@ -327,6 +327,16 @@ class TestShutdownAndBuild:
                 "screen_key",
                 "screen_shot",
                 "screen_find_image",
+                "browser_navigate",
+                "browser_new_tab",
+                "browser_close_active_tab",
+                "browser_activate_tab",
+                "browser_list_tabs",
+                "browser_read_active_url",
+                "browser_read_active_title",
+                "browser_reload",
+                "browser_back",
+                "browser_forward",
             }
         finally:
             holo.shutdown()
@@ -419,3 +429,87 @@ class TestScreenTools:
         server._daemon = fake
         with pytest.raises(RuntimeError, match="SikuliX bridge unavailable"):
             server.screen_click(0, 0)
+
+
+class TestBrowserTools:
+    """The browser_* MCP tools wrap `holo.browser_chrome`. They don't
+    touch the daemon or the bridge — they shell out to osascript. Here
+    we verify the MCP layer's error translation; the AppleScript
+    snippets and parsing are covered in `test_browser_chrome.py`.
+    """
+
+    def _server_no_daemon(self) -> HoloMCPServer:
+        # Browser tools don't touch the daemon, but we don't want lazy
+        # construction to start a real Daemon mid-test if something
+        # accidentally pokes it.
+        server = HoloMCPServer()
+        server._daemon = _FakeDaemon()
+        return server
+
+    def test_browser_navigate_delegates(self):
+        from unittest.mock import patch
+
+        server = self._server_no_daemon()
+        with patch("holo.browser_chrome.navigate") as nav:
+            nav.return_value = {"url": "https://x/"}
+            out = server.browser_navigate("https://x/")
+
+        assert out == {"url": "https://x/"}
+        nav.assert_called_once_with("https://x/")
+
+    def test_browser_navigate_translates_browser_error_to_runtime_error(self):
+        from unittest.mock import patch
+
+        from holo.browser_chrome import BrowserError
+
+        server = self._server_no_daemon()
+        with patch("holo.browser_chrome.navigate", side_effect=BrowserError("boom")):
+            with pytest.raises(RuntimeError, match="boom"):
+                server.browser_navigate("https://x/")
+
+    def test_browser_navigate_translates_not_available(self):
+        from unittest.mock import patch
+
+        from holo.browser_chrome import BrowserNotAvailable
+
+        server = self._server_no_daemon()
+        with patch(
+            "holo.browser_chrome.navigate",
+            side_effect=BrowserNotAvailable("linux"),
+        ):
+            with pytest.raises(RuntimeError, match="linux"):
+                server.browser_navigate("https://x/")
+
+    def test_browser_list_tabs_passthrough(self):
+        from unittest.mock import patch
+
+        server = self._server_no_daemon()
+        payload = {
+            "tabs": [{"id": 1, "title": "x", "url": "https://x/", "index": 1}],
+            "active": 1,
+        }
+        with patch("holo.browser_chrome.list_tabs", return_value=payload):
+            assert server.browser_list_tabs() == payload
+
+    def test_browser_new_tab_with_and_without_url(self):
+        from unittest.mock import patch
+
+        server = self._server_no_daemon()
+        with patch("holo.browser_chrome.new_tab") as new_tab:
+            new_tab.return_value = {"url": "https://y/"}
+            server.browser_new_tab("https://y/")
+            new_tab.assert_called_once_with("https://y/")
+
+            new_tab.reset_mock()
+            new_tab.return_value = {"url": "chrome://newtab/"}
+            server.browser_new_tab()
+            new_tab.assert_called_once_with(None)
+
+    def test_browser_activate_tab_passes_index(self):
+        from unittest.mock import patch
+
+        server = self._server_no_daemon()
+        with patch("holo.browser_chrome.activate_tab") as act:
+            act.return_value = {"index": 4}
+            assert server.browser_activate_tab(4) == {"index": 4}
+            act.assert_called_once_with(4)
