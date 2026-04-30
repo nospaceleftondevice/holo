@@ -109,20 +109,15 @@ jobs:
           # Discover packages with single-arch .so files. Iterate every
           # installed distribution's files so we catch installs in
           # framework site-packages, user-site, or anywhere else.
-          # Output `name==version` so the fuse step pins exact versions
-          # (arm64 + x86_64 wheels must come from the same release —
-          # e.g. cffi 2.0.0 dropped x86_64, so unpinned arm64 grabs 2.0
-          # and x86_64 grabs 1.17, and delocate-merge can't fuse those).
           # Skip .so files under tests/test dirs — those are fixtures
           # (delocate ships single-arch .so test data), not loaded code.
           python > /tmp/bad_pkgs.txt <<'PY'
           import os, subprocess
           from importlib.metadata import distributions
 
-          bad = {}
+          bad = set()
           for dist in distributions():
               name = dist.metadata["Name"]
-              version = dist.version
               for f in (dist.files or []):
                   fs = str(f)
                   if not fs.endswith(".so"):
@@ -141,10 +136,10 @@ jobs:
                   except subprocess.CalledProcessError:
                       continue
                   if not ("arm64" in archs and "x86_64" in archs):
-                      bad[name] = version
+                      bad.add(name)
                       break
-          for n, v in sorted(bad.items()):
-              print(f"{n}=={v}")
+          for n in sorted(bad):
+              print(n)
           PY
 
           echo "::group::offenders"
@@ -160,7 +155,7 @@ jobs:
             rm -rf "$arm_dir" "$x86_dir" "$out_dir"
             mkdir -p "$arm_dir" "$x86_dir" "$out_dir"
 
-            # Try pure-Python wheel first
+            # Try pure-Python wheel first.
             if python -m pip download --no-deps --only-binary=:all: \
                  --platform any --python-version 3.12 \
                  --dest "$out_dir" "$pkg" >/dev/null 2>&1; then
@@ -175,19 +170,28 @@ jobs:
               fi
             fi
 
+            # x86_64 anchors the version. Some packages drop x86_64 in
+            # newer releases (e.g. cffi 2.0.0 is arm64-only; latest with
+            # both archs is 1.17.1). Resolving x86_64 unpinned grabs the
+            # newest version that still ships an x86_64 wheel; we then
+            # match arm64 to that exact version so delocate-merge can
+            # fuse them.
             rm -rf "$out_dir"; mkdir -p "$out_dir"
-            python -m pip download --no-deps --only-binary=:all: \
-              --platform macosx_11_0_arm64 --python-version 3.12 \
-              --dest "$arm_dir" "$pkg"
             python -m pip download --no-deps --only-binary=:all: \
               --platform macosx_10_12_x86_64 --python-version 3.12 \
               --dest "$x86_dir" "$pkg"
-            local arm_whl x86_whl fused_whl
-            arm_whl=$(ls "$arm_dir"/*.whl)
+            local x86_whl
             x86_whl=$(ls "$x86_dir"/*.whl)
+            local pkg_version
+            pkg_version=$(basename "$x86_whl" | awk -F- '{print $2}')
+            python -m pip download --no-deps --only-binary=:all: \
+              --platform macosx_11_0_arm64 --python-version 3.12 \
+              --dest "$arm_dir" "${pkg}==${pkg_version}"
+            local arm_whl fused_whl
+            arm_whl=$(ls "$arm_dir"/*.whl)
             python -m delocate.cmd.delocate_merge "$arm_whl" "$x86_whl" -w "$out_dir"
             fused_whl=$(ls "$out_dir"/*.whl)
-            echo "  → fused: $(basename "$fused_whl")"
+            echo "  → fused: $(basename "$fused_whl") (version $pkg_version)"
             python -m pip install --force-reinstall --no-deps "$fused_whl"
           }
 
