@@ -79,6 +79,29 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install -e ".[dev]"
 
+      # On macOS universal2, any C-extension package without a universal2
+      # wheel on PyPI ends up arm64-only (since runner is arm64) and
+      # PyInstaller's universal2 build refuses to bundle a single-arch
+      # .so. Re-install those from sdist with ARCHFLAGS so the C
+      # extensions compile with both slices. Only `websockets` is known
+      # to need this today; add others here if they surface.
+      - name: Reinstall native extensions as universal2 (macOS)
+        if: matrix.python == 'universal2'
+        env:
+          ARCHFLAGS: "-arch arm64 -arch x86_64"
+          MACOSX_DEPLOYMENT_TARGET: "11.0"
+        run: |
+          pip install --upgrade --force-reinstall --no-binary websockets websockets
+          for so in $(find "$(python -c 'import websockets, os; print(os.path.dirname(websockets.__file__))')" -name '*.so'); do
+            echo "checking ${so}"
+            archs=$(lipo -archs "${so}")
+            echo "  archs: ${archs}"
+            case "${archs}" in
+              *arm64*x86_64*|*x86_64*arm64*) ;;
+              *) echo "  ✗ expected universal2"; exit 1 ;;
+            esac
+          done
+
       # Tests run on every PR via ci.yml. The release workflow's job is
       # to build binaries; we only re-run pytest on darwin where the
       # current suite has been validated. Linux / Windows will get
