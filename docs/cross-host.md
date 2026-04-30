@@ -19,7 +19,10 @@ to Host A.
 
 ## Setup (cross-host)
 
-On both hosts you need a `holo` binary on `PATH`.
+On both hosts you need a `holo` binary on `PATH`. On Host A you also
+need the bookmarklet installed in the browser you want to drive —
+run `holo install-bookmarklet` on Host A and drag the 🔧 holo button
+to the bookmarks bar.
 
 On the agent's host (Host B), in the project where you want to drive
 the remote browser:

@@ -9,6 +9,7 @@ Subcommands:
     holo mcp               run the MCP server over stdio
     holo bridge <verb>     smoke-test the SikuliX bridge directly
     holo install-bridge    pre-download the SikuliX jar into the user cache
+    holo install-bookmarklet  download the bookmarklet page and open it
 """
 
 from __future__ import annotations
@@ -450,6 +451,27 @@ def _cmd_install_bridge() -> int:
     return 0
 
 
+def _cmd_install_bookmarklet(rest: list[str]) -> int:
+    """Download `holo-bookmarklet.html` from the matching release and
+    open it in the default browser."""
+    from holo import install_bookmarklet
+
+    url: str | None = None
+    i = 0
+    while i < len(rest):
+        flag = rest[i]
+        if flag == "--url" and i + 1 < len(rest):
+            url = rest[i + 1]
+            i += 2
+        else:
+            sys.stderr.write(
+                f"holo install-bookmarklet: unknown flag: {flag!r}\n"
+                "usage: holo install-bookmarklet [--url URL]\n"
+            )
+            return 2
+    return install_bookmarklet.run(url=url)
+
+
 COMMANDS = {
     "windows": _cmd_windows,
     "doctor": _cmd_doctor,
@@ -466,7 +488,8 @@ def main(argv: list[str] | None = None) -> int:
         print(
             f"holo {__version__} — try `holo --version`, `holo windows`, "
             "`holo doctor`, `holo demo`, `holo focus`, `holo mcp`, "
-            "`holo mcp-remote`, `holo bridge`, or `holo install-bridge`"
+            "`holo mcp-remote`, `holo bridge`, `holo install-bridge`, "
+            "or `holo install-bookmarklet`"
         )
         return 0
     cmd = args[0]
@@ -489,6 +512,8 @@ def main(argv: list[str] | None = None) -> int:
         return _cmd_mcp_remote(rest)
     if cmd == "bridge":
         return _cmd_bridge(rest)
+    if cmd == "install-bookmarklet":
+        return _cmd_install_bookmarklet(rest)
     if cmd in COMMANDS:
         return COMMANDS[cmd]()
     print(f"holo: unknown command {cmd!r}", file=sys.stderr)
