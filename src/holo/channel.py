@@ -11,7 +11,8 @@ class with a small, blocking, request/response surface:
 
 The Channel locks onto a specific browser window at calibration and
 polls only that window's title for replies. Multi-window / multi-tab
-addressing is a Phase 2 concern.
+addressing is deferred — first user to actually need it owns the
+design.
 
 Two transports for command/result traffic, in order of preference:
 

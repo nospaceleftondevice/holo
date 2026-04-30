@@ -118,9 +118,16 @@ Cross-host mode adds:
 
 - **Phase 0** — primitive layer: Python lib + bookmarklet payload + title/clipboard channel + framing protocol.
 - **Phase 1** — agent surface: MCP server exposing `browser.*` tools. Local mode end-to-end.
-- **Phase 2** — per-origin plugins: tai.sh, github.com, AWS Console assertion modules.
-- **Phase 3** — cross-host: registry service + bridge popup + signed-cert daemon auth. Reuses existing tai.sh CA.
-- **Phase 4 (opt-in)** — CDP adapter for tests that genuinely need structured network capture. Keep simple architecture as default.
+- **Phase 2** — cross-host: registry service + bridge popup + signed-cert daemon auth. Reuses existing tai.sh CA.
+- **Phase 3 (opt-in)** — CDP adapter for tests that genuinely need structured network capture. Keep simple architecture as default.
+
+The original roadmap had a "per-origin assertion plugins" phase between agent
+surface and cross-host. We dropped it: a capable agent reads the page on
+demand via `read_global` / `send_command` and figures out the structure
+itself. Site plugins shipped by the framework would just freeze that derivation
+and rot as sites redesigned. If a particular extraction proves expensive or
+flaky enough to be worth caching, that's a recipe the agent (or its memory
+layer) owns, not the daemon.
 
 ## Open questions
 

@@ -33,9 +33,8 @@ general tool.
 
 - [x] Phase 0 — primitive layer (channel, framing protocol, bookmarklet payload)
 - [x] Phase 1 — agent surface (MCP server, with WebSocket transport + stealth-QR fallback)
-- [ ] Phase 2 — per-origin assertion plugins
-- [ ] Phase 3 — cross-host registry + bridge
-- [ ] Phase 4 — opt-in CDP adapter
+- [ ] Phase 2 — cross-host registry + bridge
+- [ ] Phase 3 — opt-in CDP adapter
 
 ## Build a single-file binary
 
