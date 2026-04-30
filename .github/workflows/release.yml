@@ -111,13 +111,19 @@ jobs:
           # framework site-packages, user-site, or anywhere else.
           # Skip .so files under tests/test dirs — those are fixtures
           # (delocate ships single-arch .so test data), not loaded code.
+          # Output `name==version` so the fuse step pins the pure-Python
+          # check to the right version (without a pin pip silently walks
+          # back the release history and might grab an ancient stub
+          # release — pydantic-core 0.0.1 was a placeholder before the
+          # Rust impl shipped at 2.x).
           python > /tmp/bad_pkgs.txt <<'PY'
           import os, subprocess
           from importlib.metadata import distributions
 
-          bad = set()
+          bad = {}
           for dist in distributions():
               name = dist.metadata["Name"]
+              version = dist.version
               for f in (dist.files or []):
                   fs = str(f)
                   if not fs.endswith(".so"):
@@ -136,10 +142,10 @@ jobs:
                   except subprocess.CalledProcessError:
                       continue
                   if not ("arm64" in archs and "x86_64" in archs):
-                      bad.add(name)
+                      bad[name] = version
                       break
-          for n in sorted(bad):
-              print(n)
+          for n, v in sorted(bad.items()):
+              print(f"{n}=={v}")
           PY
 
           echo "::group::offenders"
@@ -147,18 +153,23 @@ jobs:
           echo "::endgroup::"
 
           fuse_pkg() {
-            local pkg=$1
-            local slug=${pkg//[^A-Za-z0-9]/_}
+            local spec=$1   # "name==version"
+            local pkg_name=${spec%%==*}
+            local pkg_version=${spec##*==}
+            local slug=${spec//[^A-Za-z0-9]/_}
             local arm_dir="/tmp/wheels/${slug}-arm64"
             local x86_dir="/tmp/wheels/${slug}-x86"
             local out_dir="/tmp/wheels/${slug}-out"
             rm -rf "$arm_dir" "$x86_dir" "$out_dir"
             mkdir -p "$arm_dir" "$x86_dir" "$out_dir"
 
-            # Try pure-Python wheel first.
+            # Try pure-Python wheel for the discovered version. Pinning
+            # is critical: unpinned, pip walks release history for a
+            # py3-none-any match and can land on an ancient stub
+            # (pydantic-core 0.0.1 predates the Rust impl).
             if python -m pip download --no-deps --only-binary=:all: \
                  --platform any --python-version 3.12 \
-                 --dest "$out_dir" "$pkg" >/dev/null 2>&1; then
+                 --dest "$out_dir" "$spec" >/dev/null 2>&1; then
               local pure_whl
               pure_whl=$(ls "$out_dir"/*-py3-none-any.whl 2>/dev/null \
                          || ls "$out_dir"/*-py2.py3-none-any.whl 2>/dev/null \
@@ -170,28 +181,32 @@ jobs:
               fi
             fi
 
-            # x86_64 anchors the version. Some packages drop x86_64 in
-            # newer releases (e.g. cffi 2.0.0 is arm64-only; latest with
-            # both archs is 1.17.1). Resolving x86_64 unpinned grabs the
-            # newest version that still ships an x86_64 wheel; we then
-            # match arm64 to that exact version so delocate-merge can
-            # fuse them.
+            # Fuse arm64+x86_64 wheels. Try pinned first; if x86_64 has
+            # no wheel at this version (newer releases sometimes drop it
+            # — cffi 2.0.0 is arm64-only), fall back to x86_64 unpinned
+            # and re-anchor arm64 to whatever version that resolves to.
             rm -rf "$out_dir"; mkdir -p "$out_dir"
-            python -m pip download --no-deps --only-binary=:all: \
-              --platform macosx_10_12_x86_64 --python-version 3.12 \
-              --dest "$x86_dir" "$pkg"
+            if ! python -m pip download --no-deps --only-binary=:all: \
+                   --platform macosx_10_12_x86_64 --python-version 3.12 \
+                   --dest "$x86_dir" "$spec" 2>/dev/null; then
+              echo "  ! no x86_64 wheel for $spec — falling back to latest with x86_64"
+              rm -rf "$x86_dir"; mkdir -p "$x86_dir"
+              python -m pip download --no-deps --only-binary=:all: \
+                --platform macosx_10_12_x86_64 --python-version 3.12 \
+                --dest "$x86_dir" "$pkg_name"
+            fi
             local x86_whl
             x86_whl=$(ls "$x86_dir"/*.whl)
-            local pkg_version
-            pkg_version=$(basename "$x86_whl" | awk -F- '{print $2}')
+            local fuse_version
+            fuse_version=$(basename "$x86_whl" | awk -F- '{print $2}')
             python -m pip download --no-deps --only-binary=:all: \
               --platform macosx_11_0_arm64 --python-version 3.12 \
-              --dest "$arm_dir" "${pkg}==${pkg_version}"
+              --dest "$arm_dir" "${pkg_name}==${fuse_version}"
             local arm_whl fused_whl
             arm_whl=$(ls "$arm_dir"/*.whl)
             python -m delocate.cmd.delocate_merge "$arm_whl" "$x86_whl" -w "$out_dir"
             fused_whl=$(ls "$out_dir"/*.whl)
-            echo "  → fused: $(basename "$fused_whl") (version $pkg_version)"
+            echo "  → fused: $(basename "$fused_whl") (version $fuse_version)"
             python -m pip install --force-reinstall --no-deps "$fused_whl"
           }
 
