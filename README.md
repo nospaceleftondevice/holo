@@ -46,8 +46,8 @@ Three targets: `holo-macos-universal2` (arm64 + x86_64 fat binary),
 macOS / Linux:
 
 ```bash
-# Replace TAG with the latest release tag, e.g. v0.1.0a1
-TAG=v0.1.0a1
+# Replace TAG with the latest release tag, e.g. v0.1.0a2
+TAG=v0.1.0a2
 ASSET=holo-macos-universal2   # or holo-linux-x86_64
 
 curl -L -o /usr/local/bin/holo \
