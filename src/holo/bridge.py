@@ -32,6 +32,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import ssl
 import subprocess
 import sys
 import threading
@@ -435,9 +436,28 @@ def ensure_jar(
     return target
 
 
+def _ssl_context() -> ssl.SSLContext:
+    """SSL context with a CA bundle that exists on the user's machine.
+
+    PyInstaller bundles the Python interpreter built on the GHA runner.
+    That interpreter's OpenSSL has the runner's CA paths compiled in
+    (e.g. `/etc/ssl/cert.pem`), which don't exist on a fresh user
+    machine — `urllib.request.urlopen` then fails with
+    `CERTIFICATE_VERIFY_FAILED`. Use `certifi`'s bundled CA store
+    explicitly to sidestep that.
+    """
+    try:
+        import certifi
+        return ssl.create_default_context(cafile=certifi.where())
+    except ImportError:
+        # Dev install without certifi — fall back to system default.
+        return ssl.create_default_context()
+
+
 def _download(url: str, dest: Path, *, on_progress: Any = None) -> None:
     try:
-        with urllib.request.urlopen(url) as response:  # noqa: S310 (pinned URL)
+        ctx = _ssl_context()
+        with urllib.request.urlopen(url, context=ctx) as response:  # noqa: S310 (pinned URL)
             total = int(response.headers.get("Content-Length") or 0) or SIKULI_JAR_BYTES
             with open(dest, "wb") as out:
                 read = 0

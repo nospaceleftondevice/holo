@@ -28,6 +28,10 @@ dependencies = [
   "pyautogui>=0.9.54",
   "websockets>=13.0",
   "mcp>=1.2",
+  # Bundled CA store for HTTPS — PyInstaller-bundled Python's OpenSSL
+  # uses CA paths from the build runner that don't exist on the user's
+  # machine, so `urllib` against GitHub Releases fails on first run.
+  "certifi>=2024.2.2",
 ]
 
 [project.optional-dependencies]

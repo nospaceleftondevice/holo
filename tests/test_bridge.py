@@ -14,6 +14,7 @@ from __future__ import annotations
 import hashlib
 import io
 import json
+import os
 import threading
 from pathlib import Path
 from unittest.mock import patch
@@ -474,6 +475,49 @@ class TestEnsureJar:
             ensure_jar(cache_dir=cache)
         assert not (cache / SIKULI_JAR_NAME).exists()
         assert not (cache / (SIKULI_JAR_NAME + ".part")).exists()
+
+
+class TestSSLContext:
+    """`_ssl_context()` exists because PyInstaller-bundled Python's
+    OpenSSL has CA paths from the build runner compiled in, which fail
+    on a fresh user machine. We bundle certifi and create a context
+    that points at its CA bundle explicitly.
+    """
+
+    def test_uses_certifi_ca_bundle_when_available(self):
+        import certifi
+
+        ctx = bridge_mod._ssl_context()
+        # SSL contexts don't expose the cafile after construction, but
+        # we can verify the CA store loaded — certifi's bundle has
+        # hundreds of roots, the system fallback may have zero on a
+        # fresh PyInstaller binary.
+        ca_count = len(ctx.get_ca_certs())
+        assert ca_count > 50, (
+            f"expected certifi-backed context to load >50 roots, got {ca_count}"
+        )
+        # Sanity: certifi.where() points at a real readable file.
+        assert os.path.exists(certifi.where())
+
+    def test_falls_back_when_certifi_missing(self, monkeypatch):
+        # Simulate a dev install without certifi: hide the module from
+        # the import machinery so `import certifi` inside _ssl_context
+        # raises ImportError. We must still get a usable context back.
+        import builtins
+
+        real_import = builtins.__import__
+
+        def fake_import(name, *args, **kwargs):
+            if name == "certifi":
+                raise ImportError("simulated missing certifi")
+            return real_import(name, *args, **kwargs)
+
+        monkeypatch.setattr(builtins, "__import__", fake_import)
+        ctx = bridge_mod._ssl_context()
+        # Should still return a usable SSL context (system default).
+        import ssl as _ssl
+
+        assert isinstance(ctx, _ssl.SSLContext)
 
 
 class TestThreadSafety:
