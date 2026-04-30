@@ -294,6 +294,49 @@ def _cmd_mcp(*, hide_qr: bool = False, use_bridge: bool = False) -> int:
     return 0
 
 
+def _cmd_mcp_remote(rest: list[str]) -> int:
+    """Bridge a local MCP client's stdio to a remote `holo mcp`.
+
+    Spawns the user-supplied command (everything after `--`), strips
+    stdout banner content until a JSON envelope arrives, then becomes a
+    transparent stdio proxy. See `holo.mcp_remote` for the proxy
+    semantics. Typical usage:
+
+        holo mcp-remote -- ssh -A hostA holo mcp
+        holo mcp-remote -- kubectl exec -i pod-x -- holo mcp
+    """
+    from holo import mcp_remote
+
+    if "--" not in rest:
+        sys.stderr.write(
+            "usage: holo mcp-remote [--startup-timeout SECS] -- <command>\n"
+            "example: holo mcp-remote -- ssh -A hostA holo mcp\n"
+        )
+        return 2
+    sep = rest.index("--")
+    flags = rest[:sep]
+    child_argv = rest[sep + 1:]
+
+    timeout = mcp_remote.DEFAULT_STARTUP_TIMEOUT_S
+    i = 0
+    while i < len(flags):
+        flag = flags[i]
+        if flag == "--startup-timeout" and i + 1 < len(flags):
+            try:
+                timeout = float(flags[i + 1])
+            except ValueError:
+                sys.stderr.write(
+                    f"holo mcp-remote: invalid --startup-timeout: {flags[i + 1]!r}\n"
+                )
+                return 2
+            i += 2
+        else:
+            sys.stderr.write(f"holo mcp-remote: unknown flag: {flag!r}\n")
+            return 2
+
+    return mcp_remote.run(child_argv, startup_timeout_s=timeout)
+
+
 _BRIDGE_USAGE = (
     "usage: holo bridge <verb> [args]\n"
     "  ping                          start the JVM bridge and ping it\n"
@@ -423,7 +466,7 @@ def main(argv: list[str] | None = None) -> int:
         print(
             f"holo {__version__} — try `holo --version`, `holo windows`, "
             "`holo doctor`, `holo demo`, `holo focus`, `holo mcp`, "
-            "`holo bridge`, or `holo install-bridge`"
+            "`holo mcp-remote`, `holo bridge`, or `holo install-bridge`"
         )
         return 0
     cmd = args[0]
@@ -442,6 +485,8 @@ def main(argv: list[str] | None = None) -> int:
             hide_qr="--hide-qr" in rest,
             use_bridge="--bridge" in rest,
         )
+    if cmd == "mcp-remote":
+        return _cmd_mcp_remote(rest)
     if cmd == "bridge":
         return _cmd_bridge(rest)
     if cmd in COMMANDS:
