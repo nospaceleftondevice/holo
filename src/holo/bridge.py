@@ -168,10 +168,15 @@ class BridgeClient:
             for _ in range(32):
                 raw = self._proc.stdout.readline()
                 if not raw:
+                    # Popen with `bufsize=0` gives raw FileIO streams, which
+                    # implement `read()` but not `read1()`. Use plain `read`
+                    # so the diagnostic itself doesn't crash with
+                    # AttributeError and bury the real cause of the
+                    # stdout-closed condition.
                     stderr_tail = b""
                     if self._proc.stderr is not None:
                         try:
-                            stderr_tail = self._proc.stderr.read1(4096) or b""
+                            stderr_tail = self._proc.stderr.read(4096) or b""
                         except (ValueError, OSError):
                             pass
                     raise BridgeError(
