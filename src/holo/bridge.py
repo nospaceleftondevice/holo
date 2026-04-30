@@ -158,24 +158,47 @@ class BridgeClient:
             except (BrokenPipeError, OSError) as e:
                 raise BridgeError(-32000, "bridge stdin closed: " + str(e)) from e
 
-            raw = self._proc.stdout.readline()
-            if not raw:
-                stderr_tail = b""
-                if self._proc.stderr is not None:
-                    try:
-                        stderr_tail = self._proc.stderr.read1(4096) or b""
-                    except (ValueError, OSError):
-                        pass
+            # Skip stdout chatter from SikuliX/JVM that bypassed the
+            # bridge's silencer (action logs, JVM warnings, etc.). Look
+            # for the first line that parses as a JSON object — that's
+            # our response. Bound the skip so a dead bridge fails fast.
+            response: dict[str, Any] | None = None
+            skipped: list[str] = []
+            for _ in range(32):
+                raw = self._proc.stdout.readline()
+                if not raw:
+                    stderr_tail = b""
+                    if self._proc.stderr is not None:
+                        try:
+                            stderr_tail = self._proc.stderr.read1(4096) or b""
+                        except (ValueError, OSError):
+                            pass
+                    raise BridgeError(
+                        -32001,
+                        "bridge stdout closed; stderr tail: "
+                        + stderr_tail.decode("utf-8", errors="replace"),
+                    )
+                try:
+                    decoded = raw.decode("utf-8")
+                except UnicodeDecodeError:
+                    skipped.append(repr(raw))
+                    continue
+                stripped = decoded.lstrip()
+                if not stripped.startswith("{"):
+                    skipped.append(decoded.rstrip("\n"))
+                    continue
+                try:
+                    response = json.loads(decoded)
+                except json.JSONDecodeError:
+                    skipped.append(decoded.rstrip("\n"))
+                    continue
+                break
+            if response is None:
                 raise BridgeError(
-                    -32001,
-                    "bridge stdout closed; stderr tail: "
-                    + stderr_tail.decode("utf-8", errors="replace"),
+                    -32002,
+                    "no JSON response after 32 lines; skipped: "
+                    + " | ".join(skipped[-5:]),
                 )
-
-        try:
-            response = json.loads(raw.decode("utf-8"))
-        except (UnicodeDecodeError, json.JSONDecodeError) as e:
-            raise BridgeError(-32002, "bad response: " + str(e)) from e
 
         if response.get("id") != rid:
             raise BridgeError(
