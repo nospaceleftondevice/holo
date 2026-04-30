@@ -303,9 +303,48 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
+  bookmarklet:
+    name: Build bookmarklet asset
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: bookmarklet/package-lock.json
+
+      - name: Build bookmarklet
+        working-directory: bookmarklet
+        run: |
+          npm ci
+          npm run build
+
+      # `install.html` is a self-contained drag-to-bookmarks-bar page —
+      # the `javascript:` URL has all the bookmarklet JS inlined. Ship
+      # it as a release asset so users on a fresh machine can curl it
+      # without cloning the repo or building anything. Renamed to
+      # `holo-bookmarklet.html` so it sits alongside the `holo-*`
+      # binaries in the release file list.
+      - name: Stage bookmarklet asset
+        run: |
+          mkdir -p out
+          cp bookmarklet/dist/install.html out/holo-bookmarklet.html
+          ls -la out/
+
+      - name: Upload bookmarklet artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: holo-bookmarklet.html
+          path: out/holo-bookmarklet.html
+          if-no-files-found: error
+          retention-days: 14
+
   release:
     name: Publish release
-    needs: build
+    needs: [build, bookmarklet]
     runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/v')
     steps:

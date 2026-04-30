@@ -40,8 +40,10 @@ no API stability.
 ## Install
 
 Pre-built binaries are attached to each [GitHub Release](https://github.com/nospaceleftondevice/holo/releases).
-Three targets: `holo-macos-universal2` (arm64 + x86_64 fat binary),
-`holo-linux-x86_64`, `holo-windows-x86_64.exe`.
+Three binary targets: `holo-macos-universal2` (arm64 + x86_64 fat binary),
+`holo-linux-x86_64`, `holo-windows-x86_64.exe`. Each release also ships
+`holo-bookmarklet.html` — a self-contained page for installing the
+bookmarklet in your browser.
 
 macOS / Linux:
 
@@ -58,6 +60,17 @@ holo --version
 
 Windows: download `holo-windows-x86_64.exe` from the release page and
 put it on `PATH`.
+
+Install the bookmarklet (any platform — opens in the browser you want
+holo to drive):
+
+```bash
+holo install-bookmarklet
+```
+
+That downloads `holo-bookmarklet.html` from the matching release and
+opens it in your default browser. Then drag the 🔧 holo button to your
+bookmarks bar.
 
 End users also need OpenJDK 11+ installed (for the SikuliX bridge that
 drives screen primitives). The 128 MB SikuliX jar itself isn't bundled
