@@ -21,11 +21,19 @@
 
 # ruff: noqa  (this file runs under PyInstaller's bundled exec context)
 
+import os
 from pathlib import Path
 
 import PyInstaller.config
 
 ROOT = Path(SPECPATH).resolve()
+
+# When set, force a specific target arch for the EXE (e.g. universal2 on
+# macOS). PyInstaller validates that the running Python supports the
+# requested arch — set HOLO_TARGET_ARCH=universal2 in CI on macos-14
+# (where we install python.org's universal2 build) to fail fast if a
+# dependency isn't universal2 instead of silently producing arm64-only.
+TARGET_ARCH = os.environ.get("HOLO_TARGET_ARCH") or None
 
 datas = [
     (str(ROOT / "src" / "holo" / "static"), "holo/static"),
@@ -87,7 +95,7 @@ exe = EXE(
     console=True,
     disable_windowed_traceback=False,
     argv_emulation=False,
-    target_arch=None,
+    target_arch=TARGET_ARCH,
     codesign_identity=None,
     entitlements_file=None,
 )

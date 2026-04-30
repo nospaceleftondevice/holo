@@ -17,23 +17,46 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - runner: macos-14         # GitHub-hosted Apple Silicon
-            target: macos-arm64
-            artifact: holo-macos-arm64
-          - runner: macos-13         # x86_64 Mac (last x86 macOS GHA runner)
-            target: macos-x86_64
-            artifact: holo-macos-x86_64
+          # macos-14 is Apple Silicon; we install python.org's universal2
+          # Python so PyInstaller emits a single binary that runs natively
+          # on both arm64 and Intel Macs. macos-13 (x86-only runners) is
+          # consistently queue-starved on GHA and not worth the wait when
+          # universal2 covers the same userbase.
+          - runner: macos-14
+            target: macos-universal2
+            artifact: holo-macos-universal2
+            python: universal2
           - runner: ubuntu-latest
             target: linux-x86_64
             artifact: holo-linux-x86_64
+            python: setup-python
           - runner: windows-latest
             target: windows-x86_64
             artifact: holo-windows-x86_64.exe
+            python: setup-python
 
     steps:
       - uses: actions/checkout@v4
 
-      - name: Set up Python
+      # actions/setup-python doesn't ship a universal2 Python on macOS,
+      # so on the macos-14 runner we install python.org's universal2 PKG
+      # directly. The interpreter ends up at
+      # /Library/Frameworks/Python.framework/Versions/3.12/bin/python3
+      # and PyInstaller picks up its arch automatically.
+      - name: Set up universal2 Python (macOS)
+        if: matrix.python == 'universal2'
+        run: |
+          PY_VER=3.12.7
+          curl -fsSL -o python-installer.pkg \
+            "https://www.python.org/ftp/python/${PY_VER}/python-${PY_VER}-macos11.pkg"
+          sudo installer -pkg python-installer.pkg -target /
+          PY_BIN=/Library/Frameworks/Python.framework/Versions/3.12/bin
+          echo "${PY_BIN}" >> "$GITHUB_PATH"
+          "${PY_BIN}/python3" -c 'import platform; print("arch:", platform.mac_ver(), platform.machine())'
+          file "${PY_BIN}/python3"
+
+      - name: Set up Python (Linux/Windows)
+        if: matrix.python == 'setup-python'
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
@@ -65,6 +88,8 @@ jobs:
         run: pytest -ra
 
       - name: Build binary with PyInstaller
+        env:
+          HOLO_TARGET_ARCH: ${{ matrix.python == 'universal2' && 'universal2' || '' }}
         run: pyinstaller --clean holo.spec
 
       - name: Stage artifact (Unix)
@@ -74,6 +99,16 @@ jobs:
           cp dist/holo "out/${{ matrix.artifact }}"
           chmod +x "out/${{ matrix.artifact }}"
           ls -la out/
+          file "out/${{ matrix.artifact }}"
+          # Sanity-check the universal2 build — should report two arches.
+          if [ "${{ matrix.python }}" = "universal2" ]; then
+            archs=$(lipo -archs "out/${{ matrix.artifact }}")
+            echo "lipo archs: ${archs}"
+            case "${archs}" in
+              *arm64*x86_64*|*x86_64*arm64*) echo "✓ universal2 confirmed" ;;
+              *) echo "✗ expected universal2, got '${archs}'"; exit 1 ;;
+            esac
+          fi
           ./out/${{ matrix.artifact }} --version
 
       - name: Stage artifact (Windows)
