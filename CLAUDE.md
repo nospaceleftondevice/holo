@@ -85,3 +85,11 @@ Two transports:
 When the registry is non-empty, `calibrate` fast-paths to the most recent channel — cross-host setups depend on this so the human can calibrate locally on the daemon's machine and the remote agent inherits the channel.
 
 Both transports must keep stdout clean — diagnostics go to stderr only.
+
+## Browser ops (AppleScript adapter)
+
+`src/holo/browser_chrome.py` wraps Chrome's AppleScript dictionary as `browser_*` MCP tools (`browser_navigate`, `browser_new_tab`, `browser_list_tabs`, `browser_activate_tab`, `browser_close_active_tab`, `browser_read_active_*`, `browser_reload`, `browser_back`, `browser_forward`). These bypass the SikuliX keystroke layer entirely — no `app_activate` race, no focus beeps, no Accessibility permission needed for keyboard injection. Only Automation permission for the launching Terminal → Google Chrome.
+
+**Use `browser_*` for any Chrome navigation.** SikuliX's `screen_key`/`screen_type` should be reserved for non-browser apps (terminals, native dialogs, canvas content). The bookmarklet channel is still the right tool for in-page DOM reads where AppleScript is too coarse.
+
+macOS-only. Linux/Windows browser ops will land via the Phase 3 CDP adapter — Chrome 136+ blocks `--remote-debugging-port` on the default profile, so CDP requires a profile-switching dance that defeats holo's auth-piggyback pitch on macOS, but it's the right path for non-macOS.
