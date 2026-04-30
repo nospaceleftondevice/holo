@@ -1,0 +1,118 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write  # required for `softprops/action-gh-release` to upload assets
+
+jobs:
+  build:
+    name: build (${{ matrix.target }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-14         # GitHub-hosted Apple Silicon
+            target: macos-arm64
+            artifact: holo-macos-arm64
+          - runner: macos-13         # x86_64 Mac (last x86 macOS GHA runner)
+            target: macos-x86_64
+            artifact: holo-macos-x86_64
+          - runner: ubuntu-latest
+            target: linux-x86_64
+            artifact: holo-linux-x86_64
+          - runner: windows-latest
+            target: windows-x86_64
+            artifact: holo-windows-x86_64.exe
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: bookmarklet/package-lock.json
+
+      - name: Build bookmarklet
+        working-directory: bookmarklet
+        run: |
+          npm ci
+          npm run build
+
+      - name: Install Python deps
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[dev]"
+
+      # Tests run on every PR via ci.yml. The release workflow's job is
+      # to build binaries; we only re-run pytest on darwin where the
+      # current suite has been validated. Linux / Windows will get
+      # platform-specific test runs once we port the macOS-leaning bits.
+      - name: Run tests
+        if: runner.os == 'macOS'
+        run: pytest -ra
+
+      - name: Build binary with PyInstaller
+        run: pyinstaller --clean holo.spec
+
+      - name: Stage artifact (Unix)
+        if: runner.os != 'Windows'
+        run: |
+          mkdir -p out
+          cp dist/holo "out/${{ matrix.artifact }}"
+          chmod +x "out/${{ matrix.artifact }}"
+          ls -la out/
+          ./out/${{ matrix.artifact }} --version
+
+      - name: Stage artifact (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path out | Out-Null
+          Copy-Item dist\holo.exe "out\${{ matrix.artifact }}"
+          Get-ChildItem out
+          & ".\out\${{ matrix.artifact }}" --version
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: out/${{ matrix.artifact }}
+          if-no-files-found: error
+          retention-days: 14
+
+  release:
+    name: Publish release
+    needs: build
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Flatten artifact tree
+        run: |
+          mkdir -p assets
+          find artifacts -type f -exec cp {} assets/ \;
+          ls -la assets/
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: assets/*
+          generate_release_notes: true
+          fail_on_unmatched_files: true
