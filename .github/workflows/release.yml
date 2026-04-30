@@ -99,35 +99,40 @@ jobs:
         env:
           MACOSX_DEPLOYMENT_TARGET: "11.0"
         run: |
-          pip install delocate
+          # python.org's universal2 installer ships `python3`/`pip3` but
+          # no bare `pip` on PATH, and pip itself drops user-installed
+          # console scripts (delocate-merge, etc.) under the user-site
+          # bin which isn't on PATH by default. Use `python -m pip` and
+          # invoke delocate via its module entrypoint to sidestep both.
+          python -m pip install delocate
           mkdir -p /tmp/wheels
 
           # ---- websockets: install the pure-Python wheel ----
           echo "::group::websockets pure-Python"
           rm -rf /tmp/wheels/ws-pure
           mkdir -p /tmp/wheels/ws-pure
-          pip download --no-deps --only-binary=:all: \
+          python -m pip download --no-deps --only-binary=:all: \
             --platform any --python-version 3.12 \
             --dest /tmp/wheels/ws-pure websockets
           ws_whl=$(ls /tmp/wheels/ws-pure/websockets-*-py3-none-any.whl)
-          pip install --force-reinstall --no-deps "$ws_whl"
+          python -m pip install --force-reinstall --no-deps "$ws_whl"
           echo "::endgroup::"
 
           # ---- pydantic-core: merge arm64 + x86_64 ----
           echo "::group::pydantic-core merge"
           rm -rf /tmp/wheels/pyd-arm64 /tmp/wheels/pyd-x86 /tmp/wheels/pyd-out
           mkdir -p /tmp/wheels/pyd-arm64 /tmp/wheels/pyd-x86 /tmp/wheels/pyd-out
-          pip download --no-deps --only-binary=:all: \
+          python -m pip download --no-deps --only-binary=:all: \
             --platform macosx_11_0_arm64 --python-version 3.12 \
             --dest /tmp/wheels/pyd-arm64 pydantic-core
-          pip download --no-deps --only-binary=:all: \
+          python -m pip download --no-deps --only-binary=:all: \
             --platform macosx_10_12_x86_64 --python-version 3.12 \
             --dest /tmp/wheels/pyd-x86 pydantic-core
           arm_whl=$(ls /tmp/wheels/pyd-arm64/*.whl)
           x86_whl=$(ls /tmp/wheels/pyd-x86/*.whl)
-          delocate-merge "$arm_whl" "$x86_whl" -w /tmp/wheels/pyd-out
+          python -m delocate.cmd.delocate_merge "$arm_whl" "$x86_whl" -w /tmp/wheels/pyd-out
           fused_whl=$(ls /tmp/wheels/pyd-out/*.whl)
-          pip install --force-reinstall --no-deps "$fused_whl"
+          python -m pip install --force-reinstall --no-deps "$fused_whl"
           echo "::endgroup::"
 
           # ---- verify ----
