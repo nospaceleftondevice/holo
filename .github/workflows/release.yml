@@ -82,76 +82,142 @@ jobs:
       # On macOS universal2, any package without a universal2 wheel on
       # PyPI ends up single-arch (arm64 since the runner is arm64), and
       # PyInstaller's universal2 build refuses to bundle a single-arch
-      # .so. Two strategies, picked per package:
+      # .so. Auto-discover offenders by scanning site-packages, then per
+      # offender try two strategies in order:
       #
-      #   * If the package ships a `py3-none-any` (pure-Python) wheel
-      #     alongside its binary wheels, install the pure-Python one.
-      #     The C/Rust speedup is gone; pure Python is fine for our
-      #     use. (websockets does this — only ships an arm64 cp wheel
-      #     plus a pure-Python any wheel.)
+      #   1. If the package ships a `py3-none-any` (pure-Python) wheel
+      #      alongside its binary wheels, install the pure-Python one.
+      #      Speedup is gone; pure Python is fine for our use. (e.g.
+      #      websockets ships only arm64 + py3-none-any — no x86_64
+      #      wheel to fuse with.)
       #
-      #   * Otherwise fuse the arm64 + x86_64 wheels into a universal2
-      #     wheel via `delocate-merge` (delocate 0.13+ API; older
-      #     `delocate-fuse` was removed). Works for any precompiled
-      #     native ext (C, Rust, …) without a build toolchain in CI.
+      #   2. Otherwise fuse the arm64 + x86_64 wheels into a universal2
+      #      wheel via `delocate-merge` (delocate 0.13+ API; older
+      #      `delocate-fuse` was removed). Works for any precompiled
+      #      native ext (C, Rust, …) without a build toolchain in CI.
       - name: Make native extensions universal2 (macOS)
         if: matrix.python == 'universal2'
         env:
           MACOSX_DEPLOYMENT_TARGET: "11.0"
         run: |
           # python.org's universal2 installer ships `python3`/`pip3` but
-          # no bare `pip` on PATH, and pip itself drops user-installed
-          # console scripts (delocate-merge, etc.) under the user-site
-          # bin which isn't on PATH by default. Use `python -m pip` and
-          # invoke delocate via its module entrypoint to sidestep both.
+          # no bare `pip` on PATH; use `python -m pip` and invoke
+          # delocate via its module entrypoint.
           python -m pip install delocate
           mkdir -p /tmp/wheels
 
-          # ---- websockets: install the pure-Python wheel ----
-          echo "::group::websockets pure-Python"
-          rm -rf /tmp/wheels/ws-pure
-          mkdir -p /tmp/wheels/ws-pure
-          python -m pip download --no-deps --only-binary=:all: \
-            --platform any --python-version 3.12 \
-            --dest /tmp/wheels/ws-pure websockets
-          ws_whl=$(ls /tmp/wheels/ws-pure/websockets-*-py3-none-any.whl)
-          python -m pip install --force-reinstall --no-deps "$ws_whl"
+          # Discover packages with single-arch .so files. Iterate every
+          # installed distribution's files so we catch installs in
+          # framework site-packages, user-site, or anywhere else.
+          python > /tmp/bad_pkgs.txt <<'PY'
+          import os, subprocess
+          from importlib.metadata import distributions
+
+          bad = set()
+          for dist in distributions():
+              name = dist.metadata["Name"]
+              for f in (dist.files or []):
+                  if not str(f).endswith(".so"):
+                      continue
+                  full = str(dist.locate_file(f))
+                  if not os.path.exists(full):
+                      continue
+                  try:
+                      archs = subprocess.check_output(
+                          ["lipo", "-archs", full],
+                          stderr=subprocess.DEVNULL,
+                      ).decode().strip()
+                  except subprocess.CalledProcessError:
+                      continue
+                  if not ("arm64" in archs and "x86_64" in archs):
+                      bad.add(name)
+                      break
+          for n in sorted(bad):
+              print(n)
+          PY
+
+          echo "::group::offenders"
+          cat /tmp/bad_pkgs.txt
           echo "::endgroup::"
 
-          # ---- pydantic-core: merge arm64 + x86_64 ----
-          echo "::group::pydantic-core merge"
-          rm -rf /tmp/wheels/pyd-arm64 /tmp/wheels/pyd-x86 /tmp/wheels/pyd-out
-          mkdir -p /tmp/wheels/pyd-arm64 /tmp/wheels/pyd-x86 /tmp/wheels/pyd-out
-          python -m pip download --no-deps --only-binary=:all: \
-            --platform macosx_11_0_arm64 --python-version 3.12 \
-            --dest /tmp/wheels/pyd-arm64 pydantic-core
-          python -m pip download --no-deps --only-binary=:all: \
-            --platform macosx_10_12_x86_64 --python-version 3.12 \
-            --dest /tmp/wheels/pyd-x86 pydantic-core
-          arm_whl=$(ls /tmp/wheels/pyd-arm64/*.whl)
-          x86_whl=$(ls /tmp/wheels/pyd-x86/*.whl)
-          python -m delocate.cmd.delocate_merge "$arm_whl" "$x86_whl" -w /tmp/wheels/pyd-out
-          fused_whl=$(ls /tmp/wheels/pyd-out/*.whl)
-          python -m pip install --force-reinstall --no-deps "$fused_whl"
-          echo "::endgroup::"
+          fuse_pkg() {
+            local pkg=$1
+            local slug=${pkg//[^A-Za-z0-9]/_}
+            local arm_dir="/tmp/wheels/${slug}-arm64"
+            local x86_dir="/tmp/wheels/${slug}-x86"
+            local out_dir="/tmp/wheels/${slug}-out"
+            rm -rf "$arm_dir" "$x86_dir" "$out_dir"
+            mkdir -p "$arm_dir" "$x86_dir" "$out_dir"
 
-          # ---- verify ----
-          echo "::group::verify universal2"
-          for mod in websockets pydantic_core; do
-            pkg_dir=$(python -c "import $mod, os; print(os.path.dirname($mod.__file__))")
-            so_files=$(find "$pkg_dir" -name '*.so')
-            if [ -z "$so_files" ]; then
-              echo "✓ $mod has no .so files (pure Python)"
-              continue
+            # Try pure-Python wheel first
+            if python -m pip download --no-deps --only-binary=:all: \
+                 --platform any --python-version 3.12 \
+                 --dest "$out_dir" "$pkg" >/dev/null 2>&1; then
+              local pure_whl
+              pure_whl=$(ls "$out_dir"/*-py3-none-any.whl 2>/dev/null \
+                         || ls "$out_dir"/*-py2.py3-none-any.whl 2>/dev/null \
+                         || true)
+              if [ -n "$pure_whl" ]; then
+                echo "  → pure-Python: $(basename "$pure_whl")"
+                python -m pip install --force-reinstall --no-deps "$pure_whl"
+                return 0
+              fi
             fi
-            for so in $so_files; do
-              archs=$(lipo -archs "$so")
-              case "$archs" in
-                *arm64*x86_64*|*x86_64*arm64*) echo "✓ $so ($archs)" ;;
-                *) echo "✗ $so is $archs (expected universal2)"; exit 1 ;;
-              esac
-            done
-          done
+
+            rm -rf "$out_dir"; mkdir -p "$out_dir"
+            python -m pip download --no-deps --only-binary=:all: \
+              --platform macosx_11_0_arm64 --python-version 3.12 \
+              --dest "$arm_dir" "$pkg"
+            python -m pip download --no-deps --only-binary=:all: \
+              --platform macosx_10_12_x86_64 --python-version 3.12 \
+              --dest "$x86_dir" "$pkg"
+            local arm_whl x86_whl fused_whl
+            arm_whl=$(ls "$arm_dir"/*.whl)
+            x86_whl=$(ls "$x86_dir"/*.whl)
+            python -m delocate.cmd.delocate_merge "$arm_whl" "$x86_whl" -w "$out_dir"
+            fused_whl=$(ls "$out_dir"/*.whl)
+            echo "  → fused: $(basename "$fused_whl")"
+            python -m pip install --force-reinstall --no-deps "$fused_whl"
+          }
+
+          while read -r pkg; do
+            [ -z "$pkg" ] && continue
+            echo "::group::fuse $pkg"
+            fuse_pkg "$pkg"
+            echo "::endgroup::"
+          done < /tmp/bad_pkgs.txt
+
+          # Final scan: every .so belonging to an installed distribution
+          # must be universal2. Anything still single-arch fails the build.
+          echo "::group::verify universal2"
+          python <<'PY'
+          import os, subprocess, sys
+          from importlib.metadata import distributions
+
+          bad = []
+          for dist in distributions():
+              for f in (dist.files or []):
+                  if not str(f).endswith(".so"):
+                      continue
+                  full = str(dist.locate_file(f))
+                  if not os.path.exists(full):
+                      continue
+                  try:
+                      archs = subprocess.check_output(
+                          ["lipo", "-archs", full],
+                          stderr=subprocess.DEVNULL,
+                      ).decode().strip()
+                  except subprocess.CalledProcessError:
+                      continue
+                  if "arm64" in archs and "x86_64" in archs:
+                      print(f"OK {full} ({archs})")
+                  else:
+                      bad.append((full, archs))
+                      print(f"BAD {full} ({archs})")
+          if bad:
+              print(f"\n{len(bad)} single-arch .so still present", file=sys.stderr)
+              sys.exit(1)
+          PY
           echo "::endgroup::"
 
       # Tests run on every PR via ci.yml. The release workflow's job is
