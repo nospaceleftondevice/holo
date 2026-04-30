@@ -58,20 +58,63 @@ function setStatus(text, isErr) {
 // We were opened by the bookmarklet's about:blank popup; the host
 // page is two hops up in the opener chain. window.opener.opener is
 // cross-origin from us, but `opener` is one of the few properties
-// accessible across origins, so this read is safe.
-const hostWindow = window.opener && !window.opener.closed
-  ? window.opener.opener
-  : null;
+// accessible across origins, so this read is normally safe.
+//
+// Diagnostics: distinguish the actual refusal reason. The daemon
+// otherwise just times out on the handshake with no signal as to
+// whether the popup ever loaded, the opener chain was severed, or
+// the host had already navigated away.
+function logRefuse(reason, detail) {
+  // eslint-disable-next-line no-console
+  console.warn("[holo popup] WS refuse:", reason, detail || {});
+  setStatus("holo: " + reason + " — falling back to QR", true);
+}
+
+let hostWindow = null;
+let refuseReason = null;
+let refuseDetail = {};
 
 if (!sid || !token) {
-  setStatus("holo: missing sid/token", true);
-} else if (!hostWindow || hostWindow.closed) {
-  // The host page set Cross-Origin-Opener-Policy: same-origin (or
-  // similar) which severs the opener chain for cross-origin popups,
-  // so we have no way to call dispatch on the host. Refuse to
-  // connect the WebSocket — the daemon's WS_HANDSHAKE_WAIT_S timer
-  // will expire and the channel falls back gracefully to QR.
-  setStatus("holo: host opener unavailable (COOP) — falling back", true);
+  refuseReason = "missing sid/token";
+  refuseDetail = { hasSid: !!sid, hasToken: !!token };
+} else if (!window.opener) {
+  // window.opener is null. Common causes:
+  //   - host page set Cross-Origin-Opener-Policy: same-origin
+  //   - bookmarklet was opened with `noopener`
+  //   - the about:blank popup got navigated away under us
+  refuseReason = "no opener (COOP severance or noopener)";
+  refuseDetail = { coop: "likely" };
+} else if (window.opener.closed) {
+  refuseReason = "about:blank popup closed";
+} else {
+  // window.opener exists. Try to walk to host (opener.opener).
+  // Cross-origin reads of `.opener` on a cross-origin window are
+  // permitted — but property access can still throw under some
+  // sandbox/COOP configurations, so guard it.
+  try {
+    hostWindow = window.opener.opener;
+  } catch (e) {
+    refuseReason = "opener.opener access threw";
+    refuseDetail = { error: String(e) };
+  }
+  if (!refuseReason) {
+    if (!hostWindow) {
+      refuseReason = "no host opener (COOP severed at host)";
+    } else {
+      try {
+        if (hostWindow.closed) {
+          refuseReason = "host page closed";
+        }
+      } catch (e) {
+        refuseReason = "hostWindow.closed access threw";
+        refuseDetail = { error: String(e) };
+      }
+    }
+  }
+}
+
+if (refuseReason) {
+  logRefuse(refuseReason, refuseDetail);
 } else {
   start();
 }
