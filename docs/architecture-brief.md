@@ -116,9 +116,9 @@ Cross-host mode adds:
 
 ## Phasing
 
-- **Phase 0** — primitive layer: Python lib + bookmarklet payload + title/clipboard channel + framing protocol.
-- **Phase 1** — agent surface: MCP server exposing `browser.*` tools. Local mode end-to-end.
-- **Phase 2** — cross-host: registry service + bridge popup + signed-cert daemon auth. Reuses existing tai.sh CA.
+- **Phase 0 ✓** — primitive layer: Python lib + bookmarklet payload + title/clipboard channel + framing protocol.
+- **Phase 1 ✓** — agent surface: MCP server exposing `browser.*` tools. Local mode end-to-end.
+- **Phase 2 ✓** — cross-host bridge: `holo mcp-remote` ferries stdio MCP through any user-supplied transport (ssh, `kubectl exec`, `aws ssm`, custom). Banner stripping + startup-timeout diagnostics. See `docs/cross-host.md`. The originally-planned registry-and-CA architecture was deferred — pragmatic transport-bridge meets the actual user need ("agent on B, daemon on A") without standing up new infrastructure. If a registry becomes necessary, it'd be Phase 2.5.
 - **Phase 3 (opt-in)** — CDP adapter for tests that genuinely need structured network capture. Keep simple architecture as default.
 
 The original roadmap had a "per-origin assertion plugins" phase between agent

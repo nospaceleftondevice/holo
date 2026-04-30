@@ -10,8 +10,9 @@ MCP-shaped tool surface (`browser.open`, `browser.click`, `browser.read`,
 same-origin bookmarklet do the work and talk to each other through a small
 local channel.
 
-**Status:** early — Phase 0, walking-skeleton stage. Not yet usable as a
-general tool.
+**Status:** alpha — Phases 0–2 shipped (primitive layer, MCP agent
+surface, cross-host bridge). Pre-release; expect rough edges and
+no API stability.
 
 ## What's different about this approach
 
@@ -33,10 +34,40 @@ general tool.
 
 - [x] Phase 0 — primitive layer (channel, framing protocol, bookmarklet payload)
 - [x] Phase 1 — agent surface (MCP server, with WebSocket transport + stealth-QR fallback)
-- [ ] Phase 2 — cross-host registry + bridge
+- [x] Phase 2 — cross-host bridge (`holo mcp-remote`; transport-agnostic stdio proxy — see [`docs/cross-host.md`](docs/cross-host.md))
 - [ ] Phase 3 — opt-in CDP adapter
 
-## Build a single-file binary
+## Install
+
+Pre-built binaries are attached to each [GitHub Release](https://github.com/nospaceleftondevice/holo/releases).
+Three targets: `holo-macos-universal2` (arm64 + x86_64 fat binary),
+`holo-linux-x86_64`, `holo-windows-x86_64.exe`.
+
+macOS / Linux:
+
+```bash
+# Replace TAG with the latest release tag, e.g. v0.1.0a1
+TAG=v0.1.0a1
+ASSET=holo-macos-universal2   # or holo-linux-x86_64
+
+curl -L -o /usr/local/bin/holo \
+  "https://github.com/nospaceleftondevice/holo/releases/download/${TAG}/${ASSET}"
+chmod +x /usr/local/bin/holo
+holo --version
+```
+
+Windows: download `holo-windows-x86_64.exe` from the release page and
+put it on `PATH`.
+
+End users also need OpenJDK 11+ installed (for the SikuliX bridge that
+drives screen primitives). The 128 MB SikuliX jar itself isn't bundled
+in the binary — it's fetched on first `--bridge` use, or pre-warmed
+with `holo install-bridge`.
+
+For cross-host setups (agent on one machine, browser on another), see
+[`docs/cross-host.md`](docs/cross-host.md).
+
+## Build from source
 
 ```bash
 .venv/bin/pip install -e ".[dev]"
@@ -46,9 +77,7 @@ general tool.
 
 Produces a self-contained `dist/holo` (`dist/holo.exe` on Windows) that
 bundles the Python interpreter + dependencies + the Jython bridge script
-+ static assets. End users only need OpenJDK 11+ installed; the SikuliX
-jar is fetched on first run from a pinned GitHub Release (or pre-warmed
-with `holo install-bridge`).
++ static assets.
 
 ## Use as an MCP server
 

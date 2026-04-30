@@ -71,7 +71,7 @@ After editing `bookmarklet/core.js` you must rebuild **and** re-drag the bookmar
 
 - [x] Phase 0 — primitive layer (channel, framing, bookmarklet)
 - [x] Phase 1 — agent surface (MCP server `holo mcp` over stdio; WS transport + stealth-QR fallback)
-- [ ] Phase 2 — cross-host registry + bridge
+- [x] Phase 2 — cross-host bridge (`holo mcp-remote` stdio proxy; user supplies the transport — ssh, kubectl exec, aws ssm, custom — see `docs/cross-host.md`)
 - [ ] Phase 3 — opt-in CDP adapter
 
 ## MCP surface (Phase 1)
