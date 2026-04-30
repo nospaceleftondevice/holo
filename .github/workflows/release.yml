@@ -326,3 +326,8 @@ jobs:
           files: assets/*
           generate_release_notes: true
           fail_on_unmatched_files: true
+          # Auto-flag tags with PEP 440 pre-release suffixes (e.g.
+          # v0.1.0a1, v0.1.0b2, v0.1.0rc1) as pre-releases. Stable
+          # tags (v0.1.0, v1.0.0) get marked stable. Saves a manual
+          # `gh release edit --prerelease` after every alpha tag.
+          prerelease: ${{ contains(github.ref_name, 'a') || contains(github.ref_name, 'b') || contains(github.ref_name, 'rc') }}
