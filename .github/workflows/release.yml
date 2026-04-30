@@ -82,49 +82,64 @@ jobs:
       # On macOS universal2, any package without a universal2 wheel on
       # PyPI ends up single-arch (arm64 since the runner is arm64), and
       # PyInstaller's universal2 build refuses to bundle a single-arch
-      # .so. `delocate-fuse` is the canonical workaround: download both
-      # arm64 and x86_64 wheels, fuse the binaries into a universal2
-      # wheel, reinstall. Works for any precompiled native ext (C,
-      # Rust, …) without requiring a build toolchain in CI.
-      - name: Fuse native extensions to universal2 (macOS)
+      # .so. Two strategies, picked per package:
+      #
+      #   * If the package ships a `py3-none-any` (pure-Python) wheel
+      #     alongside its binary wheels, install the pure-Python one.
+      #     The C/Rust speedup is gone; pure Python is fine for our
+      #     use. (websockets does this — only ships an arm64 cp wheel
+      #     plus a pure-Python any wheel.)
+      #
+      #   * Otherwise fuse the arm64 + x86_64 wheels into a universal2
+      #     wheel via `delocate-merge` (delocate 0.13+ API; older
+      #     `delocate-fuse` was removed). Works for any precompiled
+      #     native ext (C, Rust, …) without a build toolchain in CI.
+      - name: Make native extensions universal2 (macOS)
         if: matrix.python == 'universal2'
         env:
           MACOSX_DEPLOYMENT_TARGET: "11.0"
         run: |
           pip install delocate
-          # Packages whose .so files are not universal2 today. Add new
-          # offenders here when they surface in the post-build lipo
-          # check or PyInstaller's IncompatibleBinaryArchError.
-          PACKAGES="websockets pydantic-core"
           mkdir -p /tmp/wheels
-          for pkg in $PACKAGES; do
-            echo "::group::fuse $pkg"
-            rm -rf "/tmp/wheels/$pkg-arm64" "/tmp/wheels/$pkg-x86_64"
-            mkdir -p "/tmp/wheels/$pkg-arm64" "/tmp/wheels/$pkg-x86_64"
-            pip download --no-deps --only-binary=:all: \
-              --platform macosx_11_0_arm64 \
-              --python-version 3.12 \
-              --dest "/tmp/wheels/$pkg-arm64" "$pkg"
-            pip download --no-deps --only-binary=:all: \
-              --platform macosx_10_12_x86_64 \
-              --python-version 3.12 \
-              --dest "/tmp/wheels/$pkg-x86_64" "$pkg"
-            arm_whl=$(ls "/tmp/wheels/$pkg-arm64"/*.whl)
-            x86_whl=$(ls "/tmp/wheels/$pkg-x86_64"/*.whl)
-            # delocate-fuse rewrites the first arg in place to become
-            # universal2 by merging the second arg's binaries. Wheel
-            # filename keeps the arm64 platform tag — that's fine, we
-            # `--force-reinstall --no-deps` so pip ignores tag
-            # constraints; only the bundled .so contents matter.
-            delocate-fuse "$arm_whl" "$x86_whl"
-            pip install --upgrade --force-reinstall --no-deps "$arm_whl"
-            echo "::endgroup::"
-          done
-          # Verify every .so in those packages is now universal2.
-          for pkg in $PACKAGES; do
-            mod=$(echo "$pkg" | tr '-' '_')
-            pkg_dir=$(python -c "import ${mod}, os; print(os.path.dirname(${mod}.__file__))")
-            for so in $(find "$pkg_dir" -name '*.so'); do
+
+          # ---- websockets: install the pure-Python wheel ----
+          echo "::group::websockets pure-Python"
+          rm -rf /tmp/wheels/ws-pure
+          mkdir -p /tmp/wheels/ws-pure
+          pip download --no-deps --only-binary=:all: \
+            --platform any --python-version 3.12 \
+            --dest /tmp/wheels/ws-pure websockets
+          ws_whl=$(ls /tmp/wheels/ws-pure/websockets-*-py3-none-any.whl)
+          pip install --force-reinstall --no-deps "$ws_whl"
+          echo "::endgroup::"
+
+          # ---- pydantic-core: merge arm64 + x86_64 ----
+          echo "::group::pydantic-core merge"
+          rm -rf /tmp/wheels/pyd-arm64 /tmp/wheels/pyd-x86 /tmp/wheels/pyd-out
+          mkdir -p /tmp/wheels/pyd-arm64 /tmp/wheels/pyd-x86 /tmp/wheels/pyd-out
+          pip download --no-deps --only-binary=:all: \
+            --platform macosx_11_0_arm64 --python-version 3.12 \
+            --dest /tmp/wheels/pyd-arm64 pydantic-core
+          pip download --no-deps --only-binary=:all: \
+            --platform macosx_10_12_x86_64 --python-version 3.12 \
+            --dest /tmp/wheels/pyd-x86 pydantic-core
+          arm_whl=$(ls /tmp/wheels/pyd-arm64/*.whl)
+          x86_whl=$(ls /tmp/wheels/pyd-x86/*.whl)
+          delocate-merge "$arm_whl" "$x86_whl" -w /tmp/wheels/pyd-out
+          fused_whl=$(ls /tmp/wheels/pyd-out/*.whl)
+          pip install --force-reinstall --no-deps "$fused_whl"
+          echo "::endgroup::"
+
+          # ---- verify ----
+          echo "::group::verify universal2"
+          for mod in websockets pydantic_core; do
+            pkg_dir=$(python -c "import $mod, os; print(os.path.dirname($mod.__file__))")
+            so_files=$(find "$pkg_dir" -name '*.so')
+            if [ -z "$so_files" ]; then
+              echo "✓ $mod has no .so files (pure Python)"
+              continue
+            fi
+            for so in $so_files; do
               archs=$(lipo -archs "$so")
               case "$archs" in
                 *arm64*x86_64*|*x86_64*arm64*) echo "✓ $so ($archs)" ;;
@@ -132,6 +147,7 @@ jobs:
               esac
             done
           done
+          echo "::endgroup::"
 
       # Tests run on every PR via ci.yml. The release workflow's job is
       # to build binaries; we only re-run pytest on darwin where the
