@@ -34,7 +34,7 @@ no API stability.
 
 - [x] Phase 0 — primitive layer (channel, framing protocol, bookmarklet payload)
 - [x] Phase 1 — agent surface (MCP server, with WebSocket transport + stealth-QR fallback)
-- [x] Phase 2 — cross-host bridge (`holo mcp-remote`; transport-agnostic stdio proxy — see [`docs/cross-host.md`](docs/cross-host.md))
+- [x] Phase 2 — cross-host bridge (`holo mcp-remote` stdio proxy; persistent-daemon TCP transport via `holo mcp --listen` + `holo connect` — see [`docs/cross-host.md`](docs/cross-host.md))
 - [ ] Phase 3 — opt-in CDP adapter
 
 ## Install
@@ -111,7 +111,7 @@ on whichever page should be driven), then issues commands by sid. Tools:
 
 | Tool            | What it does                                             |
 | ---             | ---                                                      |
-| `calibrate`     | Block until the bookmarklet beacon arrives, return its sid |
+| `calibrate`     | Return the most recent channel if any exist; otherwise block for a fresh bookmarklet beacon |
 | `list_channels` | Snapshot of currently calibrated tabs                    |
 | `drop_channel`  | Forget a channel (does not close the browser popup)      |
 | `ping`          | Round-trip ping over the channel                         |

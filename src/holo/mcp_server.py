@@ -18,13 +18,18 @@ embed in another runner.
 
 from __future__ import annotations
 
+import socket
+import sys
 import threading
 from typing import Any
 
+import anyio
 from mcp.server.fastmcp import FastMCP
+from mcp.server.stdio import stdio_server
 
 from holo.channel import CalibrationError, Channel, CommandError
 from holo.daemon import Daemon
+from holo.mcp_wire import WIRE_MAGIC, is_valid_handshake, read_handshake
 
 
 class HoloMCPServer:
@@ -57,7 +62,19 @@ class HoloMCPServer:
     # ---- tool implementations ---------------------------------------
 
     def calibrate(self, timeout: float = 30.0) -> dict[str, Any]:
-        """Wait for a calibration beacon, register a channel, return its sid."""
+        """Return the most recently registered channel if one exists,
+        otherwise wait for a fresh calibration beacon.
+
+        The fast-path matters for cross-host setups: the human
+        calibrates locally on the daemon's machine (where the browser
+        is), then a remote agent connecting in shouldn't have to
+        re-trigger the bookmarklet — it can just keep working with
+        whatever's already registered.
+        """
+        existing = self.daemon.registry.items()
+        if existing:
+            _, ch = existing[-1]
+            return _describe(ch)
         try:
             ch = self.daemon.calibrate(timeout=timeout)
         except CalibrationError as e:
@@ -301,3 +318,129 @@ def run(*, hide_qr: bool = False, use_bridge: bool = False) -> None:
         mcp.run()
     finally:
         holo.shutdown()
+
+
+def run_tcp(
+    port: int,
+    *,
+    hide_qr: bool = False,
+    use_bridge: bool = False,
+    stop_event: threading.Event | None = None,
+) -> None:
+    """Entrypoint used by `holo mcp --listen PORT`.
+
+    Binds 127.0.0.1:PORT, accepts one client at a time. Each
+    connection must send the magic prefix line before any MCP
+    traffic; mismatched connections are dropped. Daemon state
+    (calibrated channels, WS server, bridge) lives across
+    connection lifetimes — clients can disconnect and reconnect
+    without losing the registered tabs.
+
+    `stop_event` is for tests — production callers leave it None
+    and stop the loop with KeyboardInterrupt.
+    """
+    mcp, holo = build_server(hide_qr=hide_qr, use_bridge=use_bridge)
+    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    try:
+        listener.bind(("127.0.0.1", port))
+    except OSError as e:
+        print(f"holo mcp: bind 127.0.0.1:{port} failed: {e}", file=sys.stderr)
+        listener.close()
+        holo.shutdown()
+        raise SystemExit(1) from e
+    listener.listen(1)
+    # Polling timeout so the accept loop notices stop_event.
+    listener.settimeout(0.5)
+    print(
+        f"holo mcp: listening on 127.0.0.1:{port} (magic prefix required)",
+        file=sys.stderr,
+        flush=True,
+    )
+
+    try:
+        while stop_event is None or not stop_event.is_set():
+            try:
+                conn, addr = listener.accept()
+            except TimeoutError:
+                continue
+            except KeyboardInterrupt:
+                break
+            try:
+                handshake = read_handshake(conn)
+                if not is_valid_handshake(handshake):
+                    print(
+                        f"holo mcp: rejecting {addr}: "
+                        f"bad handshake {handshake[:32]!r}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                    continue
+                print(
+                    f"holo mcp: accepted {addr}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                _serve_one_connection(mcp, conn)
+                print(
+                    f"holo mcp: closed {addr}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+            finally:
+                try:
+                    conn.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
+                conn.close()
+    finally:
+        listener.close()
+        holo.shutdown()
+
+
+def _serve_one_connection(mcp: FastMCP, conn: socket.socket) -> None:
+    """Run the FastMCP server loop on a single TCP connection.
+
+    Mirrors `FastMCP.run_stdio_async` but supplies socket-backed
+    streams instead of sys.stdin/sys.stdout. Reaches for the
+    underlying `_mcp_server` because FastMCP doesn't expose a
+    stream-injecting public runner.
+    """
+    fin = conn.makefile("r", encoding="utf-8", errors="replace", newline="\n")
+    fout = conn.makefile("w", encoding="utf-8", newline="\n")
+
+    async def go() -> None:
+        try:
+            stdin = anyio.wrap_file(fin)
+            stdout = anyio.wrap_file(fout)
+            async with stdio_server(stdin=stdin, stdout=stdout) as (rs, ws):
+                await mcp._mcp_server.run(  # noqa: SLF001 — no public stream-injecting runner
+                    rs,
+                    ws,
+                    mcp._mcp_server.create_initialization_options(),  # noqa: SLF001
+                )
+        finally:
+            try:
+                fin.close()
+            except OSError:
+                pass
+            try:
+                fout.close()
+            except OSError:
+                pass
+
+    try:
+        anyio.run(go)
+    except (anyio.EndOfStream, ConnectionResetError, BrokenPipeError):
+        pass
+
+
+# Re-export so callers can write the magic prefix without importing the
+# wire helper module separately.
+__all__ = [
+    "HoloMCPServer",
+    "build_server",
+    "run",
+    "run_tcp",
+    "WIRE_MAGIC",
+]
