@@ -71,9 +71,17 @@ After editing `bookmarklet/core.js` you must rebuild **and** re-drag the bookmar
 
 - [x] Phase 0 — primitive layer (channel, framing, bookmarklet)
 - [x] Phase 1 — agent surface (MCP server `holo mcp` over stdio; WS transport + stealth-QR fallback)
-- [x] Phase 2 — cross-host bridge (`holo mcp-remote` stdio proxy; user supplies the transport — ssh, kubectl exec, aws ssm, custom — see `docs/cross-host.md`)
+- [x] Phase 2 — cross-host bridge (`holo mcp-remote` spawn-per-connection stdio proxy + `holo mcp --listen PORT` / `holo connect HOST:PORT` persistent-daemon TCP transport — see `docs/cross-host.md`)
 - [ ] Phase 3 — opt-in CDP adapter
 
 ## MCP surface (Phase 1)
 
-`src/holo/mcp_server.py` exposes a `FastMCP` server with six tools — `calibrate`, `list_channels`, `drop_channel`, `ping`, `read_global`, `send_command`. `HoloMCPServer` owns one lazily-constructed `Daemon` and translates `CalibrationError` / `CommandError` into MCP-style runtime errors. `holo mcp` runs it over stdio (must keep stdout clean — diagnostics go to stderr).
+`src/holo/mcp_server.py` exposes a `FastMCP` server with the channel + screen tools (`calibrate`, `list_channels`, `drop_channel`, `ping`, `read_global`, `send_command`, plus `app_activate`, `screen_*` when `--bridge` is on). `HoloMCPServer` owns one lazily-constructed `Daemon` and translates `CalibrationError` / `CommandError` into MCP-style runtime errors.
+
+Two transports:
+- `holo mcp` — stdio (default; for `claude mcp add` spawning per session)
+- `holo mcp --listen PORT` — TCP on 127.0.0.1:PORT, single concurrent connection, magic-prefix handshake (`HOLO/1\n`) required before MCP traffic. Daemon state persists across reconnects. Used with `holo connect HOST:PORT` (a stdio↔TCP bridge that injects the prefix) on the remote side of an SSH-tunnelled `mcp-remote`. Solves the macOS-TCC-on-SSH problem: the listener runs in a tmux session that has Screen Recording permission; SSH-spawned processes wouldn't.
+
+When the registry is non-empty, `calibrate` fast-paths to the most recent channel — cross-host setups depend on this so the human can calibrate locally on the daemon's machine and the remote agent inherits the channel.
+
+Both transports must keep stdout clean — diagnostics go to stderr only.

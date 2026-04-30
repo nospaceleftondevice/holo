@@ -24,29 +24,61 @@ need the bookmarklet installed in the browser you want to drive —
 run `holo install-bookmarklet` on Host A and drag the 🔧 holo button
 to the bookmarks bar.
 
-On the agent's host (Host B), in the project where you want to drive
-the remote browser:
+There are two ways to wire it up. **On macOS Host A, use the
+persistent-listener mode** — SSH-spawned processes don't inherit the
+foreground app's Screen Recording permission, and macOS TCC won't
+prompt non-interactive processes for it, so a fresh `holo mcp`
+spawned by SSH every connection can never read window titles. The
+listener mode keeps a single long-lived `holo mcp` running inside a
+tmux session that *does* have Screen Recording permission.
+
+### Persistent listener (recommended)
+
+On Host A, in tmux:
+
+```bash
+holo mcp --listen 7777 --bridge
+```
+
+That binds 127.0.0.1:7777 and waits for a single TCP client at a
+time. Each connection must send a magic prefix (`HOLO/1\n`) before
+any MCP traffic — drive-by browser fetches can't do that, since
+browsers always send an HTTP request line first, so the listener
+can't be reached from a malicious page on the same machine.
+
+Calibrate locally — open a browser tab on Host A, click the
+bookmarklet — the daemon registers the channel right there. Daemon
+state lives across reconnects, so the agent on Host B doesn't have
+to re-trigger calibration.
+
+On Host B, in the project where you want to drive the remote browser:
 
 ```bash
 cd ~/projects/foo
-claude mcp add holo --scope project /path/to/holo mcp-remote -- ssh -A hostA holo mcp
+claude mcp add holo --scope project /path/to/holo mcp-remote -- \
+    ssh -l balexa100 192.168.1.32 /usr/local/bin/holo connect localhost:7777
 ```
 
-That writes a project-local `.mcp.json`. Subsequent `claude` runs in
-that project pick up the remote `holo` MCP server; runs in other
-projects don't see it.
+`holo connect` is a tiny stdio↔TCP bridge — it opens the TCP
+connection on Host A's side of the SSH tunnel, sends the magic
+prefix, and pipes bytes both ways. SSH provides the encrypted
+transport; the prefix and the 127.0.0.1 bind are the access control.
+No `nc` dependency.
 
-If your scenario needs `--bridge` (SikuliX screen primitives), pass
-it through to the remote `holo mcp`:
+### Spawn-per-connection (Linux / non-TCC remotes)
+
+On Linux Host A (or anywhere TCC isn't in the picture), you can also
+have `mcp-remote` spawn a fresh `holo mcp` per connection instead of
+running a persistent listener:
 
 ```bash
 claude mcp add holo --scope project /path/to/holo mcp-remote -- \
     ssh -A hostA holo mcp --bridge
 ```
 
-Anything after `--` is the verbatim command we spawn. SSH is the
-common case but we're transport-agnostic — `kubectl exec`, `aws ssm
-start-session`, custom proxy scripts all work the same way:
+Anything after `--` is the verbatim command spawned. We're
+transport-agnostic, so `kubectl exec`, `aws ssm start-session`, and
+custom proxy scripts also work:
 
 ```bash
 claude mcp add holo --scope project /path/to/holo mcp-remote -- \
@@ -59,6 +91,10 @@ claude mcp add holo --scope project /path/to/holo mcp-remote -- \
     --document-name AWS-StartInteractiveCommand \
     --parameters command='holo mcp'
 ```
+
+This mode is simpler — no listener to keep alive, no tmux, no
+calibration-on-the-server-side. Use it when the remote OS doesn't
+sandbox screen access by responsible-binary like macOS does.
 
 ## What `mcp-remote` does
 

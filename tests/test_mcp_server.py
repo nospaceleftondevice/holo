@@ -139,18 +139,49 @@ class TestCalibrate:
         with pytest.raises(RuntimeError, match="calibration timeout"):
             server.calibrate(timeout=1.0)
 
+    def test_fast_path_returns_existing_channel_without_blocking(
+        self, server_with_fake
+    ):
+        """When the registry is non-empty, calibrate returns the most
+        recent channel immediately. Cross-host setups depend on this:
+        the human calibrates locally on the daemon's machine, then a
+        remote agent that connects in shouldn't have to re-trigger the
+        bookmarklet — list/use the existing channel.
+        """
+        server, fake = server_with_fake
+        existing = _StubChannel("sid-existing", window_id=99, ws_ready=True)
+        fake.registry.register(existing.session, existing)
+
+        # No queued calibrations: if the fast path were missing, the
+        # fake's `calibrate()` would assert.
+        result = server.calibrate(timeout=1.0)
+
+        assert result == {
+            "sid": "sid-existing",
+            "window_id": 99,
+            "window_owner": "Google Chrome",
+            "transport": "ws",
+        }
+
+    def test_fast_path_picks_most_recent_channel(self, server_with_fake):
+        server, fake = server_with_fake
+        fake.registry.register("sid-old", _StubChannel("sid-old"))
+        fake.registry.register(
+            "sid-new", _StubChannel("sid-new", window_id=42, ws_ready=True)
+        )
+
+        result = server.calibrate()
+
+        assert result["sid"] == "sid-new"
+
 
 class TestListAndDrop:
     def test_list_channels_snapshots_registry(self, server_with_fake):
         server, fake = server_with_fake
-        fake.next_calibrations.extend(
-            [
-                _StubChannel("sid-A", window_id=1),
-                _StubChannel("sid-B", window_id=2, ws_ready=True),
-            ]
+        fake.registry.register("sid-A", _StubChannel("sid-A", window_id=1))
+        fake.registry.register(
+            "sid-B", _StubChannel("sid-B", window_id=2, ws_ready=True)
         )
-        server.calibrate()
-        server.calibrate()
 
         listed = server.list_channels()
 

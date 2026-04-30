@@ -7,6 +7,8 @@ Subcommands:
     holo doctor            check macOS permissions / runtime environment
     holo demo              end-to-end smoke test against the in-page agent
     holo mcp               run the MCP server over stdio
+    holo mcp --listen PORT run the MCP server over TCP (single connection)
+    holo connect HOST:PORT stdio↔TCP bridge to a listening `holo mcp`
     holo bridge <verb>     smoke-test the SikuliX bridge directly
     holo install-bridge    pre-download the SikuliX jar into the user cache
     holo install-bookmarklet  download the bookmarklet page and open it
@@ -276,15 +278,40 @@ def _cmd_focus() -> int:
     return 0
 
 
-def _cmd_mcp(*, hide_qr: bool = False, use_bridge: bool = False) -> int:
-    """Run the MCP server over stdio.
+def _cmd_mcp(
+    *,
+    hide_qr: bool = False,
+    use_bridge: bool = False,
+    listen_port: int | None = None,
+) -> int:
+    """Run the MCP server.
 
-    Intended to be launched by an MCP client (Claude Code, Codex, Cursor)
-    rather than from a terminal. The client exchanges JSON-RPC over the
-    process's stdin/stdout, so anything we print to stdout corrupts the
-    protocol — keep output on stderr only.
+    Default mode is stdio — intended to be launched by an MCP client
+    (Claude Code, Codex, Cursor) rather than from a terminal.
+
+    With `--listen PORT`, instead binds 127.0.0.1:PORT and accepts a
+    single concurrent TCP client. Each new connection must send the
+    magic handshake prefix before any MCP traffic, so a drive-by
+    browser can't reach the server (browsers can't control the
+    first bytes of a TCP connection — fetch always sends an HTTP
+    request line first). Daemon state persists across reconnects.
+
+    Either way we print only to stderr — stdout carries protocol.
     """
     from holo import mcp_server
+
+    if listen_port is not None:
+        print(
+            f"holo mcp — listening on 127.0.0.1:{listen_port} "
+            "(magic prefix required)",
+            file=sys.stderr,
+        )
+        if hide_qr:
+            print("QR reply channel: stealth (camera-resistant)", file=sys.stderr)
+        if use_bridge:
+            print("Input pipeline: SikuliX bridge (cross-platform)", file=sys.stderr)
+        mcp_server.run_tcp(listen_port, hide_qr=hide_qr, use_bridge=use_bridge)
+        return 0
 
     print("holo mcp — starting MCP server over stdio", file=sys.stderr)
     if hide_qr:
@@ -293,6 +320,27 @@ def _cmd_mcp(*, hide_qr: bool = False, use_bridge: bool = False) -> int:
         print("Input pipeline: SikuliX bridge (cross-platform)", file=sys.stderr)
     mcp_server.run(hide_qr=hide_qr, use_bridge=use_bridge)
     return 0
+
+
+def _cmd_connect(rest: list[str]) -> int:
+    """Bridge process stdio to a listening `holo mcp --listen PORT`.
+
+    Used as the remote side of an SSH-tunnelled MCP setup:
+
+        holo mcp-remote -- ssh user@host /usr/local/bin/holo connect localhost:7777
+
+    The magic handshake prefix is sent automatically — users never
+    type it.
+    """
+    from holo import mcp_connect
+
+    if len(rest) != 1 or rest[0] in {"-h", "--help"}:
+        sys.stderr.write(
+            "usage: holo connect HOST:PORT\n"
+            "example: holo connect localhost:7777\n"
+        )
+        return 2
+    return mcp_connect.run(rest[0])
 
 
 def _cmd_mcp_remote(rest: list[str]) -> int:
@@ -488,6 +536,7 @@ def main(argv: list[str] | None = None) -> int:
         print(
             f"holo {__version__} — try `holo --version`, `holo windows`, "
             "`holo doctor`, `holo demo`, `holo focus`, `holo mcp`, "
+            "`holo mcp --listen PORT`, `holo connect HOST:PORT`, "
             "`holo mcp-remote`, `holo bridge`, `holo install-bridge`, "
             "or `holo install-bookmarklet`"
         )
@@ -504,10 +553,31 @@ def main(argv: list[str] | None = None) -> int:
             use_bridge="--bridge" in rest,
         )
     if cmd == "mcp":
+        listen_port: int | None = None
+        if "--listen" in rest:
+            i = rest.index("--listen")
+            if i + 1 >= len(rest):
+                sys.stderr.write("holo mcp: --listen requires a port number\n")
+                return 2
+            try:
+                listen_port = int(rest[i + 1])
+            except ValueError:
+                sys.stderr.write(
+                    f"holo mcp: invalid --listen port {rest[i + 1]!r}\n"
+                )
+                return 2
+            if not (0 < listen_port < 65536):
+                sys.stderr.write(
+                    f"holo mcp: --listen port {listen_port} out of range\n"
+                )
+                return 2
         return _cmd_mcp(
             hide_qr="--hide-qr" in rest,
             use_bridge="--bridge" in rest,
+            listen_port=listen_port,
         )
+    if cmd == "connect":
+        return _cmd_connect(rest)
     if cmd == "mcp-remote":
         return _cmd_mcp_remote(rest)
     if cmd == "bridge":
