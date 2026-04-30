@@ -37,6 +37,20 @@ general tool.
 - [ ] Phase 3 — cross-host registry + bridge
 - [ ] Phase 4 — opt-in CDP adapter
 
+## Build a single-file binary
+
+```bash
+.venv/bin/pip install -e ".[dev]"
+.venv/bin/pyinstaller --clean holo.spec
+./dist/holo --version
+```
+
+Produces a self-contained `dist/holo` (`dist/holo.exe` on Windows) that
+bundles the Python interpreter + dependencies + the Jython bridge script
++ static assets. End users only need OpenJDK 11+ installed; the SikuliX
+jar is fetched on first run from a pinned GitHub Release (or pre-warmed
+with `holo install-bridge`).
+
 ## Use as an MCP server
 
 `holo mcp` runs a stdio MCP server that exposes the channel as a small
