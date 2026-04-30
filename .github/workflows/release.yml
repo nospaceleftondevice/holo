@@ -109,15 +109,26 @@ jobs:
           # Discover packages with single-arch .so files. Iterate every
           # installed distribution's files so we catch installs in
           # framework site-packages, user-site, or anywhere else.
+          # Output `name==version` so the fuse step pins exact versions
+          # (arm64 + x86_64 wheels must come from the same release —
+          # e.g. cffi 2.0.0 dropped x86_64, so unpinned arm64 grabs 2.0
+          # and x86_64 grabs 1.17, and delocate-merge can't fuse those).
+          # Skip .so files under tests/test dirs — those are fixtures
+          # (delocate ships single-arch .so test data), not loaded code.
           python > /tmp/bad_pkgs.txt <<'PY'
           import os, subprocess
           from importlib.metadata import distributions
 
-          bad = set()
+          bad = {}
           for dist in distributions():
               name = dist.metadata["Name"]
+              version = dist.version
               for f in (dist.files or []):
-                  if not str(f).endswith(".so"):
+                  fs = str(f)
+                  if not fs.endswith(".so"):
+                      continue
+                  parts = fs.replace("\\", "/").split("/")
+                  if any(p in ("tests", "test") for p in parts):
                       continue
                   full = str(dist.locate_file(f))
                   if not os.path.exists(full):
@@ -130,10 +141,10 @@ jobs:
                   except subprocess.CalledProcessError:
                       continue
                   if not ("arm64" in archs and "x86_64" in archs):
-                      bad.add(name)
+                      bad[name] = version
                       break
-          for n in sorted(bad):
-              print(n)
+          for n, v in sorted(bad.items()):
+              print(f"{n}=={v}")
           PY
 
           echo "::group::offenders"
@@ -188,7 +199,7 @@ jobs:
           done < /tmp/bad_pkgs.txt
 
           # Final scan: every .so belonging to an installed distribution
-          # must be universal2. Anything still single-arch fails the build.
+          # (excluding test fixtures) must be universal2.
           echo "::group::verify universal2"
           python <<'PY'
           import os, subprocess, sys
@@ -197,7 +208,11 @@ jobs:
           bad = []
           for dist in distributions():
               for f in (dist.files or []):
-                  if not str(f).endswith(".so"):
+                  fs = str(f)
+                  if not fs.endswith(".so"):
+                      continue
+                  parts = fs.replace("\\", "/").split("/")
+                  if any(p in ("tests", "test") for p in parts):
                       continue
                   full = str(dist.locate_file(f))
                   if not os.path.exists(full):
