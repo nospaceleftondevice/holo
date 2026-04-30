@@ -35,6 +35,22 @@ except ImportError:
     _SIKULI_OK = False
 
 
+# SikuliX writes action logs ("[log] click on (x,y)", "[log] doType ...")
+# to stdout by default. Stdout is our JSON-RPC channel — any extra line
+# corrupts the protocol, since the daemon does a blocking readline()
+# expecting one envelope per request. Silence every logging surface we
+# know about. Settings.* are public; Debug.* covers the older paths.
+if _SIKULI_OK:
+    try:
+        from org.sikuli.basics import Debug, Settings
+        Debug.off()
+        Settings.ActionLogs = False
+        Settings.InfoLogs = False
+        Settings.DebugLogs = False
+    except ImportError:
+        pass
+
+
 PROTOCOL_VERSION = "1"
 
 
