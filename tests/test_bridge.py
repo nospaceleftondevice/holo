@@ -287,6 +287,41 @@ class TestConvenienceVerbs:
         assert json.loads(sent[1])["method"] == "screen.type"
         assert json.loads(sent[1])["params"] == {"text": "hello"}
 
+    def test_scroll_defaults_to_down_three_steps(self, tmp_path):
+        client, fake = self._client_for(
+            tmp_path,
+            [{"id": "REQ", "result": {"scrolled": True}}],
+        )
+        with patch("holo.bridge.uuid.uuid4") as uu:
+            uu.return_value.hex = "REQ"
+            client.scroll(100, 200)
+        sent = fake.stdin.getvalue().decode().strip().splitlines()
+        msg = json.loads(sent[1])
+        assert msg["method"] == "screen.scroll"
+        assert msg["params"] == {
+            "x": 100,
+            "y": 200,
+            "direction": "down",
+            "steps": 3,
+        }
+
+    def test_scroll_passes_explicit_direction_and_steps(self, tmp_path):
+        client, fake = self._client_for(
+            tmp_path,
+            [{"id": "REQ", "result": {"scrolled": True}}],
+        )
+        with patch("holo.bridge.uuid.uuid4") as uu:
+            uu.return_value.hex = "REQ"
+            client.scroll(50, 60, direction="up", steps=10)
+        sent = fake.stdin.getvalue().decode().strip().splitlines()
+        msg = json.loads(sent[1])
+        assert msg["params"] == {
+            "x": 50,
+            "y": 60,
+            "direction": "up",
+            "steps": 10,
+        }
+
     def test_screenshot_decodes_base64_to_png_bytes(self, tmp_path):
         import base64 as _b64
 
