@@ -282,6 +282,49 @@ class BridgeClient:
             params["region"] = region
         return self.request("screen.find_image", params, timeout=timeout)
 
+    def find_image_path(
+        self,
+        path: str,
+        *,
+        region: dict[str, int] | None = None,
+        score: float = 0.7,
+        timeout: float = 15.0,
+    ) -> dict[str, Any] | None:
+        """Same as `find_image` but the needle is a JVM-side filesystem path.
+
+        Used by the template cache so we don't re-encode the same small
+        PNGs on every find. The path must be readable by the JVM
+        process — the daemon and the bridge share a filesystem.
+        """
+        params: dict[str, Any] = {"path": str(path), "score": score}
+        if region is not None:
+            params["region"] = region
+        return self.request("screen.find_image_path", params, timeout=timeout)
+
+    def user_capture(
+        self,
+        *,
+        prompt: str = "",
+        timeout: float = 60.0,
+    ) -> dict[str, Any]:
+        """Block until the user drag-selects a screen rect (or cancels).
+
+        Returns either:
+          - {"image": "<base64 PNG>", "x", "y", "width", "height"} on success
+          - {"cancelled": True, "reason": str} on Esc/timeout
+
+        The transport timeout is set generously to cover the user's
+        thinking time; the bridge itself uses Sikuli's blocking
+        `userCapture` and returns whenever the user finishes.
+        """
+        params: dict[str, Any] = {"timeout": timeout}
+        if prompt:
+            params["prompt"] = prompt
+        # Add slack on top of the user-facing timeout for SikuliX overhead.
+        return self.request(
+            "screen.user_capture", params, timeout=timeout + 5.0
+        )
+
     # ---- resource resolution --------------------------------------------
 
     def _resolve_jar(self) -> Path:

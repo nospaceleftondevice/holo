@@ -89,6 +89,17 @@ class _StubBridge:
         self.calls.append(("find_image", {"needle": needle, "region": region, "score": score}))
         return self.next_find
 
+    def find_image_path(self, path, *, region=None, score=0.7, timeout=15.0):
+        self.calls.append(
+            ("find_image_path", {"path": str(path), "region": region, "score": score})
+        )
+        return self.next_find
+
+    def user_capture(self, *, prompt="", timeout=60.0):
+        self.calls.append(("user_capture", {"prompt": prompt, "timeout": timeout}))
+        # Default: return cancelled. Tests override `next_capture` for success.
+        return getattr(self, "next_capture", {"cancelled": True, "reason": "stub"})
+
 
 class _FakeDaemon:
     def __init__(self, *, bridge: _StubBridge | None = None) -> None:
@@ -339,6 +350,11 @@ class TestShutdownAndBuild:
                 "browser_forward",
                 "browser_execute_js",
                 "bookmarklet_query",
+                "ui_template_capture",
+                "ui_template_list",
+                "ui_template_find",
+                "ui_template_click",
+                "ui_template_delete",
             }
         finally:
             holo.shutdown()
@@ -598,3 +614,205 @@ class TestBookmarkletQuery:
         server, _ = server_with_channel
         with pytest.raises(ValueError, match="no channel"):
             server.bookmarklet_query("nope", "button")
+
+
+class TestUiTemplates:
+    """Template cache MCP tools — capture / list / find / click / delete.
+
+    The TemplateStore itself is exercised exhaustively in test_templates.py;
+    here we just verify the MCP layer routes correctly to the store and
+    bridge, and that find/click integrate them properly.
+    """
+
+    @pytest.fixture
+    def fixtures(self, tmp_path):
+        """Server wired to a stubbed bridge + a tmp-dir TemplateStore."""
+        from holo.templates import TemplateStore
+
+        store = TemplateStore(root=tmp_path / "templates")
+        bridge = _StubBridge()
+        # 24x24 PNG that the bridge "captured" and that find_image_path "matches".
+        png = self._make_png(24, 24)
+        bridge.next_screenshot = png
+        bridge.next_capture = {
+            "image": __import__("base64").b64encode(png).decode(),
+            "x": 100, "y": 200, "width": 24, "height": 24,
+        }
+        bridge.next_find = {
+            "x": 100, "y": 200, "width": 24, "height": 24, "score": 0.91,
+        }
+        server = HoloMCPServer(templates=store)
+        server._daemon = _FakeDaemon(bridge=bridge)
+        return server, bridge, store, png
+
+    @staticmethod
+    def _make_png(w, h):
+        import struct
+        import zlib
+
+        sig = b"\x89PNG\r\n\x1a\n"
+
+        def chunk(typ, data):
+            crc = zlib.crc32(typ + data) & 0xFFFFFFFF
+            return struct.pack(">I", len(data)) + typ + data + struct.pack(">I", crc)
+
+        ihdr = struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0)
+        raw = b"".join(b"\x00" + b"\x00\x00\x00" * w for _ in range(h))
+        idat = zlib.compress(raw)
+        return sig + chunk(b"IHDR", ihdr) + chunk(b"IDAT", idat) + chunk(b"IEND", b"")
+
+    # ---- capture --------------------------------------------------------
+
+    def test_capture_with_region_uses_screenshot(self, fixtures):
+        server, bridge, store, _ = fixtures
+        out = server.ui_template_capture(
+            "kebab", app="chrome",
+            region={"x": 0, "y": 0, "width": 24, "height": 24},
+        )
+        # The bridge was asked for a screenshot, not a userCapture.
+        assert any(c[0] == "screenshot" for c in bridge.calls)
+        assert not any(c[0] == "user_capture" for c in bridge.calls)
+        assert out["saved"] is True
+        assert out["entry"]["app"] == "chrome"
+        assert out["entry"]["label"] == "kebab"
+        assert store.get("kebab", "chrome") is not None
+
+    def test_capture_without_region_calls_user_capture(self, fixtures):
+        server, bridge, store, _ = fixtures
+        out = server.ui_template_capture("kebab", app="chrome")
+        assert any(c[0] == "user_capture" for c in bridge.calls)
+        assert out["saved"] is True
+        assert store.get("kebab", "chrome") is not None
+
+    def test_capture_cancelled_returns_cancelled_marker_no_save(self, fixtures):
+        server, bridge, store, _ = fixtures
+        bridge.next_capture = {"cancelled": True, "reason": "user cancelled"}
+        out = server.ui_template_capture("kebab", app="chrome")
+        assert out == {"cancelled": True, "reason": "user cancelled"}
+        # Nothing was written to the cache.
+        assert store.get("kebab", "chrome") is None
+
+    def test_capture_propagates_replace_and_similarity(self, fixtures):
+        server, _, store, _ = fixtures
+        server.ui_template_capture(
+            "kebab", app="chrome",
+            region={"x": 0, "y": 0, "width": 24, "height": 24},
+        )
+        server.ui_template_capture(
+            "kebab", app="chrome",
+            region={"x": 0, "y": 0, "width": 24, "height": 24},
+            replace=True,
+            similarity=0.95,
+        )
+        entry = store.get("kebab", "chrome")
+        assert entry["variants"] == ["kebab.png"]
+        assert entry["similarity"] == 0.95
+
+    # ---- list -----------------------------------------------------------
+
+    def test_list_filters_by_app(self, fixtures):
+        server, _, store, png = fixtures
+        store.add_variant("a", "chrome", png)
+        store.add_variant("b", "slack", png)
+        out = server.ui_template_list(app="chrome")
+        assert [e["label"] for e in out["templates"]] == ["a"]
+
+    def test_list_all(self, fixtures):
+        server, _, store, png = fixtures
+        store.add_variant("a", "chrome", png)
+        store.add_variant("b", None, png)
+        out = server.ui_template_list()
+        assert len(out["templates"]) == 2
+
+    # ---- find -----------------------------------------------------------
+
+    def test_find_returns_match_with_variant_name(self, fixtures):
+        server, bridge, store, png = fixtures
+        store.add_variant("kebab", "chrome", png, similarity=0.9)
+        out = server.ui_template_find("kebab", app="chrome")
+        assert out["score"] == 0.91
+        assert out["variant"] == "kebab.png"
+        assert out["x"] == 100
+        # Bridge was asked with the entry's similarity, not the default.
+        path_calls = [c for c in bridge.calls if c[0] == "find_image_path"]
+        assert path_calls and path_calls[-1][1]["score"] == 0.9
+
+    def test_find_walks_variants_in_order(self, fixtures):
+        server, bridge, store, png = fixtures
+        store.add_variant("kebab", "chrome", png)
+        store.add_variant("kebab", "chrome", png)  # _2
+        # First variant misses, second hits.
+        responses = [None, {
+            "x": 1, "y": 2, "width": 24, "height": 24, "score": 0.88,
+        }]
+
+        def stepwise_find(path, *, region=None, score=0.7, timeout=15.0):
+            bridge.calls.append(("find_image_path", {"path": str(path)}))
+            return responses.pop(0)
+
+        bridge.find_image_path = stepwise_find  # type: ignore[assignment]
+        out = server.ui_template_find("kebab", app="chrome")
+        assert out["variant"] == "kebab_2.png"
+
+    def test_find_returns_null_when_no_variant_matches(self, fixtures):
+        server, bridge, store, png = fixtures
+        store.add_variant("kebab", "chrome", png)
+        bridge.next_find = None
+        assert server.ui_template_find("kebab", app="chrome") is None
+
+    def test_find_raises_lookup_error_for_missing_label(self, fixtures):
+        server, _, _, _ = fixtures
+        with pytest.raises(LookupError, match="kebab"):
+            server.ui_template_find("kebab", app="chrome")
+
+    def test_find_bumps_last_used_and_match_count(self, fixtures):
+        server, _, store, png = fixtures
+        store.add_variant("kebab", "chrome", png)
+        server.ui_template_find("kebab", app="chrome")
+        entry = store.get("kebab", "chrome")
+        assert entry["match_count"] == 1
+        assert entry["last_used"] is not None
+
+    # ---- click ----------------------------------------------------------
+
+    def test_click_finds_and_clicks_center(self, fixtures):
+        server, bridge, store, png = fixtures
+        store.add_variant("kebab", "chrome", png)
+        out = server.ui_template_click("kebab", app="chrome")
+        # Center of the 100,200 / 24x24 match is (112, 212).
+        assert out == {
+            "clicked": True, "x": 112, "y": 212, "score": 0.91, "variant": "kebab.png"
+        }
+        assert ("click", {"x": 112, "y": 212, "modifiers": []}) in bridge.calls
+
+    def test_click_raises_when_template_doesnt_match(self, fixtures):
+        server, bridge, store, png = fixtures
+        store.add_variant("kebab", "chrome", png)
+        bridge.next_find = None
+        with pytest.raises(RuntimeError, match="matched nothing"):
+            server.ui_template_click("kebab", app="chrome")
+        # No click was issued.
+        assert not any(c[0] == "click" for c in bridge.calls)
+
+    def test_click_raises_for_missing_label(self, fixtures):
+        server, _, _, _ = fixtures
+        with pytest.raises(LookupError, match="kebab"):
+            server.ui_template_click("kebab", app="chrome")
+
+    # ---- delete ---------------------------------------------------------
+
+    def test_delete_removes_entry(self, fixtures):
+        server, _, store, png = fixtures
+        store.add_variant("kebab", "chrome", png)
+        out = server.ui_template_delete("kebab", app="chrome")
+        assert "kebab.png" in out["removed"]
+        assert store.get("kebab", "chrome") is None
+
+    def test_delete_one_variant_keeps_entry(self, fixtures):
+        server, _, store, png = fixtures
+        store.add_variant("kebab", "chrome", png)
+        store.add_variant("kebab", "chrome", png)
+        out = server.ui_template_delete("kebab", app="chrome", variant="kebab.png")
+        assert out["removed"] == ["kebab.png"]
+        entry = store.get("kebab", "chrome")
+        assert entry["variants"] == ["kebab_2.png"]

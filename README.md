@@ -120,6 +120,7 @@ on whichever page should be driven), then issues commands by sid. Tools:
 | `browser_navigate` / `browser_new_tab` / `browser_list_tabs` / `browser_activate_tab` / `browser_close_active_tab` / `browser_read_active_url` / `browser_read_active_title` / `browser_reload` / `browser_back` / `browser_forward` | AppleScript-driven Chrome ops (macOS). Reliable navigation without keystroke simulation; bypasses `app_activate` + `screen_key` entirely. |
 | `browser_execute_js` | Run an arbitrary JS expression in the active tab via Chrome's AppleScript dictionary. Requires Chrome → View → Developer → "Allow JavaScript from Apple Events". Raises a clear error pointing at `bookmarklet_query` if that toggle is off. |
 | `bookmarklet_query` | CSP-safe DOM query routed through the bookmarklet — `document.querySelector(selector)` reading either a property (default `innerText`) or an attribute. Works on strict-CSP origins where `browser_execute_js` is unavailable. Pass `all=true` for `querySelectorAll`. |
+| `ui_template_capture` / `ui_template_list` / `ui_template_find` / `ui_template_click` / `ui_template_delete` | Persistent on-disk cache that maps natural-language `(app, label)` keys to PNG variants and matches them with SikuliX. Capture once (drag-rectangle prompt or programmatic region), then click by name in future sessions. Avoids re-discovering the same desktop UI elements via vision. Default cache: `~/Library/Caches/holo/templates/` (override with `HOLO_TEMPLATE_DIR`). |
 
 ## License
 

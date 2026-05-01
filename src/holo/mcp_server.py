@@ -30,6 +30,7 @@ from mcp.server.stdio import stdio_server
 from holo.channel import CalibrationError, Channel, CommandError
 from holo.daemon import Daemon
 from holo.mcp_wire import WIRE_MAGIC, is_valid_handshake, read_handshake
+from holo.templates import TemplateNotFound, TemplateStore
 
 
 class HoloMCPServer:
@@ -40,11 +41,20 @@ class HoloMCPServer:
     us one place to attach a fake daemon in tests.
     """
 
-    def __init__(self, *, hide_qr: bool = False, use_bridge: bool = False) -> None:
+    def __init__(
+        self,
+        *,
+        hide_qr: bool = False,
+        use_bridge: bool = False,
+        templates: TemplateStore | None = None,
+    ) -> None:
         self.hide_qr = hide_qr
         self.use_bridge = use_bridge
         self._daemon: Daemon | None = None
         self._daemon_lock = threading.Lock()
+        # Template cache lives across daemon restarts — it's a pure
+        # filesystem store, not bound to any JVM/browser session.
+        self.templates = templates if templates is not None else TemplateStore()
 
     @property
     def daemon(self) -> Daemon:
@@ -194,6 +204,136 @@ class HoloMCPServer:
         return self._require_bridge().find_image(
             needle_bytes, region=region, score=score
         )
+
+    # ---- UI template cache ----------------------------------------------
+    #
+    # Maps natural-language `(app, label)` keys to stored PNG variants
+    # so the agent doesn't need to re-discover the same on-screen
+    # element via Vision every session. `_capture` blocks for a user
+    # rectangle drag (or accepts a `region` for programmatic stash);
+    # `_find` runs SikuliX template matching against the saved PNG;
+    # `_click` is the find-and-click convenience over the existing
+    # screen.click. Storage layout / index format documented in
+    # `holo.templates`.
+
+    def ui_template_capture(
+        self,
+        label: str,
+        app: str | None = None,
+        region: dict[str, int] | None = None,
+        replace: bool = False,
+        similarity: float = 0.85,
+        timeout: float = 60.0,
+        prompt: str = "",
+    ) -> dict[str, Any]:
+        """Save a template for `(app, label)` from a user-drawn rect or a programmatic region.
+
+        - region=None → blocks for a user `drag-rectangle` capture (Esc cancels).
+        - region={x,y,w,h} → captures that rect via screen.shot (no UI prompt).
+
+        `replace=True` discards prior variants for the entry; otherwise the
+        new image is appended as another variant (idle / hover / etc.).
+        Returns the saved index entry.
+        """
+        bridge = self._require_bridge()
+        if region is not None:
+            png = bridge.screenshot(region=region)
+        else:
+            result = bridge.user_capture(prompt=prompt, timeout=timeout)
+            if result.get("cancelled"):
+                # Surface as a non-error response — agent re-prompts user.
+                return {
+                    "cancelled": True,
+                    "reason": result.get("reason", "user cancelled"),
+                }
+            import base64 as _b64
+
+            png = _b64.b64decode(result["image"])
+        entry = self.templates.add_variant(
+            label, app, png, replace=replace, similarity=similarity
+        )
+        return {"saved": True, "entry": entry}
+
+    def ui_template_list(self, app: str | None = None) -> dict[str, Any]:
+        """List stored templates. `app=None` lists all; pass `'_global'` for the catch-all."""
+        return {"templates": self.templates.list(app=app)}
+
+    def ui_template_find(
+        self,
+        label: str,
+        app: str | None = None,
+        region: dict[str, int] | None = None,
+    ) -> dict[str, Any] | None:
+        """Locate a saved template on the current screen.
+
+        Walks each variant in order and returns the first hit. Bumps
+        `last_used` / `match_count` on the entry. Returns None if no
+        variant matches anywhere on the (optionally constrained) screen.
+
+        Raises `LookupError` if there's no entry for `(app, label)` —
+        distinct from "entry exists but doesn't match right now".
+        """
+        try:
+            paths = self.templates.variant_paths(label, app)
+        except TemplateNotFound as e:
+            raise LookupError(str(e)) from e
+        entry = self.templates.get(label, app)
+        # `get` is checked again because `variant_paths` raises before
+        # we reach this; we know it exists.
+        score = float(entry["similarity"]) if entry else 0.85
+        bridge = self._require_bridge()
+        for p in paths:
+            match = bridge.find_image_path(str(p), region=region, score=score)
+            if match is not None:
+                self.templates.touch(label, app)
+                return {**match, "variant": p.name}
+        return None
+
+    def ui_template_click(
+        self,
+        label: str,
+        app: str | None = None,
+        region: dict[str, int] | None = None,
+        button: str = "left",
+        clicks: int = 1,
+    ) -> dict[str, Any]:
+        """Find a saved template and click its center. Raises if nothing matches.
+
+        Convenience over `ui_template_find` + `screen_click`. The agent
+        gets one tool call for the 80% case (open the bookmarks menu,
+        click a saved icon, etc.). On miss this raises rather than
+        silently doing nothing — clicking the wrong place is worse than
+        a clear error.
+        """
+        del button, clicks  # not yet wired through screen.click — left/single only
+        match = self.ui_template_find(label, app, region=region)
+        if match is None:
+            app_norm = app or "_global"
+            raise RuntimeError(
+                f"template {app_norm}/{label} matched nothing on screen "
+                "(use ui_template_capture to refresh, or check whether the "
+                "target app is in front)"
+            )
+        cx = int(match["x"] + match["width"] / 2)
+        cy = int(match["y"] + match["height"] / 2)
+        self._require_bridge().click(cx, cy)
+        return {
+            "clicked": True,
+            "x": cx,
+            "y": cy,
+            "score": match["score"],
+            "variant": match["variant"],
+        }
+
+    def ui_template_delete(
+        self,
+        label: str,
+        app: str | None = None,
+        variant: str | None = None,
+    ) -> dict[str, Any]:
+        """Remove a stored template entry, or just one of its variants."""
+        removed = self.templates.delete(label, app, variant=variant)
+        return {"removed": removed}
 
     # ---- Chrome browser tools (AppleScript; macOS-only) -----------------
     #
@@ -449,6 +589,94 @@ def build_server(
         score: float = 0.7,
     ) -> dict[str, Any] | None:
         return holo.screen_find_image(needle, region=region, score=score)
+
+    # ---- UI template cache --------------------------------------------------
+    #
+    # Persistent cache mapping (app, label) → stored PNG variants. Used to
+    # turn natural-language UI references ("the kebab menu", "the bookmarks
+    # bar work folder") into screen coordinates without redoing vision each
+    # session. Templates are captured once (interactively or from a region
+    # the agent already has) and reused.
+
+    @mcp.tool(
+        description=(
+            "Save a template image for `(app, label)`. If `region` is "
+            "provided, captures that screen rect; otherwise blocks for the "
+            "user to drag-select a rectangle (Esc cancels). `app` defaults "
+            "to '_global'. Pass `replace=True` to discard existing variants; "
+            "otherwise the new image is added as another variant (idle, "
+            "hover, dark mode, etc.). Returns the saved index entry, or "
+            "{cancelled: true} if the user pressed Esc."
+        )
+    )
+    def ui_template_capture(
+        label: str,
+        app: str | None = None,
+        region: dict[str, int] | None = None,
+        replace: bool = False,
+        similarity: float = 0.85,
+        timeout: float = 60.0,
+        prompt: str = "",
+    ) -> dict[str, Any]:
+        return holo.ui_template_capture(
+            label,
+            app=app,
+            region=region,
+            replace=replace,
+            similarity=similarity,
+            timeout=timeout,
+            prompt=prompt,
+        )
+
+    @mcp.tool(
+        description=(
+            "List stored UI templates. `app=None` lists everything; pass an "
+            "app name (or '_global') to filter."
+        )
+    )
+    def ui_template_list(app: str | None = None) -> dict[str, Any]:
+        return holo.ui_template_list(app=app)
+
+    @mcp.tool(
+        description=(
+            "Locate a saved template on the current screen. Walks variants "
+            "in order, returns the first hit as {x, y, width, height, score, "
+            "variant} or null if none match. Raises if the label has no "
+            "registered template — call `ui_template_capture` first."
+        )
+    )
+    def ui_template_find(
+        label: str,
+        app: str | None = None,
+        region: dict[str, int] | None = None,
+    ) -> dict[str, Any] | None:
+        return holo.ui_template_find(label, app=app, region=region)
+
+    @mcp.tool(
+        description=(
+            "Find a saved template and click its center. Raises if nothing "
+            "matches — clicking the wrong place is worse than a clear error."
+        )
+    )
+    def ui_template_click(
+        label: str,
+        app: str | None = None,
+        region: dict[str, int] | None = None,
+    ) -> dict[str, Any]:
+        return holo.ui_template_click(label, app=app, region=region)
+
+    @mcp.tool(
+        description=(
+            "Remove a stored template entry, or pass `variant` to delete just "
+            "one variant (the entry stays if other variants remain)."
+        )
+    )
+    def ui_template_delete(
+        label: str,
+        app: str | None = None,
+        variant: str | None = None,
+    ) -> dict[str, Any]:
+        return holo.ui_template_delete(label, app=app, variant=variant)
 
     # ---- Chrome browser tools (AppleScript; macOS-only) ---------------------
     #
