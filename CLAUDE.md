@@ -76,7 +76,7 @@ After editing `bookmarklet/core.js` you must rebuild **and** re-drag the bookmar
 
 ## MCP surface (Phase 1)
 
-`src/holo/mcp_server.py` exposes a `FastMCP` server with the channel + screen tools (`calibrate`, `list_channels`, `drop_channel`, `ping`, `read_global`, `send_command`, plus `app_activate`, `screen_*` when `--bridge` is on). `HoloMCPServer` owns one lazily-constructed `Daemon` and translates `CalibrationError` / `CommandError` into MCP-style runtime errors.
+`src/holo/mcp_server.py` exposes a `FastMCP` server with the channel + screen tools (`calibrate`, `list_channels`, `drop_channel`, `ping`, `read_global`, `send_command`, `bookmarklet_query`, plus `app_activate`, `screen_*` when `--bridge` is on, plus `browser_*` AppleScript ops). `HoloMCPServer` owns one lazily-constructed `Daemon` and translates `CalibrationError` / `CommandError` into MCP-style runtime errors.
 
 Two transports:
 - `holo mcp` — stdio (default; for `claude mcp add` spawning per session)
@@ -88,8 +88,10 @@ Both transports must keep stdout clean — diagnostics go to stderr only.
 
 ## Browser ops (AppleScript adapter)
 
-`src/holo/browser_chrome.py` wraps Chrome's AppleScript dictionary as `browser_*` MCP tools (`browser_navigate`, `browser_new_tab`, `browser_list_tabs`, `browser_activate_tab`, `browser_close_active_tab`, `browser_read_active_*`, `browser_reload`, `browser_back`, `browser_forward`). These bypass the SikuliX keystroke layer entirely — no `app_activate` race, no focus beeps, no Accessibility permission needed for keyboard injection. Only Automation permission for the launching Terminal → Google Chrome.
+`src/holo/browser_chrome.py` wraps Chrome's AppleScript dictionary as `browser_*` MCP tools (`browser_navigate`, `browser_new_tab`, `browser_list_tabs`, `browser_activate_tab`, `browser_close_active_tab`, `browser_read_active_*`, `browser_reload`, `browser_back`, `browser_forward`, `browser_execute_js`). These bypass the SikuliX keystroke layer entirely — no `app_activate` race, no focus beeps, no Accessibility permission needed for keyboard injection. Only Automation permission for the launching Terminal → Google Chrome.
 
-**Use `browser_*` for any Chrome navigation.** SikuliX's `screen_key`/`screen_type` should be reserved for non-browser apps (terminals, native dialogs, canvas content). The bookmarklet channel is still the right tool for in-page DOM reads where AppleScript is too coarse.
+**Use `browser_*` for any Chrome navigation.** SikuliX's `screen_key`/`screen_type` should be reserved for non-browser apps (terminals, native dialogs, canvas content).
+
+For arbitrary DOM reads, prefer `browser_execute_js` (AppleScript) — it has no CSP constraint because it runs on Chrome's main world via Apple Events, not via a script the page can block. It needs Chrome → View → Developer → **Allow JavaScript from Apple Events** turned on; when that toggle is off, `JavaScriptNotAuthorized` surfaces a message naming the menu item and points the agent at `bookmarklet_query` (`query_selector` / `query_selector_all` ops in `bookmarklet/dispatch.js`) as the CSP-safe fallback. The bookmarklet path stays useful even when the AppleScript path is available — it doesn't need the toggle and works on any tab where the bookmarklet is calibrated.
 
 macOS-only. Linux/Windows browser ops will land via the Phase 3 CDP adapter — Chrome 136+ blocks `--remote-debugging-port` on the default profile, so CDP requires a profile-switching dance that defeats holo's auth-piggyback pitch on macOS, but it's the right path for non-macOS.

@@ -15,7 +15,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from holo import browser_chrome
-from holo.browser_chrome import BrowserError, BrowserNotAvailable
+from holo.browser_chrome import BrowserError, BrowserNotAvailable, JavaScriptNotAuthorized
 
 # All these tests pretend we're on macOS regardless of where the suite runs.
 pytestmark = [
@@ -264,6 +264,57 @@ def test_missing_osascript_raises_browser_not_available(monkeypatch):
 
 
 # --- Sanity: real-platform behaviour on Linux/Windows works correctly --
+
+
+def test_execute_js_returns_stringified_result():
+    with patch.object(subprocess, "run", return_value=_ok("hello\n")) as run:
+        result = browser_chrome.execute_js("document.title")
+    assert result == {"result": "hello"}
+    script = run.call_args.args[0][2]
+    assert "execute active tab of front window javascript" in script
+    assert '"document.title"' in script
+
+
+def test_execute_js_escapes_quotes_in_expression():
+    nasty = 'document.querySelector("a.cta")?.innerText'
+    with patch.object(subprocess, "run", return_value=_ok("Click me")) as run:
+        browser_chrome.execute_js(nasty)
+    script = run.call_args.args[0][2]
+    # Inner double-quotes must be backslash-escaped or AppleScript breaks.
+    assert '\\"a.cta\\"' in script
+
+
+def test_execute_js_rejects_empty_expression():
+    with pytest.raises(BrowserError, match="non-empty"):
+        browser_chrome.execute_js("")
+
+
+def test_execute_js_raises_javascript_not_authorized_when_toggle_off():
+    """Chrome's exact stderr when 'Allow JavaScript from Apple Events' is off
+    varies across versions; cover the documented patterns."""
+    err_messages = [
+        "Executing JavaScript through AppleScript is turned off.",
+        "execution error: AppleScript permission required (-1743)",
+        "javascript through apple events is not allowed",
+    ]
+    for err in err_messages:
+        with patch.object(subprocess, "run", return_value=_fail(err)):
+            with pytest.raises(JavaScriptNotAuthorized) as exc:
+                browser_chrome.execute_js("document.title")
+        assert "View → Developer" in str(exc.value)
+        assert "Allow JavaScript from Apple Events" in str(exc.value)
+
+
+def test_execute_js_other_errors_remain_browser_error():
+    """Unrelated osascript errors don't get the JS-not-authorized
+    treatment — important so callers don't get confused about whether
+    a fallback is appropriate."""
+    with patch.object(
+        subprocess, "run", return_value=_fail("execution error: -1728 (-1728)")
+    ):
+        with pytest.raises(BrowserError) as exc:
+            browser_chrome.execute_js("document.title")
+    assert not isinstance(exc.value, JavaScriptNotAuthorized)
 
 
 def test_running_on_actual_non_macos_without_force_skips_gracefully():
