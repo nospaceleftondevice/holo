@@ -9,8 +9,8 @@ Subcommands:
     holo mcp               run the MCP server over stdio
     holo mcp --listen PORT run the MCP server over TCP (single connection)
     holo connect HOST:PORT stdio↔TCP bridge to a listening `holo mcp`
-    holo bridge <verb>     smoke-test the SikuliX bridge directly
-    holo install-bridge    pre-download the SikuliX jar into the user cache
+    holo screen <verb>     smoke-test the SikuliX-backed screen tools directly
+    holo install-screen    pre-download the SikuliX jar into the user cache
     holo install-bookmarklet  download the bookmarklet page and open it
 """
 
@@ -115,7 +115,7 @@ def _cmd_doctor() -> int:
 _MANUAL_COUNTDOWN_S: int = 5
 
 
-def _cmd_demo(*, manual: bool = False, hide_qr: bool = False, use_bridge: bool = False) -> int:
+def _cmd_demo(*, manual: bool = False, hide_qr: bool = False, enable_screen: bool = False) -> int:
     """End-to-end smoke test: read R2D2_VERSION through the channel.
 
     Pass `manual=True` (or run `holo demo --manual`) to skip the
@@ -161,11 +161,11 @@ def _cmd_demo(*, manual: bool = False, hide_qr: bool = False, use_bridge: bool =
     print("Run `holo doctor` first if you suspect a permissions issue.")
     print()
 
-    daemon = Daemon(hide_qr=hide_qr, use_bridge=use_bridge)
+    daemon = Daemon(hide_qr=hide_qr, enable_screen=enable_screen)
     if hide_qr:
         print("QR reply channel: stealth (camera-resistant)")
-    if use_bridge:
-        print("Input pipeline: SikuliX bridge (cross-platform)")
+    if enable_screen:
+        print("Screen tools: SikuliX bridge enabled")
     print(f"WS listener: {daemon.ws_server.url}")
     print("Polling for calibration beacon (60s timeout)…")
     try:
@@ -281,7 +281,8 @@ def _cmd_focus() -> int:
 def _cmd_mcp(
     *,
     hide_qr: bool = False,
-    use_bridge: bool = False,
+    enable_screen: bool = False,
+    no_bookmarklet: bool = False,
     listen_port: int | None = None,
 ) -> int:
     """Run the MCP server.
@@ -296,9 +297,24 @@ def _cmd_mcp(
     first bytes of a TCP connection — fetch always sends an HTTP
     request line first). Daemon state persists across reconnects.
 
+    With `--no-bookmarklet`, the channel-dependent tools are
+    omitted from the surface and the WS server isn't started. Use
+    this for agents that only drive screen / template / AppleScript
+    tools — e.g. a Slack-only orchestrator.
+
     Either way we print only to stderr — stdout carries protocol.
     """
     from holo import mcp_server
+
+    def _banner_lines() -> list[str]:
+        lines: list[str] = []
+        if hide_qr:
+            lines.append("QR reply channel: stealth (camera-resistant)")
+        if enable_screen:
+            lines.append("Screen tools: SikuliX bridge enabled")
+        if no_bookmarklet:
+            lines.append("Bookmarklet channel: disabled (--no-bookmarklet)")
+        return lines
 
     if listen_port is not None:
         print(
@@ -306,19 +322,24 @@ def _cmd_mcp(
             "(magic prefix required)",
             file=sys.stderr,
         )
-        if hide_qr:
-            print("QR reply channel: stealth (camera-resistant)", file=sys.stderr)
-        if use_bridge:
-            print("Input pipeline: SikuliX bridge (cross-platform)", file=sys.stderr)
-        mcp_server.run_tcp(listen_port, hide_qr=hide_qr, use_bridge=use_bridge)
+        for line in _banner_lines():
+            print(line, file=sys.stderr)
+        mcp_server.run_tcp(
+            listen_port,
+            hide_qr=hide_qr,
+            enable_screen=enable_screen,
+            no_bookmarklet=no_bookmarklet,
+        )
         return 0
 
     print("holo mcp — starting MCP server over stdio", file=sys.stderr)
-    if hide_qr:
-        print("QR reply channel: stealth (camera-resistant)", file=sys.stderr)
-    if use_bridge:
-        print("Input pipeline: SikuliX bridge (cross-platform)", file=sys.stderr)
-    mcp_server.run(hide_qr=hide_qr, use_bridge=use_bridge)
+    for line in _banner_lines():
+        print(line, file=sys.stderr)
+    mcp_server.run(
+        hide_qr=hide_qr,
+        enable_screen=enable_screen,
+        no_bookmarklet=no_bookmarklet,
+    )
     return 0
 
 
@@ -386,8 +407,8 @@ def _cmd_mcp_remote(rest: list[str]) -> int:
     return mcp_remote.run(child_argv, startup_timeout_s=timeout)
 
 
-_BRIDGE_USAGE = (
-    "usage: holo bridge <verb> [args]\n"
+_SCREEN_USAGE = (
+    "usage: holo screen <verb> [args]\n"
     "  ping                          start the JVM bridge and ping it\n"
     "  activate <app>                bring an app to the foreground\n"
     "  click <x> <y>                 click at screen coordinates\n"
@@ -396,8 +417,8 @@ _BRIDGE_USAGE = (
 )
 
 
-def _cmd_bridge(rest: list[str]) -> int:
-    """Drive the SikuliX bridge directly — no calibration, no channel.
+def _cmd_screen(rest: list[str]) -> int:
+    """Drive the SikuliX-backed screen tools directly — no channel.
 
     This is for sanity-checking the JVM + jar setup end-to-end. Each
     invocation spawns a fresh JVM, runs one verb, exits. Slow for
@@ -406,7 +427,7 @@ def _cmd_bridge(rest: list[str]) -> int:
     from holo.bridge import BridgeClient, BridgeError, BridgeMissingError
 
     if not rest:
-        print(_BRIDGE_USAGE, file=sys.stderr)
+        print(_SCREEN_USAGE, file=sys.stderr)
         return 2
     verb = rest[0]
     args = rest[1:]
@@ -415,7 +436,7 @@ def _cmd_bridge(rest: list[str]) -> int:
     try:
         client.start()
     except BridgeMissingError as e:
-        print(f"holo bridge: {e}", file=sys.stderr)
+        print(f"holo screen: {e}", file=sys.stderr)
         print(
             "Hint: install OpenJDK 11+ and drop sikulixapi.jar in vendor/ "
             "or set HOLO_SIKULI_JAR.",
@@ -423,7 +444,7 @@ def _cmd_bridge(rest: list[str]) -> int:
         )
         return 1
     except (BridgeError, OSError) as e:
-        print(f"holo bridge: failed to start JVM: {e}", file=sys.stderr)
+        print(f"holo screen: failed to start JVM: {e}", file=sys.stderr)
         return 1
 
     try:
@@ -438,10 +459,10 @@ def _cmd_bridge(rest: list[str]) -> int:
         elif verb == "type" and len(args) >= 1:
             result = client.type_text(" ".join(args))
         else:
-            print(_BRIDGE_USAGE, file=sys.stderr)
+            print(_SCREEN_USAGE, file=sys.stderr)
             return 2
     except BridgeError as e:
-        print(f"holo bridge: error {e.code}: {e.message}", file=sys.stderr)
+        print(f"holo screen: error {e.code}: {e.message}", file=sys.stderr)
         if e.trace:
             print(e.trace, file=sys.stderr)
         return 1
@@ -452,7 +473,7 @@ def _cmd_bridge(rest: list[str]) -> int:
     return 0
 
 
-def _cmd_install_bridge() -> int:
+def _cmd_install_screen() -> int:
     """Pre-download the SikuliX jar into the user cache.
 
     Useful in air-gapped / metered-bandwidth environments where you want
@@ -468,7 +489,7 @@ def _cmd_install_bridge() -> int:
         ensure_jar,
     )
 
-    print(f"holo install-bridge — fetching {SIKULI_JAR_NAME}")
+    print(f"holo install-screen — fetching {SIKULI_JAR_NAME}")
     print(f"  source: {SIKULI_JAR_URL}")
 
     last_pct = {"value": -1}
@@ -489,7 +510,7 @@ def _cmd_install_bridge() -> int:
         path = ensure_jar(on_progress=on_progress)
     except BridgeMissingError as e:
         print()
-        print(f"holo install-bridge: {e}", file=sys.stderr)
+        print(f"holo install-screen: {e}", file=sys.stderr)
         return 1
     finally:
         if last_pct["value"] >= 0:
@@ -526,7 +547,7 @@ COMMANDS = {
     "demo": _cmd_demo,
     "focus": _cmd_focus,
     "mcp": _cmd_mcp,
-    "install-bridge": _cmd_install_bridge,
+    "install-screen": _cmd_install_screen,
 }
 
 
@@ -537,15 +558,17 @@ Usage: holo <command> [options]
 
 Commands:
   doctor                  check macOS permissions / runtime environment
-  demo [--manual] [--hide-qr] [--bridge]
+  demo [--manual] [--hide-qr] [--screen]
                           end-to-end smoke test against the in-page agent
-  mcp [--listen PORT] [--hide-qr] [--bridge]
+  mcp [--listen PORT] [--hide-qr] [--screen] [--no-bookmarklet]
                           run the MCP server over stdio (or TCP with --listen)
+                          --screen          enable screen / template / app_activate tools
+                          --no-bookmarklet  drop channel tools; no WS server
   connect HOST:PORT       stdio↔TCP bridge to a listening `holo mcp`
   mcp-remote -- CMD ...   spawn-per-connection stdio proxy
   windows                 print visible windows (smoke for windows reader)
-  bridge <verb>           smoke-test the SikuliX bridge directly
-  install-bridge          pre-download the SikuliX jar into the user cache
+  screen <verb>           smoke-test the SikuliX-backed screen tools directly
+  install-screen          pre-download the SikuliX jar into the user cache
   install-bookmarklet     download the bookmarklet page and open it
 
 Options:
@@ -573,7 +596,7 @@ def main(argv: list[str] | None = None) -> int:
         return _cmd_demo(
             manual="--manual" in rest,
             hide_qr="--hide-qr" in rest,
-            use_bridge="--bridge" in rest,
+            enable_screen="--screen" in rest,
         )
     if cmd == "mcp":
         listen_port: int | None = None
@@ -596,15 +619,16 @@ def main(argv: list[str] | None = None) -> int:
                 return 2
         return _cmd_mcp(
             hide_qr="--hide-qr" in rest,
-            use_bridge="--bridge" in rest,
+            enable_screen="--screen" in rest,
+            no_bookmarklet="--no-bookmarklet" in rest,
             listen_port=listen_port,
         )
     if cmd == "connect":
         return _cmd_connect(rest)
     if cmd == "mcp-remote":
         return _cmd_mcp_remote(rest)
-    if cmd == "bridge":
-        return _cmd_bridge(rest)
+    if cmd == "screen":
+        return _cmd_screen(rest)
     if cmd == "install-bookmarklet":
         return _cmd_install_bookmarklet(rest)
     if cmd in COMMANDS:
