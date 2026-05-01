@@ -48,8 +48,8 @@ bookmarklet in your browser.
 macOS / Linux:
 
 ```bash
-# Replace TAG with the latest release tag, e.g. v0.1.0a6
-TAG=v0.1.0a6
+# Replace TAG with the latest release tag, e.g. v0.1.0a7
+TAG=v0.1.0a7
 ASSET=holo-macos-universal2   # or holo-linux-x86_64
 
 curl -L -o /usr/local/bin/holo \
