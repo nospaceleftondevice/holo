@@ -359,6 +359,68 @@ class TestShutdownAndBuild:
         finally:
             holo.shutdown()
 
+    def test_no_bookmarklet_omits_channel_tools(self):
+        """`--no-bookmarklet` mode drops the seven channel-dependent tools
+        (calibrate / list_channels / drop_channel / ping / read_global /
+        send_command / bookmarklet_query) but keeps screen, template, and
+        AppleScript browser ops. Used by agents that never touch the
+        bookmarklet — Slack / desktop orchestrators."""
+        import asyncio
+
+        mcp, holo = build_server(no_bookmarklet=True)
+        try:
+            tools = asyncio.run(mcp.list_tools())
+            names = {t.name for t in tools}
+            channel_tools = {
+                "calibrate",
+                "list_channels",
+                "drop_channel",
+                "ping",
+                "read_global",
+                "send_command",
+                "bookmarklet_query",
+            }
+            assert names.isdisjoint(channel_tools), (
+                f"channel tools should be omitted: {names & channel_tools}"
+            )
+            # Sanity: surfaces that don't depend on the channel still load.
+            assert {
+                "app_activate",
+                "screen_click",
+                "screen_shot",
+                "browser_navigate",
+                "browser_execute_js",
+                "ui_template_capture",
+                "ui_template_click",
+            }.issubset(names)
+        finally:
+            holo.shutdown()
+
+    def test_no_bookmarklet_skips_ws_server(self):
+        """The Daemon should never spin up its WS server when the flag is
+        on — the flag's whole point is to avoid binding a port that
+        nothing will use."""
+        from holo.daemon import Daemon
+
+        d = Daemon(no_bookmarklet=True)
+        try:
+            assert d.ws_server is None
+        finally:
+            d.shutdown()  # must not raise even with ws_server=None
+
+    def test_no_bookmarklet_calibrate_raises(self):
+        """`Daemon.calibrate()` must raise rather than silently hanging
+        in no-bookmarklet mode — there's no WS server to receive the
+        beacon and no popup serving infrastructure."""
+        from holo.daemon import Daemon
+
+        d = Daemon(no_bookmarklet=True)
+        try:
+            with pytest.raises(RuntimeError, match="no-bookmarklet"):
+                d.calibrate(timeout=0.1)
+        finally:
+            d.shutdown()
+
 
 class TestScreenTools:
     """SikuliX-backed tools that don't take a sid — they drive whatever's
@@ -369,7 +431,7 @@ class TestScreenTools:
     @pytest.fixture
     def server_with_bridge(self):
         bridge = _StubBridge()
-        server = HoloMCPServer(use_bridge=True)
+        server = HoloMCPServer(enable_screen=True)
         fake = _FakeDaemon(bridge=bridge)
         server._daemon = fake  # bypass lazy init
         return server, bridge
@@ -442,10 +504,10 @@ class TestScreenTools:
             server.screen_find_image("!!!not-base64!!!")
 
     def test_no_bridge_raises_clean_error(self):
-        server = HoloMCPServer(use_bridge=False)
+        server = HoloMCPServer(enable_screen=False)
         fake = _FakeDaemon(bridge=None)
         server._daemon = fake
-        with pytest.raises(RuntimeError, match="SikuliX bridge unavailable"):
+        with pytest.raises(RuntimeError, match="Screen tools unavailable"):
             server.screen_click(0, 0)
 
 

@@ -37,7 +37,7 @@ tmux session that *does* have Screen Recording permission.
 On Host A, in tmux:
 
 ```bash
-holo mcp --listen 7777 --bridge
+holo mcp --listen 7777 --screen
 ```
 
 That binds 127.0.0.1:7777 and waits for a single TCP client at a
@@ -73,7 +73,7 @@ running a persistent listener:
 
 ```bash
 claude mcp add holo --scope project /path/to/holo mcp-remote -- \
-    ssh -A hostA holo mcp --bridge
+    ssh -A hostA holo mcp --screen
 ```
 
 Anything after `--` is the verbatim command spawned. We're

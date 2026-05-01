@@ -659,7 +659,7 @@ class _StubBridge:
 
 
 class TestBridgePath:
-    """When a Daemon has `use_bridge=True` and its bridge has come up,
+    """When a Daemon has `enable_screen=True` and its bridge has come up,
     the paste pipeline must route every step (activate, click, paste
     keystroke) through the SikuliX bridge — not through `_macos.py`."""
 
@@ -667,7 +667,7 @@ class TestBridgePath:
         from holo.daemon import Daemon
 
         bridge = _StubBridge()
-        d = Daemon(use_bridge=True)
+        d = Daemon(enable_screen=True)
         # Inject the stub bridge by short-circuiting the lazy-start.
         d._bridge = bridge  # type: ignore[assignment]
         d._bridge_attempted = True
@@ -732,8 +732,8 @@ class TestBridgePath:
             d._bridge = None  # don't let shutdown call into the stub
             d.shutdown()
 
-    def test_use_bridge_false_keeps_legacy_macos_path(self, fake_list_windows):
-        """When `use_bridge=False`, channels must NEVER touch the bridge.
+    def test_enable_screen_false_keeps_legacy_macos_path(self, fake_list_windows):
+        """When `enable_screen=False`, channels must NEVER touch the bridge.
 
         Existing macOS users without OpenJDK installed depend on this —
         the legacy `_macos.py` path stays default until binary builds
@@ -746,7 +746,7 @@ class TestBridgePath:
         if _sys.platform != "darwin":
             pytest.skip("legacy path is darwin-only")
 
-        d = Daemon(use_bridge=False)
+        d = Daemon(enable_screen=False)
         try:
             assert d.bridge is None  # never starts when opted out
             ch = Channel(daemon=d, poll_interval=0.001, default_timeout=2.0)
@@ -805,8 +805,8 @@ class TestBridgePath:
         finally:
             d.shutdown()
 
-    def test_use_bridge_true_but_unavailable_falls_back(self):
-        """If `use_bridge=True` but the bridge fails to start (no jar / no
+    def test_enable_screen_true_but_unavailable_falls_back(self):
+        """If `enable_screen=True` but the bridge fails to start (no jar / no
         JDK), `daemon.bridge` returns None and channels must fall through
         cleanly to the legacy path."""
         from unittest.mock import patch
@@ -814,7 +814,7 @@ class TestBridgePath:
         from holo.bridge import BridgeMissingError
         from holo.daemon import Daemon
 
-        d = Daemon(use_bridge=True)
+        d = Daemon(enable_screen=True)
         try:
             with patch("holo.bridge.BridgeClient.start", side_effect=BridgeMissingError("no jar")):
                 assert d.bridge is None

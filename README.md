@@ -74,8 +74,8 @@ bookmarks bar.
 
 End users also need OpenJDK 11+ installed (for the SikuliX bridge that
 drives screen primitives). The 128 MB SikuliX jar itself isn't bundled
-in the binary — it's fetched on first `--bridge` use, or pre-warmed
-with `holo install-bridge`.
+in the binary — it's fetched on first `--screen` use, or pre-warmed
+with `holo install-screen`.
 
 For cross-host setups (agent on one machine, browser on another), see
 [`docs/cross-host.md`](docs/cross-host.md).
@@ -121,6 +121,34 @@ on whichever page should be driven), then issues commands by sid. Tools:
 | `browser_execute_js` | Run an arbitrary JS expression in the active tab via Chrome's AppleScript dictionary. Requires Chrome → View → Developer → "Allow JavaScript from Apple Events". Raises a clear error pointing at `bookmarklet_query` if that toggle is off. |
 | `bookmarklet_query` | CSP-safe DOM query routed through the bookmarklet — `document.querySelector(selector)` reading either a property (default `innerText`) or an attribute. Works on strict-CSP origins where `browser_execute_js` is unavailable. Pass `all=true` for `querySelectorAll`. |
 | `ui_template_capture` / `ui_template_list` / `ui_template_find` / `ui_template_click` / `ui_template_delete` | Persistent on-disk cache that maps natural-language `(app, label)` keys to PNG variants and matches them with SikuliX. Capture once (drag-rectangle prompt or programmatic region), then click by name in future sessions. Avoids re-discovering the same desktop UI elements via vision. Default cache: `~/Library/Caches/holo/templates/` (override with `HOLO_TEMPLATE_DIR`). |
+
+### Tailoring the tool surface per agent
+
+Two flags shape what `holo mcp` exposes:
+
+- `--screen` — register `screen_*`, `app_activate`, and `ui_template_*`.
+  Brings up a SikuliX JVM (~200 MB; needs OpenJDK 11+). Off by default
+  so agents that only do browser work don't pay for a JVM they never
+  use.
+- `--no-bookmarklet` — drop the seven channel-dependent tools
+  (`calibrate`, `list_channels`, `drop_channel`, `ping`, `read_global`,
+  `send_command`, `bookmarklet_query`) and skip starting the WS server
+  / popup-serving infrastructure entirely. AppleScript-based
+  `browser_*` tools still work.
+
+Common combinations:
+
+| Agent type | Flags | Why |
+| --- | --- | --- |
+| Browser-only orchestrator (multi-tab) | _(none)_ | Channel + AppleScript browser ops; no JVM |
+| Browser + screen captures of Chrome chrome | `--screen` | Adds template / kebab-menu support |
+| Slack / desktop-only orchestrator | `--screen --no-bookmarklet` | All screen ops; no bookmarklet, no WS port |
+| AppleScript-only browser nav | `--no-bookmarklet` | No JVM, no WS port; AppleScript browser ops only |
+
+Two independent CLI agents on the same host can run their own daemons
+in parallel — each `holo mcp` is a self-contained process. Set
+`HOLO_TEMPLATE_DIR` per project if both will capture templates, so
+their cache indexes don't race.
 
 ## License
 

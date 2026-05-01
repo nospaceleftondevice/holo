@@ -30,6 +30,11 @@ def test_cli_help_flag(capsys):
         # A few subcommands must show up so the help is actually useful.
         for sub in ("doctor", "demo", "mcp", "install-bookmarklet"):
             assert sub in out
+        # Renamed surfaces should appear under their new names; the old
+        # names should not — keeps the help honest.
+        for sub in ("screen", "install-screen", "--no-bookmarklet"):
+            assert sub in out
+        assert "install-bridge" not in out
 
 
 def test_cli_unknown_command_points_at_help(capsys):
@@ -38,3 +43,13 @@ def test_cli_unknown_command_points_at_help(capsys):
     err = capsys.readouterr().err
     assert "unknown command" in err
     assert "--help" in err
+
+
+def test_cli_old_bridge_subcommand_is_unknown(capsys):
+    """The `holo bridge` subcommand was renamed to `holo screen`. Hitting
+    the old name should fall through to the unknown-command handler so
+    users get a pointer instead of silent confusion."""
+    rc = main(["bridge", "ping"])
+    assert rc == 2
+    err = capsys.readouterr().err
+    assert "unknown command" in err

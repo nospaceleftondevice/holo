@@ -76,7 +76,13 @@ After editing `bookmarklet/core.js` you must rebuild **and** re-drag the bookmar
 
 ## MCP surface (Phase 1)
 
-`src/holo/mcp_server.py` exposes a `FastMCP` server with the channel + screen tools (`calibrate`, `list_channels`, `drop_channel`, `ping`, `read_global`, `send_command`, `bookmarklet_query`, plus `app_activate`, `screen_*` when `--bridge` is on, plus `browser_*` AppleScript ops). `HoloMCPServer` owns one lazily-constructed `Daemon` and translates `CalibrationError` / `CommandError` into MCP-style runtime errors.
+`src/holo/mcp_server.py` exposes a `FastMCP` server with the channel + screen tools (`calibrate`, `list_channels`, `drop_channel`, `ping`, `read_global`, `send_command`, `bookmarklet_query`, plus `app_activate`, `screen_*` when `--screen` is on, plus `browser_*` AppleScript ops). `HoloMCPServer` owns one lazily-constructed `Daemon` and translates `CalibrationError` / `CommandError` into MCP-style runtime errors.
+
+Two flags tailor the surface:
+- `--screen` (kwarg `enable_screen`) — registers SikuliX-backed tools (`screen_*`, `app_activate`, `ui_template_*`). Off by default; opt-in keeps the JVM cost off the table for browser-only agents.
+- `--no-bookmarklet` (kwarg `no_bookmarklet`) — skips the WSServer entirely and drops the seven channel-dependent tool registrations (`calibrate`, `list_channels`, `drop_channel`, `ping`, `read_global`, `send_command`, `bookmarklet_query`). Suits agents that never touch the bookmarklet (Slack-only orchestrator, AppleScript-only nav). `Daemon.calibrate()` raises in this mode; channel methods on `HoloMCPServer` still exist defensively but the tools aren't exposed.
+
+Internal naming kept as-is: `BridgeClient`, `daemon.bridge`, `_require_bridge` describe the JVM bridge implementation accurately. Only the user-facing flag (`--bridge` → `--screen`), the matching kwarg (`use_bridge` → `enable_screen`), and two CLI subcommands (`holo bridge` → `holo screen`, `holo install-bridge` → `holo install-screen`) were renamed.
 
 Two transports:
 - `holo mcp` — stdio (default; for `claude mcp add` spawning per session)

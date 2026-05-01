@@ -45,11 +45,13 @@ class HoloMCPServer:
         self,
         *,
         hide_qr: bool = False,
-        use_bridge: bool = False,
+        enable_screen: bool = False,
+        no_bookmarklet: bool = False,
         templates: TemplateStore | None = None,
     ) -> None:
         self.hide_qr = hide_qr
-        self.use_bridge = use_bridge
+        self.enable_screen = enable_screen
+        self.no_bookmarklet = no_bookmarklet
         self._daemon: Daemon | None = None
         self._daemon_lock = threading.Lock()
         # Template cache lives across daemon restarts — it's a pure
@@ -60,7 +62,11 @@ class HoloMCPServer:
     def daemon(self) -> Daemon:
         with self._daemon_lock:
             if self._daemon is None:
-                self._daemon = Daemon(hide_qr=self.hide_qr, use_bridge=self.use_bridge)
+                self._daemon = Daemon(
+                    hide_qr=self.hide_qr,
+                    enable_screen=self.enable_screen,
+                    no_bookmarklet=self.no_bookmarklet,
+                )
             return self._daemon
 
     def shutdown(self) -> None:
@@ -151,9 +157,9 @@ class HoloMCPServer:
         bridge = self.daemon.bridge
         if bridge is None:
             raise RuntimeError(
-                "SikuliX bridge unavailable. Start the daemon with "
-                "`use_bridge=True` (CLI: `holo mcp --bridge`) and ensure "
-                "OpenJDK 11+ + sikulix*.jar are installed."
+                "Screen tools unavailable. Start the daemon with "
+                "`enable_screen=True` (CLI: `holo mcp --screen`) and "
+                "ensure OpenJDK 11+ + sikulix*.jar are installed."
             )
         return bridge
 
@@ -492,51 +498,70 @@ def _describe(ch: Channel) -> dict[str, Any]:
 
 
 def build_server(
-    *, hide_qr: bool = False, use_bridge: bool = False
+    *,
+    hide_qr: bool = False,
+    enable_screen: bool = False,
+    no_bookmarklet: bool = False,
 ) -> tuple[FastMCP, HoloMCPServer]:
     """Build a FastMCP instance with the holo tools registered.
 
     Returns the FastMCP server and the underlying `HoloMCPServer` so
     the caller can shut down the daemon after `mcp.run()` returns.
+
+    With `no_bookmarklet=True`, the channel-dependent tools
+    (calibrate, list_channels, drop_channel, ping, read_global,
+    send_command, bookmarklet_query) are not registered and the
+    daemon never spins up its WS server. Suits agents that only
+    drive screen + AppleScript surfaces.
     """
-    holo = HoloMCPServer(hide_qr=hide_qr, use_bridge=use_bridge)
+    holo = HoloMCPServer(
+        hide_qr=hide_qr,
+        enable_screen=enable_screen,
+        no_bookmarklet=no_bookmarklet,
+    )
     mcp = FastMCP("holo")
 
-    @mcp.tool(description="Wait for the bookmarklet's calibration beacon and register a channel.")
-    def calibrate(timeout: float = 30.0) -> dict[str, Any]:
-        return holo.calibrate(timeout=timeout)
-
-    @mcp.tool(description="List currently registered channels (one per calibrated tab).")
-    def list_channels() -> dict[str, Any]:
-        return holo.list_channels()
-
-    @mcp.tool(description="Forget a channel by sid. Does not close the browser popup.")
-    def drop_channel(sid: str) -> dict[str, Any]:
-        return holo.drop_channel(sid)
-
-    @mcp.tool(description="Round-trip a ping through the channel for `sid`.")
-    def ping(sid: str, timeout: float = 5.0) -> dict[str, Any]:
-        return holo.ping(sid, timeout=timeout)
-
-    @mcp.tool(
-        description=(
-            "Read a dotted path off the page's global object "
-            "(e.g. 'document.title' or 'R2D2_VERSION')."
+    if not no_bookmarklet:
+        @mcp.tool(
+            description=(
+                "Wait for the bookmarklet's calibration beacon and "
+                "register a channel."
+            )
         )
-    )
-    def read_global(sid: str, path: str, timeout: float = 5.0) -> dict[str, Any]:
-        return holo.read_global(sid, path, timeout=timeout)
+        def calibrate(timeout: float = 30.0) -> dict[str, Any]:
+            return holo.calibrate(timeout=timeout)
 
-    @mcp.tool(
-        description=(
-            "Send an arbitrary command to the bookmarklet. "
-            "Must be a dict with a string `op` field; see bookmarklet/dispatch.js."
+        @mcp.tool(description="List currently registered channels (one per calibrated tab).")
+        def list_channels() -> dict[str, Any]:
+            return holo.list_channels()
+
+        @mcp.tool(description="Forget a channel by sid. Does not close the browser popup.")
+        def drop_channel(sid: str) -> dict[str, Any]:
+            return holo.drop_channel(sid)
+
+        @mcp.tool(description="Round-trip a ping through the channel for `sid`.")
+        def ping(sid: str, timeout: float = 5.0) -> dict[str, Any]:
+            return holo.ping(sid, timeout=timeout)
+
+        @mcp.tool(
+            description=(
+                "Read a dotted path off the page's global object "
+                "(e.g. 'document.title' or 'R2D2_VERSION')."
+            )
         )
-    )
-    def send_command(
-        sid: str, command: dict[str, Any], timeout: float = 5.0
-    ) -> dict[str, Any]:
-        return holo.send_command(sid, command, timeout=timeout)
+        def read_global(sid: str, path: str, timeout: float = 5.0) -> dict[str, Any]:
+            return holo.read_global(sid, path, timeout=timeout)
+
+        @mcp.tool(
+            description=(
+                "Send an arbitrary command to the bookmarklet. "
+                "Must be a dict with a string `op` field; see bookmarklet/dispatch.js."
+            )
+        )
+        def send_command(
+            sid: str, command: dict[str, Any], timeout: float = 5.0
+        ) -> dict[str, Any]:
+            return holo.send_command(sid, command, timeout=timeout)
 
     @mcp.tool(description="Bring an application to the foreground by name (e.g. 'Google Chrome').")
     def app_activate(name: str) -> dict[str, Any]:
@@ -759,33 +784,43 @@ def build_server(
     def browser_execute_js(js: str) -> dict[str, Any]:
         return holo.browser_execute_js(js)
 
-    @mcp.tool(
-        description=(
-            "DOM query through the bookmarklet channel — CSP-safe "
-            "fallback for `browser_execute_js`. Reads `selector` and "
-            "returns the named property (default 'innerText') or "
-            "attribute. Pass `all=true` for a list of matches. "
-            "Requires a calibrated `sid`."
+    if not no_bookmarklet:
+        @mcp.tool(
+            description=(
+                "DOM query through the bookmarklet channel — CSP-safe "
+                "fallback for `browser_execute_js`. Reads `selector` and "
+                "returns the named property (default 'innerText') or "
+                "attribute. Pass `all=true` for a list of matches. "
+                "Requires a calibrated `sid`."
+            )
         )
-    )
-    def bookmarklet_query(
-        sid: str,
-        selector: str,
-        prop: str = "innerText",
-        attr: str | None = None,
-        all: bool = False,
-        timeout: float = 5.0,
-    ) -> dict[str, Any]:
-        return holo.bookmarklet_query(
-            sid, selector, prop=prop, attr=attr, all=all, timeout=timeout
-        )
+        def bookmarklet_query(
+            sid: str,
+            selector: str,
+            prop: str = "innerText",
+            attr: str | None = None,
+            all: bool = False,
+            timeout: float = 5.0,
+        ) -> dict[str, Any]:
+            return holo.bookmarklet_query(
+                sid, selector, prop=prop, attr=attr, all=all, timeout=timeout
+            )
 
     return mcp, holo
 
 
-def run(*, hide_qr: bool = False, use_bridge: bool = False) -> None:
+def run(
+    *,
+    hide_qr: bool = False,
+    enable_screen: bool = False,
+    no_bookmarklet: bool = False,
+) -> None:
     """Entrypoint used by `holo mcp` — runs the server over stdio."""
-    mcp, holo = build_server(hide_qr=hide_qr, use_bridge=use_bridge)
+    mcp, holo = build_server(
+        hide_qr=hide_qr,
+        enable_screen=enable_screen,
+        no_bookmarklet=no_bookmarklet,
+    )
     try:
         mcp.run()
     finally:
@@ -796,7 +831,8 @@ def run_tcp(
     port: int,
     *,
     hide_qr: bool = False,
-    use_bridge: bool = False,
+    enable_screen: bool = False,
+    no_bookmarklet: bool = False,
     stop_event: threading.Event | None = None,
 ) -> None:
     """Entrypoint used by `holo mcp --listen PORT`.
@@ -811,7 +847,11 @@ def run_tcp(
     `stop_event` is for tests — production callers leave it None
     and stop the loop with KeyboardInterrupt.
     """
-    mcp, holo = build_server(hide_qr=hide_qr, use_bridge=use_bridge)
+    mcp, holo = build_server(
+        hide_qr=hide_qr,
+        enable_screen=enable_screen,
+        no_bookmarklet=no_bookmarklet,
+    )
     listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     try:
