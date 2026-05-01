@@ -344,6 +344,86 @@ class TestConvenienceVerbs:
             uu.return_value.hex = "REQ"
             assert client.find_image(b"PNG") is None
 
+    def test_find_image_path_passes_path_not_needle(self, tmp_path):
+        """The cache form of find — sends a JVM-side path, not encoded bytes."""
+        client, fake = self._client_for(
+            tmp_path,
+            [{
+                "id": "REQ",
+                "result": {"x": 1, "y": 2, "width": 24, "height": 24, "score": 0.91},
+            }],
+        )
+        with patch("holo.bridge.uuid.uuid4") as uu:
+            uu.return_value.hex = "REQ"
+            out = client.find_image_path(
+                "/Users/x/.cache/holo/templates/chrome/kebab.png", score=0.85
+            )
+        assert out == {"x": 1, "y": 2, "width": 24, "height": 24, "score": 0.91}
+        sent = fake.stdin.getvalue().decode().strip().splitlines()
+        req = json.loads(sent[1])
+        assert req["method"] == "screen.find_image_path"
+        assert req["params"]["path"] == (
+            "/Users/x/.cache/holo/templates/chrome/kebab.png"
+        )
+        assert req["params"]["score"] == 0.85
+        assert "needle" not in req["params"]
+
+    def test_find_image_path_returns_none_for_no_match(self, tmp_path):
+        client, _ = self._client_for(tmp_path, [{"id": "REQ", "result": None}])
+        with patch("holo.bridge.uuid.uuid4") as uu:
+            uu.return_value.hex = "REQ"
+            assert client.find_image_path("/x/y.png") is None
+
+    def test_user_capture_returns_image_and_rect(self, tmp_path):
+        """Successful capture: base64 PNG + the screen rect the user dragged."""
+        import base64 as _b64
+
+        png = b"\x89PNG\r\n\x1a\nmade-up"
+        client, fake = self._client_for(
+            tmp_path,
+            [{
+                "id": "REQ",
+                "result": {
+                    "image": _b64.b64encode(png).decode(),
+                    "x": 100, "y": 200, "width": 24, "height": 24,
+                },
+            }],
+        )
+        with patch("holo.bridge.uuid.uuid4") as uu:
+            uu.return_value.hex = "REQ"
+            out = client.user_capture(prompt="drag a rect", timeout=30.0)
+        assert out["x"] == 100
+        assert out["width"] == 24
+        # Caller decodes base64 itself; the bridge passes through the field.
+        assert _b64.b64decode(out["image"]) == png
+        sent = fake.stdin.getvalue().decode().strip().splitlines()
+        req = json.loads(sent[1])
+        assert req["method"] == "screen.user_capture"
+        assert req["params"]["prompt"] == "drag a rect"
+        assert req["params"]["timeout"] == 30.0
+
+    def test_user_capture_surfaces_cancel(self, tmp_path):
+        """Esc / timeout from the bridge surfaces as `cancelled: True`."""
+        client, _ = self._client_for(
+            tmp_path,
+            [{"id": "REQ", "result": {"cancelled": True, "reason": "user cancelled"}}],
+        )
+        with patch("holo.bridge.uuid.uuid4") as uu:
+            uu.return_value.hex = "REQ"
+            out = client.user_capture()
+        assert out == {"cancelled": True, "reason": "user cancelled"}
+
+    def test_user_capture_omits_prompt_when_empty(self, tmp_path):
+        client, fake = self._client_for(
+            tmp_path,
+            [{"id": "REQ", "result": {"cancelled": True, "reason": "x"}}],
+        )
+        with patch("holo.bridge.uuid.uuid4") as uu:
+            uu.return_value.hex = "REQ"
+            client.user_capture()
+        req = json.loads(fake.stdin.getvalue().decode().strip().splitlines()[1])
+        assert "prompt" not in req["params"]
+
 
 class TestResourceResolution:
     def test_explicit_jar_path_must_exist(self, tmp_path):

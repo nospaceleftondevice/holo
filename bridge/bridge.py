@@ -170,6 +170,72 @@ def handle_screen_find_image(params):
         _remove_quietly(needle_path)
 
 
+def handle_screen_find_image_path(params):
+    # Same as screen.find_image, but the needle is a path on the JVM-side
+    # filesystem instead of a base64-encoded blob. Used by the template
+    # cache, which already has the PNG on disk under <root>/<app>/<name>.png
+    # and would just be re-encoding/decoding bytes for no gain.
+    path = params["path"]
+    score = float(params.get("score", 0.7))
+    target = sikuli.Screen()
+    if "region" in params and params["region"] is not None:
+        r = params["region"]
+        target = sikuli.Region(
+            int(r["x"]),
+            int(r["y"]),
+            int(r["width"]),
+            int(r["height"]),
+        )
+    try:
+        pattern = sikuli.Pattern(path).similar(score)
+        match = target.exists(pattern, 0)
+    except Exception:
+        match = None
+    if match is None:
+        return None
+    return {
+        "x": int(match.getX()),
+        "y": int(match.getY()),
+        "width": int(match.getW()),
+        "height": int(match.getH()),
+        "score": float(match.getScore()),
+    }
+
+
+def handle_screen_user_capture(params):
+    # Blocks until the user finishes a rectangle selection (or cancels
+    # with Esc). Returns the captured image as base64 PNG plus the
+    # screen-coordinate rect. {"cancelled": true} on Esc/timeout — the
+    # agent surface re-prompts rather than treating it as an error.
+    timeout = float(params.get("timeout", 60.0))
+    prompt = params.get("prompt", "")
+    region = sikuli.Screen()
+    # SikuliX's userCapture takes a prompt string and returns a
+    # ScreenImage (or None on cancel). We pass `timeout` via Settings
+    # if available; otherwise the caller's transport timeout governs.
+    try:
+        if prompt:
+            captured = region.userCapture(prompt)
+        else:
+            captured = region.userCapture()
+    except Exception as e:
+        # Some Sikuli builds throw on cancel rather than returning None.
+        # Mirror cancel semantics so the daemon doesn't see a hard error.
+        return {"cancelled": True, "reason": str(e)}
+    if captured is None:
+        return {"cancelled": True, "reason": "user cancelled"}
+    # ScreenImage exposes .getROI() (java.awt.Rectangle) and .getImage().
+    roi = captured.getROI()
+    image = captured.getImage()
+    return {
+        "image": _encode_png_b64(image),
+        "x": int(roi.x),
+        "y": int(roi.y),
+        "width": int(roi.width),
+        "height": int(roi.height),
+    }
+
+
 HANDLERS = {
     "ping": handle_ping,
     "app.activate": handle_app_activate,
@@ -178,6 +244,8 @@ HANDLERS = {
     "screen.type": handle_screen_type,
     "screen.shot": handle_screen_shot,
     "screen.find_image": handle_screen_find_image,
+    "screen.find_image_path": handle_screen_find_image_path,
+    "screen.user_capture": handle_screen_user_capture,
 }
 
 
