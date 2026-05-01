@@ -19,3 +19,22 @@ def test_cli_default(capsys):
     assert rc == 0
     captured = capsys.readouterr()
     assert "holo" in captured.out
+
+
+def test_cli_help_flag(capsys):
+    for flag in ["--help", "-h", "help"]:
+        rc = main([flag])
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "Usage:" in out
+        # A few subcommands must show up so the help is actually useful.
+        for sub in ("doctor", "demo", "mcp", "install-bookmarklet"):
+            assert sub in out
+
+
+def test_cli_unknown_command_points_at_help(capsys):
+    rc = main(["nopenope"])
+    assert rc == 2
+    err = capsys.readouterr().err
+    assert "unknown command" in err
+    assert "--help" in err
