@@ -81,6 +81,18 @@ class _StubBridge:
         self.calls.append(("type_text", {"text": text}))
         return {"typed_chars": len(text)}
 
+    def scroll(self, x, y, *, direction="down", steps=3):
+        self.calls.append(
+            ("scroll", {"x": x, "y": y, "direction": direction, "steps": steps})
+        )
+        return {
+            "scrolled": True,
+            "x": x,
+            "y": y,
+            "direction": direction,
+            "steps": steps,
+        }
+
     def screenshot(self, *, region=None, timeout=15.0):
         self.calls.append(("screenshot", {"region": region}))
         return self.next_screenshot
@@ -336,6 +348,7 @@ class TestShutdownAndBuild:
                 "screen_click",
                 "screen_type",
                 "screen_key",
+                "screen_scroll",
                 "screen_shot",
                 "screen_find_image",
                 "browser_navigate",
@@ -387,6 +400,7 @@ class TestShutdownAndBuild:
             assert {
                 "app_activate",
                 "screen_click",
+                "screen_scroll",
                 "screen_shot",
                 "browser_navigate",
                 "browser_execute_js",
@@ -474,6 +488,23 @@ class TestScreenTools:
         region = {"x": 10, "y": 20, "width": 30, "height": 40}
         server.screen_shot(region=region)
         assert bridge.calls[-1] == ("screenshot", {"region": region})
+
+    def test_screen_scroll_defaults_to_down_three_steps(self, server_with_bridge):
+        server, bridge = server_with_bridge
+        out = server.screen_scroll(100, 200)
+        assert out["scrolled"] is True
+        assert bridge.calls[-1] == (
+            "scroll",
+            {"x": 100, "y": 200, "direction": "down", "steps": 3},
+        )
+
+    def test_screen_scroll_passes_explicit_args(self, server_with_bridge):
+        server, bridge = server_with_bridge
+        server.screen_scroll(50, 60, direction="up", steps=10)
+        assert bridge.calls[-1] == (
+            "scroll",
+            {"x": 50, "y": 60, "direction": "up", "steps": 10},
+        )
 
     def test_screen_find_image_decodes_needle(self, server_with_bridge):
         import base64

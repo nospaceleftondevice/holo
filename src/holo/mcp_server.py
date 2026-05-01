@@ -181,6 +181,18 @@ class HoloMCPServer:
         """Send a key combo, e.g. 'cmd+v', 'enter', 'shift+tab'."""
         return self._require_bridge().key(combo)
 
+    def screen_scroll(
+        self,
+        x: int,
+        y: int,
+        direction: str = "down",
+        steps: int = 3,
+    ) -> dict[str, Any]:
+        """Move to (x, y) and emit `steps` mouse-wheel events."""
+        return self._require_bridge().scroll(
+            x, y, direction=direction, steps=steps
+        )
+
     def screen_shot(
         self, region: dict[str, int] | None = None
     ) -> dict[str, Any]:
@@ -590,6 +602,19 @@ def build_server(
     )
     def screen_key(combo: str) -> dict[str, Any]:
         return holo.screen_key(combo)
+
+    @mcp.tool(
+        description=(
+            "Move to screen coordinates (x, y) and emit `steps` "
+            "mouse-wheel events in `direction` ('up' or 'down', "
+            "default 'down'). Use this when keyboard scroll won't "
+            "work — e.g. a sidebar that doesn't have keyboard focus."
+        )
+    )
+    def screen_scroll(
+        x: int, y: int, direction: str = "down", steps: int = 3
+    ) -> dict[str, Any]:
+        return holo.screen_scroll(x, y, direction=direction, steps=steps)
 
     @mcp.tool(
         description=(

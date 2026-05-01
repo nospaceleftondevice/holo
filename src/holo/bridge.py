@@ -248,6 +248,31 @@ class BridgeClient:
         # Avoid clashing with the `type` builtin in callers' namespaces.
         return self.request("screen.type", {"text": text})
 
+    def scroll(
+        self,
+        x: float,
+        y: float,
+        *,
+        direction: str = "down",
+        steps: int = 3,
+    ) -> dict[str, Any]:
+        """Move to (x, y) and emit `steps` mouse-wheel events.
+
+        `direction` is "up" or "down". Each step is one wheel "click"
+        — exact pixel delta is OS / app-defined. Scroll-by-wheel
+        works in apps that don't accept keyboard scroll (panel that
+        doesn't have keyboard focus).
+        """
+        return self.request(
+            "screen.scroll",
+            {
+                "x": int(x),
+                "y": int(y),
+                "direction": direction,
+                "steps": int(steps),
+            },
+        )
+
     def screenshot(
         self,
         *,

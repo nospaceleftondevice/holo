@@ -236,6 +236,31 @@ def handle_screen_user_capture(params):
     }
 
 
+def handle_screen_scroll(params):
+    # Move the mouse to (x, y) and emit `steps` wheel events in the
+    # given direction. SikuliX's module-level `wheel(target, dir, steps)`
+    # handles the move-and-emit in one call. Direction maps: "down" = 1,
+    # "up" = -1 (matches SikuliX's WHEEL_DOWN / WHEEL_UP constants).
+    x = int(params["x"])
+    y = int(params["y"])
+    direction = params.get("direction", "down")
+    steps = int(params.get("steps", 3))
+    if direction == "down":
+        d = 1
+    elif direction == "up":
+        d = -1
+    else:
+        raise ValueError("direction must be 'up' or 'down'")
+    sikuli.wheel(Location(x, y), d, steps)
+    return {
+        "scrolled": True,
+        "x": x,
+        "y": y,
+        "direction": direction,
+        "steps": steps,
+    }
+
+
 HANDLERS = {
     "ping": handle_ping,
     "app.activate": handle_app_activate,
@@ -246,6 +271,7 @@ HANDLERS = {
     "screen.find_image": handle_screen_find_image,
     "screen.find_image_path": handle_screen_find_image_path,
     "screen.user_capture": handle_screen_user_capture,
+    "screen.scroll": handle_screen_scroll,
 }
 
 
