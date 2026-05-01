@@ -289,6 +289,54 @@ class HoloMCPServer:
         except (browser_chrome.BrowserError, browser_chrome.BrowserNotAvailable) as e:
             raise RuntimeError(str(e)) from e
 
+    def browser_execute_js(self, js: str) -> dict[str, Any]:
+        """Run a JS expression in Chrome's active tab via AppleScript.
+
+        Requires Chrome's 'Allow JavaScript from Apple Events' toggle
+        (View → Developer). When that's off, raises a runtime error
+        whose message tells the caller exactly how to enable it OR to
+        fall back to `bookmarklet_query` against a calibrated channel.
+        """
+        from holo import browser_chrome
+
+        try:
+            return browser_chrome.execute_js(js)
+        except browser_chrome.JavaScriptNotAuthorized as e:
+            # Specific message; the agent can read this and route to
+            # `bookmarklet_query` if a channel is available.
+            raise RuntimeError(str(e)) from e
+        except (browser_chrome.BrowserError, browser_chrome.BrowserNotAvailable) as e:
+            raise RuntimeError(str(e)) from e
+
+    def bookmarklet_query(
+        self,
+        sid: str,
+        selector: str,
+        prop: str = "innerText",
+        attr: str | None = None,
+        all: bool = False,
+        timeout: float = 5.0,
+    ) -> dict[str, Any]:
+        """DOM query through the bookmarklet channel — CSP-safe
+        fallback when `browser_execute_js` is unavailable.
+
+        - `selector` is a CSS selector
+        - `prop` is the JS property to read (default 'innerText'); ignored when `attr` is set
+        - `attr` is an HTML attribute name; takes precedence over `prop`
+        - `all=True` returns a list of matches; default returns the first match
+        """
+        if not selector:
+            raise ValueError("selector must be non-empty")
+        cmd: dict[str, Any] = {
+            "op": "query_selector_all" if all else "query_selector",
+            "selector": selector,
+        }
+        if attr is not None:
+            cmd["attr"] = attr
+        else:
+            cmd["prop"] = prop
+        return self.send_command(sid, cmd, timeout=timeout)
+
 
 def _transport(ch: Channel) -> str:
     return "ws" if ch._ws_ready else "qr"
@@ -467,6 +515,42 @@ def build_server(
     @mcp.tool(description="Navigate forward in Chrome's active tab history.")
     def browser_forward() -> dict[str, Any]:
         return holo.browser_forward()
+
+    @mcp.tool(
+        description=(
+            "Run a JS expression in Chrome's active tab via AppleScript "
+            "and return its stringified result. Use this for arbitrary "
+            "DOM queries (`document.querySelector('button')?.innerText`, "
+            "`JSON.stringify(...)`, etc). "
+            "Requires Chrome's 'Allow JavaScript from Apple Events' "
+            "toggle (View → Developer); if disabled, the error message "
+            "will say so — fall back to `bookmarklet_query` against a "
+            "calibrated channel for CSP-safe DOM access."
+        )
+    )
+    def browser_execute_js(js: str) -> dict[str, Any]:
+        return holo.browser_execute_js(js)
+
+    @mcp.tool(
+        description=(
+            "DOM query through the bookmarklet channel — CSP-safe "
+            "fallback for `browser_execute_js`. Reads `selector` and "
+            "returns the named property (default 'innerText') or "
+            "attribute. Pass `all=true` for a list of matches. "
+            "Requires a calibrated `sid`."
+        )
+    )
+    def bookmarklet_query(
+        sid: str,
+        selector: str,
+        prop: str = "innerText",
+        attr: str | None = None,
+        all: bool = False,
+        timeout: float = 5.0,
+    ) -> dict[str, Any]:
+        return holo.bookmarklet_query(
+            sid, selector, prop=prop, attr=attr, all=all, timeout=timeout
+        )
 
     return mcp, holo
 

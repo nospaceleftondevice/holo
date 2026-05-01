@@ -83,6 +83,153 @@ describe("dispatch: read_global", () => {
   });
 });
 
+describe("dispatch: query_selector", () => {
+  // Minimal DOM stub that mirrors what dispatch needs: a doc with
+  // querySelector / querySelectorAll returning element-shaped objects.
+  function makeDoc(elements) {
+    return {
+      querySelector(sel) {
+        return elements.find((e) => e.__sel === sel) ?? null;
+      },
+      querySelectorAll(sel) {
+        return elements.filter((e) => e.__sel === sel);
+      },
+    };
+  }
+
+  it("returns innerText by default for the first match", () => {
+    const env = {
+      document: makeDoc([
+        { __sel: "button", innerText: "Click me" },
+        { __sel: "button", innerText: "Cancel" },
+      ]),
+    };
+    assert.deepEqual(
+      dispatch({ op: "query_selector", selector: "button" }, env),
+      { value: "Click me" }
+    );
+  });
+
+  it("returns null when nothing matches", () => {
+    const env = { document: makeDoc([]) };
+    assert.deepEqual(
+      dispatch({ op: "query_selector", selector: ".missing" }, env),
+      { value: null }
+    );
+  });
+
+  it("reads a custom property via `prop`", () => {
+    const env = {
+      document: makeDoc([{ __sel: "h1", innerHTML: "<em>Hi</em>" }]),
+    };
+    assert.deepEqual(
+      dispatch({ op: "query_selector", selector: "h1", prop: "innerHTML" }, env),
+      { value: "<em>Hi</em>" }
+    );
+  });
+
+  it("reads an HTML attribute via `attr` (takes precedence over prop)", () => {
+    const env = {
+      document: makeDoc([
+        {
+          __sel: "a.cta",
+          innerText: "go",
+          getAttribute(name) { return name === "href" ? "https://x/" : null; },
+        },
+      ]),
+    };
+    assert.deepEqual(
+      dispatch(
+        { op: "query_selector", selector: "a.cta", attr: "href", prop: "innerText" },
+        env
+      ),
+      { value: "https://x/" }
+    );
+  });
+
+  it("stringifies non-serializable values", () => {
+    const env = {
+      document: makeDoc([
+        { __sel: "div", weird: { toString() { return "stringified"; } } },
+      ]),
+    };
+    assert.deepEqual(
+      dispatch({ op: "query_selector", selector: "div", prop: "weird" }, env),
+      { value: "stringified" }
+    );
+  });
+
+  it("preserves falsy primitive values", () => {
+    const env = {
+      document: makeDoc([{ __sel: "input", value: "", checked: false }]),
+    };
+    assert.deepEqual(
+      dispatch({ op: "query_selector", selector: "input", prop: "value" }, env),
+      { value: "" }
+    );
+    assert.deepEqual(
+      dispatch({ op: "query_selector", selector: "input", prop: "checked" }, env),
+      { value: false }
+    );
+  });
+
+  it("rejects empty or non-string selector", () => {
+    assert.throws(
+      () => dispatch({ op: "query_selector", selector: "" }, { document: makeDoc([]) }),
+      { name: "DispatchError", code: "bad_arg" }
+    );
+    assert.throws(
+      () => dispatch({ op: "query_selector", selector: 5 }, { document: makeDoc([]) }),
+      { name: "DispatchError", code: "bad_arg" }
+    );
+  });
+});
+
+describe("dispatch: query_selector_all", () => {
+  function makeDoc(elements) {
+    return {
+      querySelectorAll(sel) {
+        return elements.filter((e) => e.__sel === sel);
+      },
+    };
+  }
+
+  it("returns a list of innerText for all matches", () => {
+    const env = {
+      document: makeDoc([
+        { __sel: "button", innerText: "OK" },
+        { __sel: "button", innerText: "Cancel" },
+        { __sel: "button", innerText: "Help" },
+      ]),
+    };
+    assert.deepEqual(
+      dispatch({ op: "query_selector_all", selector: "button" }, env),
+      { value: ["OK", "Cancel", "Help"], count: 3 }
+    );
+  });
+
+  it("returns empty list (not null) when nothing matches", () => {
+    const env = { document: makeDoc([]) };
+    assert.deepEqual(
+      dispatch({ op: "query_selector_all", selector: ".x" }, env),
+      { value: [], count: 0 }
+    );
+  });
+
+  it("reads an attribute across all matches", () => {
+    const env = {
+      document: makeDoc([
+        { __sel: "a", getAttribute: (n) => (n === "href" ? "/a" : null) },
+        { __sel: "a", getAttribute: (n) => (n === "href" ? "/b" : null) },
+      ]),
+    };
+    assert.deepEqual(
+      dispatch({ op: "query_selector_all", selector: "a", attr: "href" }, env),
+      { value: ["/a", "/b"], count: 2 }
+    );
+  });
+});
+
 describe("readPath", () => {
   it("returns root when path is empty after split", () => {
     // path.split(".") on "" gives [""], which then misses on root.

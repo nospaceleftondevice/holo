@@ -49,7 +49,48 @@ const HANDLERS = {
     const root = env.window ?? globalThis.window ?? globalThis;
     return { value: readPath(root, cmd.path) };
   },
+
+  // Structured DOM query — CSP-safe, doesn't cross the eval boundary.
+  // Reads either an element property (default 'innerText') or an HTML
+  // attribute (when `attr` is provided).
+  query_selector(cmd, env) {
+    const doc = env.document ?? globalThis.document;
+    if (!doc) throw new DispatchError("no document in this environment", "bad_env");
+    if (typeof cmd.selector !== "string" || cmd.selector === "") {
+      throw new DispatchError("query_selector requires a non-empty `selector`", "bad_arg");
+    }
+    const el = doc.querySelector(cmd.selector);
+    if (!el) return { value: null };
+    return { value: pickField(el, cmd) };
+  },
+
+  query_selector_all(cmd, env) {
+    const doc = env.document ?? globalThis.document;
+    if (!doc) throw new DispatchError("no document in this environment", "bad_env");
+    if (typeof cmd.selector !== "string" || cmd.selector === "") {
+      throw new DispatchError("query_selector_all requires a non-empty `selector`", "bad_arg");
+    }
+    const list = Array.from(doc.querySelectorAll(cmd.selector));
+    return { value: list.map((el) => pickField(el, cmd)), count: list.length };
+  },
 };
+
+function pickField(el, cmd) {
+  if (typeof cmd.attr === "string" && cmd.attr !== "") {
+    return el.getAttribute(cmd.attr);
+  }
+  const prop = typeof cmd.prop === "string" && cmd.prop !== "" ? cmd.prop : "innerText";
+  // Keep results JSON-serializable. DOMRect, NodeLists, event handlers,
+  // etc. would break the framing layer.
+  const v = el[prop];
+  if (v === null || v === undefined) return v;
+  const t = typeof v;
+  if (t === "string" || t === "number" || t === "boolean") return v;
+  // Fall back to text for complex values; agents who want structured
+  // data should use `browser_execute_js` with explicit JSON.stringify
+  // instead.
+  return String(v);
+}
 
 // Walks a dotted path against an object root. `cur?.[part]` would skip
 // over present-but-falsy values (0, ""), so we explicitly check for

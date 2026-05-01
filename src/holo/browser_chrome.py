@@ -46,6 +46,13 @@ class BrowserNotAvailable(RuntimeError):
     (non-macOS, or osascript missing)."""
 
 
+class JavaScriptNotAuthorized(BrowserError):
+    """Raised when Chrome's "Allow JavaScript from Apple Events" toggle
+    is OFF and `browser_execute_js` is called. Distinct from generic
+    BrowserError so callers can route to a bookmarklet fallback when
+    a calibrated channel is available."""
+
+
 def _require_macos() -> None:
     if sys.platform != "darwin":
         raise BrowserNotAvailable(
@@ -74,10 +81,36 @@ def _run_applescript(script: str, *, timeout: float = OSASCRIPT_TIMEOUT_S) -> st
         ) from e
     if proc.returncode != 0:
         # osascript writes errors to stderr, prefixed with "execution
-        # error:" or similar. Surface verbatim.
+        # error:" or similar. Surface verbatim, but distinguish the
+        # specific "JS from Apple Events not authorized" case so
+        # callers can fall back to the bookmarklet channel.
         msg = proc.stderr.strip() or proc.stdout.strip() or "(no output)"
+        if _is_js_not_authorized(msg):
+            raise JavaScriptNotAuthorized(
+                "Chrome's 'Allow JavaScript from Apple Events' is off. "
+                "Enable it in Chrome → View → Developer → "
+                "'Allow JavaScript from Apple Events', then retry. "
+                "Original error: " + msg
+            )
         raise BrowserError(f"osascript exit {proc.returncode}: {msg}")
     return proc.stdout.rstrip("\n")
+
+
+def _is_js_not_authorized(stderr: str) -> bool:
+    """Detect the specific Chrome error when the AppleScript-execute-JS
+    toggle is off. Chrome's exact wording across versions:
+
+      - "Executing JavaScript through AppleScript is turned off."
+      - "Allow JavaScript from Apple Events"
+      - errAEEventNotPermitted (-1743)
+    """
+    s = stderr.lower()
+    return (
+        "executing javascript through applescript is turned off" in s
+        or "allow javascript from apple events" in s
+        or "javascript through apple events" in s
+        or "-1743" in s  # errAEEventNotPermitted
+    )
 
 
 # ---- script builders -----------------------------------------------
@@ -143,6 +176,19 @@ def _history_script(direction: str) -> str:
     return (
         f'tell application "{APP_NAME}"\n'
         f"  tell active tab of front window to {direction}\n"
+        "end tell"
+    )
+
+
+def _execute_js_script(js: str) -> str:
+    """Wrap a JS expression for Chrome's `execute javascript` AppleScript
+    command. The expression must be a single value-producing JS
+    expression (or an IIFE that returns one); Chrome serializes
+    primitives as their text form. For structured data, wrap in
+    `JSON.stringify(...)` on the caller's side."""
+    return (
+        f'tell application "{APP_NAME}"\n'
+        f'  return execute active tab of front window javascript "{_escape(js)}"\n'
         "end tell"
     )
 
@@ -229,6 +275,23 @@ def go_back() -> dict[str, Any]:
 def go_forward() -> dict[str, Any]:
     _run_applescript(_history_script("go forward"))
     return {"direction": "forward"}
+
+
+def execute_js(js: str) -> dict[str, Any]:
+    """Run a JS expression in Chrome's active tab via AppleScript and
+    return its result. Requires Chrome's "Allow JavaScript from Apple
+    Events" toggle (View → Developer); raises `JavaScriptNotAuthorized`
+    if it's off so callers can fall back to the bookmarklet channel.
+
+    The result is whatever Chrome's stringification of the JS value
+    produces — primitives come back as their text form, objects as
+    `[object Object]` (so callers should `JSON.stringify` themselves
+    if they want structured data).
+    """
+    if not js:
+        raise BrowserError("js expression must be non-empty")
+    raw = _run_applescript(_execute_js_script(js))
+    return {"result": raw}
 
 
 def list_tabs() -> dict[str, Any]:

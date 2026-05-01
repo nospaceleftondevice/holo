@@ -337,6 +337,8 @@ class TestShutdownAndBuild:
                 "browser_reload",
                 "browser_back",
                 "browser_forward",
+                "browser_execute_js",
+                "bookmarklet_query",
             }
         finally:
             holo.shutdown()
@@ -513,3 +515,86 @@ class TestBrowserTools:
             act.return_value = {"index": 4}
             assert server.browser_activate_tab(4) == {"index": 4}
             act.assert_called_once_with(4)
+
+    def test_browser_execute_js_delegates(self):
+        from unittest.mock import patch
+
+        server = self._server_no_daemon()
+        with patch("holo.browser_chrome.execute_js") as exec_js:
+            exec_js.return_value = {"result": "Click me"}
+            out = server.browser_execute_js(
+                "document.querySelector('button')?.innerText"
+            )
+        assert out == {"result": "Click me"}
+        exec_js.assert_called_once_with(
+            "document.querySelector('button')?.innerText"
+        )
+
+    def test_browser_execute_js_surfaces_authorization_message(self):
+        """When Chrome's JS-from-AppleEvents is off, the agent should
+        see a message that names the menu item AND points at
+        bookmarklet_query as the fallback."""
+        from unittest.mock import patch
+
+        from holo.browser_chrome import JavaScriptNotAuthorized
+
+        server = self._server_no_daemon()
+        with patch(
+            "holo.browser_chrome.execute_js",
+            side_effect=JavaScriptNotAuthorized(
+                "Chrome's 'Allow JavaScript from Apple Events' is off..."
+            ),
+        ):
+            with pytest.raises(RuntimeError, match="Allow JavaScript from Apple Events"):
+                server.browser_execute_js("document.title")
+
+
+class TestBookmarkletQuery:
+    """`bookmarklet_query` rides on the existing channel send_command
+    path — we just verify it builds the right command shape."""
+
+    @pytest.fixture
+    def server_with_channel(self):
+        server = HoloMCPServer()
+        fake = _FakeDaemon()
+        server._daemon = fake
+        ch = _StubChannel("sid-A", replies=[{"value": "Click me"}])
+        fake.registry.register("sid-A", ch)
+        return server, ch
+
+    def test_default_uses_query_selector_and_innerText(self, server_with_channel):
+        server, ch = server_with_channel
+        out = server.bookmarklet_query("sid-A", "button")
+        assert out["result"] == {"value": "Click me"}
+        cmd, _timeout = ch.calls[-1]
+        assert cmd == {"op": "query_selector", "selector": "button", "prop": "innerText"}
+
+    def test_all_flag_switches_to_query_selector_all(self, server_with_channel):
+        server, ch = server_with_channel
+        # The stub returns the canned reply regardless of op.
+        server.bookmarklet_query("sid-A", "button", all=True)
+        cmd, _ = ch.calls[-1]
+        assert cmd["op"] == "query_selector_all"
+
+    def test_attr_takes_precedence_over_prop(self, server_with_channel):
+        server, ch = server_with_channel
+        server.bookmarklet_query("sid-A", "a", prop="innerText", attr="href")
+        cmd, _ = ch.calls[-1]
+        assert "attr" in cmd and cmd["attr"] == "href"
+        assert "prop" not in cmd
+
+    def test_custom_prop(self, server_with_channel):
+        server, ch = server_with_channel
+        server.bookmarklet_query("sid-A", "h1", prop="innerHTML")
+        cmd, _ = ch.calls[-1]
+        assert cmd["prop"] == "innerHTML"
+
+    def test_rejects_empty_selector(self, server_with_channel):
+        server, _ = server_with_channel
+        with pytest.raises(ValueError, match="selector"):
+            server.bookmarklet_query("sid-A", "")
+
+    def test_unknown_sid_raises(self, server_with_channel):
+        server, _ = server_with_channel
+        with pytest.raises(ValueError, match="no channel"):
+            server.bookmarklet_query("nope", "button")
