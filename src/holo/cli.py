@@ -530,19 +530,42 @@ COMMANDS = {
 }
 
 
+def _print_help() -> None:
+    print(f"""holo {__version__} — browser + screen automation for AI agents
+
+Usage: holo <command> [options]
+
+Commands:
+  doctor                  check macOS permissions / runtime environment
+  demo [--manual] [--hide-qr] [--bridge]
+                          end-to-end smoke test against the in-page agent
+  mcp [--listen PORT] [--hide-qr] [--bridge]
+                          run the MCP server over stdio (or TCP with --listen)
+  connect HOST:PORT       stdio↔TCP bridge to a listening `holo mcp`
+  mcp-remote -- CMD ...   spawn-per-connection stdio proxy
+  windows                 print visible windows (smoke for windows reader)
+  bridge <verb>           smoke-test the SikuliX bridge directly
+  install-bridge          pre-download the SikuliX jar into the user cache
+  install-bookmarklet     download the bookmarklet page and open it
+
+Options:
+  -h, --help              show this help and exit
+  -V, --version           print version and exit
+
+Quick start: `holo install-bookmarklet` to install the bookmarklet, then
+`holo mcp` to run the MCP server.""")
+
+
 def main(argv: list[str] | None = None) -> int:
     args = argv if argv is not None else sys.argv[1:]
     if not args:
-        print(
-            f"holo {__version__} — try `holo --version`, `holo windows`, "
-            "`holo doctor`, `holo demo`, `holo focus`, `holo mcp`, "
-            "`holo mcp --listen PORT`, `holo connect HOST:PORT`, "
-            "`holo mcp-remote`, `holo bridge`, `holo install-bridge`, "
-            "or `holo install-bookmarklet`"
-        )
+        _print_help()
         return 0
     cmd = args[0]
     rest = args[1:]
+    if cmd in {"-h", "--help", "help"}:
+        _print_help()
+        return 0
     if cmd in {"-V", "--version"}:
         print(__version__)
         return 0
@@ -586,7 +609,9 @@ def main(argv: list[str] | None = None) -> int:
         return _cmd_install_bookmarklet(rest)
     if cmd in COMMANDS:
         return COMMANDS[cmd]()
-    print(f"holo: unknown command {cmd!r}", file=sys.stderr)
+    print(
+        f"holo: unknown command {cmd!r} (try `holo --help`)", file=sys.stderr
+    )
     return 2
 
 
