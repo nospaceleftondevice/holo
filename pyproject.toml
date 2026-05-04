@@ -32,6 +32,12 @@ dependencies = [
   # uses CA paths from the build runner that don't exist on the user's
   # machine, so `urllib` against GitHub Releases fails on first run.
   "certifi>=2024.2.2",
+  # Pure-Python mDNS / DNS-SD; speaks the multicast protocol directly so
+  # neither Avahi nor Bonjour need to be installed on Linux/Windows.
+  # Used by `holo mcp --announce` to broadcast session metadata to the
+  # companion desktop app. LGPL 2.1+ — bundled binaries should ship a
+  # NOTICE entry and the library source must remain replaceable.
+  "zeroconf>=0.131",
 ]
 
 [project.optional-dependencies]

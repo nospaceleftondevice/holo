@@ -82,6 +82,9 @@ Two flags tailor the surface:
 - `--screen` (kwarg `enable_screen`) — registers SikuliX-backed tools (`screen_*`, `app_activate`, `ui_template_*`). Off by default; opt-in keeps the JVM cost off the table for browser-only agents.
 - `--no-bookmarklet` (kwarg `no_bookmarklet`) — skips the WSServer entirely and drops the seven channel-dependent tool registrations (`calibrate`, `list_channels`, `drop_channel`, `ping`, `read_global`, `send_command`, `bookmarklet_query`). Suits agents that never touch the bookmarklet (Slack-only orchestrator, AppleScript-only nav). `Daemon.calibrate()` raises in this mode; channel methods on `HoloMCPServer` still exist defensively but the tools aren't exposed.
 
+Plus a separate orthogonal capability:
+- `--announce` (kwargs `announce`, `announce_session`, `announce_user`, `announce_ssh_user`) — broadcasts an mDNS service record (`_holo-session._tcp.local.`) so a companion desktop app on the same LAN can discover live sessions. See **Session announcement** below.
+
 Internal naming kept as-is: `BridgeClient`, `daemon.bridge`, `_require_bridge` describe the JVM bridge implementation accurately. Only the user-facing flag (`--bridge` → `--screen`), the matching kwarg (`use_bridge` → `enable_screen`), and two CLI subcommands (`holo bridge` → `holo screen`, `holo install-bridge` → `holo install-screen`) were renamed.
 
 Two transports:
@@ -101,6 +104,39 @@ Both transports must keep stdout clean — diagnostics go to stderr only.
 For arbitrary DOM reads, prefer `browser_execute_js` (AppleScript) — it has no CSP constraint because it runs on Chrome's main world via Apple Events, not via a script the page can block. It needs Chrome → View → Developer → **Allow JavaScript from Apple Events** turned on; when that toggle is off, `JavaScriptNotAuthorized` surfaces a message naming the menu item and points the agent at `bookmarklet_query` (`query_selector` / `query_selector_all` ops in `bookmarklet/dispatch.js`) as the CSP-safe fallback. The bookmarklet path stays useful even when the AppleScript path is available — it doesn't need the toggle and works on any tab where the bookmarklet is calibrated.
 
 macOS-only. Linux/Windows browser ops will land via the Phase 3 CDP adapter — Chrome 136+ blocks `--remote-debugging-port` on the default profile, so CDP requires a profile-switching dance that defeats holo's auth-piggyback pitch on macOS, but it's the right path for non-macOS.
+
+## Session announcement (mDNS / DNS-SD)
+
+`src/holo/announce.py` broadcasts a `_holo-session._tcp.local.` service record so a companion desktop app on the same LAN can discover live holo sessions and build "droid" connections (SSH + tmux attach) to reach them. **No authentication material is broadcast** — credentials live in the user's SSH config / agent. The TXT record carries only metadata.
+
+Implementation: `python-zeroconf` (LGPL 2.1+, pure-Python). It speaks the multicast protocol directly via raw sockets — Avahi (Linux) and Bonjour (Windows) are NOT required. Cross-platform out of the box.
+
+TXT schema (v=1):
+| Field | Always? | Source |
+|---|---|---|
+| `v` | yes | constant `1` (schema version) |
+| `host` | yes | `socket.gethostname()` |
+| `user` | yes | `--announce-user` flag, else `getpass.getuser()` |
+| `holo_pid` | yes | `os.getpid()` |
+| `holo_version` | yes | `holo.__version__` |
+| `started` | yes | unix epoch at startup |
+| `cwd` | yes | `os.getcwd()` |
+| `session` | optional | `--announce-session` only |
+| `ssh_user` | optional | `--announce-ssh-user` only |
+| `tmux_session` / `tmux_window` | when in tmux | `tmux display-message -p '#S' / '#W'` |
+
+**Omit-when-not-specified rule.** If a flag isn't passed, the field is omitted entirely (not emitted as empty). The desktop UI distinguishes "unset" from "set to empty" this way.
+
+`HoloAnnouncer` is constructed by `HoloMCPServer.__init__` when `announce=True` and stopped in `shutdown()`. Failures during `start()` (no network, multicast disabled, etc.) are logged to stderr and the server continues without broadcasting — announce is best-effort, not load-bearing.
+
+Smoke verification on macOS:
+```bash
+holo mcp --announce --announce-session test --no-bookmarklet &
+dns-sd -B _holo-session._tcp local
+dns-sd -L <instance> _holo-session._tcp local   # full TXT dump
+```
+
+The advertised SRV port is `0` in stdio mode and the `--listen` port in TCP mode. The desktop companion uses TXT data + SSH config for the actual connection — the SRV port is metadata, not an endpoint to dial directly.
 
 ## UI template cache (desktop DOM analog)
 

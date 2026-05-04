@@ -124,7 +124,8 @@ on whichever page should be driven), then issues commands by sid. Tools:
 
 ### Tailoring the tool surface per agent
 
-Two flags shape what `holo mcp` exposes:
+Two flags shape what `holo mcp` exposes (a third — `--announce` —
+adds an orthogonal mDNS broadcast; see below):
 
 - `--screen` — register `screen_*`, `app_activate`, and `ui_template_*`.
   Brings up a SikuliX JVM (~200 MB; needs OpenJDK 11+). Off by default
@@ -149,6 +150,39 @@ Two independent CLI agents on the same host can run their own daemons
 in parallel — each `holo mcp` is a self-contained process. Set
 `HOLO_TEMPLATE_DIR` per project if both will capture templates, so
 their cache indexes don't race.
+
+### Session announcement (mDNS)
+
+`holo mcp --announce` broadcasts an mDNS service record
+(`_holo-session._tcp.local.`) carrying session metadata so a
+companion desktop app on the same LAN can discover the session and
+build a connection (SSH + tmux attach) to reach it. **No
+authentication material is broadcast** — credentials live in your
+SSH config / agent.
+
+```bash
+holo mcp --announce \
+  --announce-session "claude-1" \
+  --announce-user "$USER" \
+  --announce-ssh-user "balexand"
+```
+
+| Flag | Purpose |
+| --- | --- |
+| `--announce` | Enable broadcast |
+| `--announce-session NAME` | Logical session id (omitted if not set) |
+| `--announce-user NAME` | Display label (default: current user) |
+| `--announce-ssh-user NAME` | SSH login user (omitted if not set) |
+
+If `$TMUX` is set, tmux session and window names are auto-detected
+and added to the TXT record so the companion can `tmux attach -t`.
+Cross-platform — works on macOS, Linux, and Windows without Avahi
+or Bonjour installed (uses pure-Python `python-zeroconf`).
+
+Verify the broadcast on macOS:
+```bash
+dns-sd -B _holo-session._tcp local
+```
 
 ## License
 

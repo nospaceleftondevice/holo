@@ -17,6 +17,7 @@ Subcommands:
 from __future__ import annotations
 
 import sys
+from typing import Any
 
 from holo import __version__
 
@@ -284,6 +285,11 @@ def _cmd_mcp(
     enable_screen: bool = False,
     no_bookmarklet: bool = False,
     listen_port: int | None = None,
+    announce: bool = False,
+    announce_session: str | None = None,
+    announce_user: str | None = None,
+    announce_ssh_user: str | None = None,
+    announce_ips: list[str] | None = None,
 ) -> int:
     """Run the MCP server.
 
@@ -302,6 +308,14 @@ def _cmd_mcp(
     this for agents that only drive screen / template / AppleScript
     tools — e.g. a Slack-only orchestrator.
 
+    With `--announce`, broadcasts an mDNS service record so a
+    companion desktop app on the same LAN can discover this session.
+    Optional metadata: `--announce-session NAME` (logical session
+    id), `--announce-user NAME` (display label, defaults to $USER),
+    `--announce-ssh-user NAME` (SSH login user, omitted if not set),
+    `--announce-ip A,B,C` (comma-separated IPv4 override; default
+    is to enumerate every non-loopback interface).
+
     Either way we print only to stderr — stdout carries protocol.
     """
     from holo import mcp_server
@@ -314,7 +328,25 @@ def _cmd_mcp(
             lines.append("Screen tools: SikuliX bridge enabled")
         if no_bookmarklet:
             lines.append("Bookmarklet channel: disabled (--no-bookmarklet)")
+        if announce:
+            label_bits = []
+            if announce_session:
+                label_bits.append(f"session={announce_session}")
+            if announce_user:
+                label_bits.append(f"user={announce_user}")
+            if announce_ips:
+                label_bits.append(f"ips={','.join(announce_ips)}")
+            label = " ".join(label_bits) if label_bits else "(defaults)"
+            lines.append(f"mDNS announce: enabled — {label}")
         return lines
+
+    announce_kwargs: dict[str, Any] = {
+        "announce": announce,
+        "announce_session": announce_session,
+        "announce_user": announce_user,
+        "announce_ssh_user": announce_ssh_user,
+        "announce_ips": announce_ips,
+    }
 
     if listen_port is not None:
         print(
@@ -329,6 +361,7 @@ def _cmd_mcp(
             hide_qr=hide_qr,
             enable_screen=enable_screen,
             no_bookmarklet=no_bookmarklet,
+            **announce_kwargs,
         )
         return 0
 
@@ -339,6 +372,7 @@ def _cmd_mcp(
         hide_qr=hide_qr,
         enable_screen=enable_screen,
         no_bookmarklet=no_bookmarklet,
+        **announce_kwargs,
     )
     return 0
 
@@ -561,9 +595,16 @@ Commands:
   demo [--manual] [--hide-qr] [--screen]
                           end-to-end smoke test against the in-page agent
   mcp [--listen PORT] [--hide-qr] [--screen] [--no-bookmarklet]
+      [--announce] [--announce-session NAME] [--announce-user NAME]
+      [--announce-ssh-user NAME] [--announce-ip A,B,C]
                           run the MCP server over stdio (or TCP with --listen)
                           --screen          enable screen / template / app_activate tools
                           --no-bookmarklet  drop channel tools; no WS server
+                          --announce        broadcast session via mDNS
+                          --announce-session NAME    logical session id
+                          --announce-user NAME       display label (default: $USER)
+                          --announce-ssh-user NAME   SSH login user
+                          --announce-ip A,B,C        comma-separated IPv4 override
   connect HOST:PORT       stdio↔TCP bridge to a listening `holo mcp`
   mcp-remote -- CMD ...   spawn-per-connection stdio proxy
   windows                 print visible windows (smoke for windows reader)
@@ -577,6 +618,28 @@ Options:
 
 Quick start: `holo install-bookmarklet` to install the bookmarklet, then
 `holo mcp` to run the MCP server.""")
+
+
+_MISSING_ARG = object()
+
+
+def _value_flag(rest: list[str], flag: str) -> str | None | object:
+    """Read a `--flag VALUE` pair from `rest`.
+
+    Returns:
+        - ``None`` if the flag is absent
+        - ``_MISSING_ARG`` if the flag is present but lacks a value
+        - the string value otherwise
+    """
+    if flag not in rest:
+        return None
+    i = rest.index(flag)
+    if i + 1 >= len(rest):
+        return _MISSING_ARG
+    value = rest[i + 1]
+    if value.startswith("--"):
+        return _MISSING_ARG
+    return value
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -617,11 +680,57 @@ def main(argv: list[str] | None = None) -> int:
                     f"holo mcp: --listen port {listen_port} out of range\n"
                 )
                 return 2
+
+        announce_session = _value_flag(rest, "--announce-session")
+        announce_user = _value_flag(rest, "--announce-user")
+        announce_ssh_user = _value_flag(rest, "--announce-ssh-user")
+        announce_ip_raw = _value_flag(rest, "--announce-ip")
+        announce = "--announce" in rest
+        if not announce and (
+            announce_session is not None
+            or announce_user is not None
+            or announce_ssh_user is not None
+            or announce_ip_raw is not None
+        ):
+            sys.stderr.write(
+                "holo mcp: --announce-session/--announce-user/"
+                "--announce-ssh-user/--announce-ip require --announce\n"
+            )
+            return 2
+        if announce_session is _MISSING_ARG:
+            sys.stderr.write("holo mcp: --announce-session requires a value\n")
+            return 2
+        if announce_user is _MISSING_ARG:
+            sys.stderr.write("holo mcp: --announce-user requires a value\n")
+            return 2
+        if announce_ssh_user is _MISSING_ARG:
+            sys.stderr.write("holo mcp: --announce-ssh-user requires a value\n")
+            return 2
+        if announce_ip_raw is _MISSING_ARG:
+            sys.stderr.write("holo mcp: --announce-ip requires a value\n")
+            return 2
+
+        announce_ips: list[str] | None = None
+        if isinstance(announce_ip_raw, str):
+            announce_ips = [
+                ip.strip() for ip in announce_ip_raw.split(",") if ip.strip()
+            ]
+            if not announce_ips:
+                sys.stderr.write(
+                    "holo mcp: --announce-ip requires at least one IP\n"
+                )
+                return 2
+
         return _cmd_mcp(
             hide_qr="--hide-qr" in rest,
             enable_screen="--screen" in rest,
             no_bookmarklet="--no-bookmarklet" in rest,
             listen_port=listen_port,
+            announce=announce,
+            announce_session=announce_session,
+            announce_user=announce_user,
+            announce_ssh_user=announce_ssh_user,
+            announce_ips=announce_ips,
         )
     if cmd == "connect":
         return _cmd_connect(rest)
