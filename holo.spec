@@ -59,6 +59,16 @@ hiddenimports = [
     "uvicorn.loops.auto",
     "uvicorn.protocols.http.auto",
     "uvicorn.protocols.websockets.auto",
+    # zeroconf (used by holo.announce) lazy-loads several internal
+    # submodules; collect_submodules in a hook would be cleaner but
+    # this enumeration is easy to keep current and avoids the hook
+    # discovery path.
+    "zeroconf",
+    "zeroconf._handlers",
+    "zeroconf._protocol",
+    "zeroconf._services",
+    "zeroconf._utils",
+    "ifaddr",
 ]
 
 a = Analysis(

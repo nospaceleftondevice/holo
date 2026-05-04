@@ -18,9 +18,12 @@ embed in another runner.
 
 from __future__ import annotations
 
+import signal
 import socket
 import sys
 import threading
+from collections.abc import Iterator
+from contextlib import contextmanager
 from typing import Any
 
 import anyio
@@ -48,6 +51,12 @@ class HoloMCPServer:
         enable_screen: bool = False,
         no_bookmarklet: bool = False,
         templates: TemplateStore | None = None,
+        announce: bool = False,
+        announce_session: str | None = None,
+        announce_user: str | None = None,
+        announce_ssh_user: str | None = None,
+        announce_ips: list[str] | None = None,
+        announce_port: int = 0,
     ) -> None:
         self.hide_qr = hide_qr
         self.enable_screen = enable_screen
@@ -57,6 +66,28 @@ class HoloMCPServer:
         # Template cache lives across daemon restarts — it's a pure
         # filesystem store, not bound to any JVM/browser session.
         self.templates = templates if templates is not None else TemplateStore()
+
+        self._announcer: Any | None = None
+        if announce:
+            try:
+                from holo.announce import HoloAnnouncer
+
+                self._announcer = HoloAnnouncer(
+                    session=announce_session,
+                    user=announce_user,
+                    ssh_user=announce_ssh_user,
+                    port=announce_port,
+                    ips=announce_ips,
+                )
+                self._announcer.start()
+            except Exception as e:  # noqa: BLE001 — surface and continue
+                print(
+                    f"holo mcp: mDNS announce failed ({e}); continuing "
+                    "without broadcast",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                self._announcer = None
 
     @property
     def daemon(self) -> Daemon:
@@ -70,6 +101,12 @@ class HoloMCPServer:
             return self._daemon
 
     def shutdown(self) -> None:
+        if self._announcer is not None:
+            try:
+                self._announcer.stop()
+            except Exception:  # noqa: BLE001 — shutdown must not raise
+                pass
+            self._announcer = None
         with self._daemon_lock:
             if self._daemon is not None:
                 self._daemon.shutdown()
@@ -514,6 +551,12 @@ def build_server(
     hide_qr: bool = False,
     enable_screen: bool = False,
     no_bookmarklet: bool = False,
+    announce: bool = False,
+    announce_session: str | None = None,
+    announce_user: str | None = None,
+    announce_ssh_user: str | None = None,
+    announce_ips: list[str] | None = None,
+    announce_port: int = 0,
 ) -> tuple[FastMCP, HoloMCPServer]:
     """Build a FastMCP instance with the holo tools registered.
 
@@ -525,11 +568,22 @@ def build_server(
     send_command, bookmarklet_query) are not registered and the
     daemon never spins up its WS server. Suits agents that only
     drive screen + AppleScript surfaces.
+
+    With `announce=True`, broadcasts an mDNS service record
+    (`_holo-session._tcp.local.`) carrying the optional session /
+    user / ssh_user metadata for a companion desktop app to
+    discover.
     """
     holo = HoloMCPServer(
         hide_qr=hide_qr,
         enable_screen=enable_screen,
         no_bookmarklet=no_bookmarklet,
+        announce=announce,
+        announce_session=announce_session,
+        announce_user=announce_user,
+        announce_ssh_user=announce_ssh_user,
+        announce_ips=announce_ips,
+        announce_port=announce_port,
     )
     mcp = FastMCP("holo")
 
@@ -834,20 +888,67 @@ def build_server(
     return mcp, holo
 
 
+@contextmanager
+def _sigterm_as_keyboard_interrupt() -> Iterator[None]:
+    """Convert SIGTERM into KeyboardInterrupt while inside the block.
+
+    Existing teardown paths already handle KeyboardInterrupt — they
+    fall through to the `finally` clauses that call `holo.shutdown()`,
+    which gives the announcer a chance to send mDNS Goodbye packets
+    (TTL=0 records) before the process exits. Without this, `kill
+    <pid>` leaves stale entries in every cache on the LAN until they
+    age out (~75 s).
+
+    The handler is restored on exit so test-suite re-entry doesn't
+    poison subsequent runs. Only the main thread can call
+    `signal.signal`; that's fine — `run`/`run_tcp` are CLI entrypoints.
+    """
+
+    def _handler(signum: int, frame: Any) -> None:  # noqa: ARG001
+        raise KeyboardInterrupt()
+
+    try:
+        previous = signal.signal(signal.SIGTERM, _handler)
+    except ValueError:
+        # Not on the main thread (e.g. inside a test harness that
+        # called this from a worker). Skip — graceful shutdown still
+        # works for SIGINT via Python's default handler.
+        yield
+        return
+    try:
+        yield
+    finally:
+        signal.signal(signal.SIGTERM, previous)
+
+
 def run(
     *,
     hide_qr: bool = False,
     enable_screen: bool = False,
     no_bookmarklet: bool = False,
+    announce: bool = False,
+    announce_session: str | None = None,
+    announce_user: str | None = None,
+    announce_ssh_user: str | None = None,
+    announce_ips: list[str] | None = None,
 ) -> None:
     """Entrypoint used by `holo mcp` — runs the server over stdio."""
     mcp, holo = build_server(
         hide_qr=hide_qr,
         enable_screen=enable_screen,
         no_bookmarklet=no_bookmarklet,
+        announce=announce,
+        announce_session=announce_session,
+        announce_user=announce_user,
+        announce_ssh_user=announce_ssh_user,
+        announce_ips=announce_ips,
     )
     try:
-        mcp.run()
+        with _sigterm_as_keyboard_interrupt():
+            mcp.run()
+    except KeyboardInterrupt:
+        # Normal shutdown path — fall through to finally for cleanup.
+        pass
     finally:
         holo.shutdown()
 
@@ -858,6 +959,11 @@ def run_tcp(
     hide_qr: bool = False,
     enable_screen: bool = False,
     no_bookmarklet: bool = False,
+    announce: bool = False,
+    announce_session: str | None = None,
+    announce_user: str | None = None,
+    announce_ssh_user: str | None = None,
+    announce_ips: list[str] | None = None,
     stop_event: threading.Event | None = None,
 ) -> None:
     """Entrypoint used by `holo mcp --listen PORT`.
@@ -876,6 +982,12 @@ def run_tcp(
         hide_qr=hide_qr,
         enable_screen=enable_screen,
         no_bookmarklet=no_bookmarklet,
+        announce=announce,
+        announce_session=announce_session,
+        announce_user=announce_user,
+        announce_ssh_user=announce_ssh_user,
+        announce_ips=announce_ips,
+        announce_port=port,
     )
     listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -896,40 +1008,43 @@ def run_tcp(
     )
 
     try:
-        while stop_event is None or not stop_event.is_set():
-            try:
-                conn, addr = listener.accept()
-            except TimeoutError:
-                continue
-            except KeyboardInterrupt:
-                break
-            try:
-                handshake = read_handshake(conn)
-                if not is_valid_handshake(handshake):
+        with _sigterm_as_keyboard_interrupt():
+            while stop_event is None or not stop_event.is_set():
+                try:
+                    conn, addr = listener.accept()
+                except TimeoutError:
+                    continue
+                except KeyboardInterrupt:
+                    break
+                try:
+                    handshake = read_handshake(conn)
+                    if not is_valid_handshake(handshake):
+                        print(
+                            f"holo mcp: rejecting {addr}: "
+                            f"bad handshake {handshake[:32]!r}",
+                            file=sys.stderr,
+                            flush=True,
+                        )
+                        continue
                     print(
-                        f"holo mcp: rejecting {addr}: "
-                        f"bad handshake {handshake[:32]!r}",
+                        f"holo mcp: accepted {addr}",
                         file=sys.stderr,
                         flush=True,
                     )
-                    continue
-                print(
-                    f"holo mcp: accepted {addr}",
-                    file=sys.stderr,
-                    flush=True,
-                )
-                _serve_one_connection(mcp, conn)
-                print(
-                    f"holo mcp: closed {addr}",
-                    file=sys.stderr,
-                    flush=True,
-                )
-            finally:
-                try:
-                    conn.shutdown(socket.SHUT_RDWR)
-                except OSError:
-                    pass
-                conn.close()
+                    _serve_one_connection(mcp, conn)
+                    print(
+                        f"holo mcp: closed {addr}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                except KeyboardInterrupt:
+                    break
+                finally:
+                    try:
+                        conn.shutdown(socket.SHUT_RDWR)
+                    except OSError:
+                        pass
+                    conn.close()
     finally:
         listener.close()
         holo.shutdown()
