@@ -37,7 +37,19 @@ dependencies = [
   # Used by `holo mcp --announce` to broadcast session metadata to the
   # companion desktop app. LGPL 2.1+ — bundled binaries should ship a
   # NOTICE entry and the library source must remain replaceable.
-  "zeroconf>=0.131",
+  #
+  # Pinned to `<0.40` because zeroconf 0.40.0+ stopped shipping a
+  # `py3-none-any` pure-Python wheel AND only publishes arm64 macOS
+  # wheels (no x86_64). Our universal2 PyInstaller build needs either
+  # a fusable arm64+x86_64 pair or a pure-Python fallback — 0.40+
+  # provides neither and the workflow's "fallback to latest with x86_64"
+  # path silently downgraded the dep. 0.39.4 ships both arches AND
+  # py3-none-any, so the workflow's pure-Python swap path works cleanly.
+  "zeroconf>=0.39,<0.40",
+  # Required by zeroconf <0.40 for asyncio.timeout-style cancellation
+  # on Pythons before 3.11. Listing it explicitly so the install is
+  # reproducible regardless of which transitive marker pip evaluates.
+  "async_timeout>=4.0",
 ]
 
 [project.optional-dependencies]
