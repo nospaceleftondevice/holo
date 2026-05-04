@@ -179,10 +179,19 @@ class HoloAnnouncer:
             self._service_info = None
 
     def _instance_name(self) -> str:
-        host = socket.gethostname().split(".")[0]
-        base = f"holo-{self.session}" if self.session else f"holo-{host}"
+        # DNS label cap is 63 bytes (RFC 1035); GitHub Actions runner
+        # hostnames are ~60 bytes alone, so naïve concatenation blows
+        # the limit. Compute the budget left after the pid/salt suffix
+        # and truncate the human-readable body to fit.
+        pid = str(os.getpid())
         salt = uuid.uuid4().hex[:6]
-        return f"{base}-{os.getpid()}-{salt}"
+        suffix = f"-{pid}-{salt}"
+        budget = 63 - len(suffix)
+        if self.session:
+            body = f"holo-{self.session}"
+        else:
+            body = f"holo-{socket.gethostname().split('.')[0]}"
+        return body[:budget] + suffix
 
 
 def _tmux_field(spec: str) -> str | None:

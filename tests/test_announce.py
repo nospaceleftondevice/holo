@@ -225,6 +225,31 @@ class TestIPsInTXTRecord:
         assert "ips" not in props
 
 
+class TestInstanceName:
+    """The instance label must fit in 63 bytes (DNS label cap, RFC 1035).
+
+    Regression: GHA runner hostnames are ~60 bytes alone, which blows the
+    limit when concatenated with the pid/salt suffix. zeroconf raises
+    BadTypeInNameException at ServiceInfo construction even when the
+    network layer is mocked.
+    """
+
+    def test_instance_name_fits_63_bytes_with_long_hostname(self) -> None:
+        long_host = "sjc20-cw713-08a880d5-3c20-465c-85ab-7b7d1f6bcad4-064000B729D5"
+        with patch("holo.announce.socket.gethostname", return_value=long_host):
+            name = HoloAnnouncer()._instance_name()
+        assert len(name) <= 63, f"instance name too long: {name!r} ({len(name)} bytes)"
+
+    def test_instance_name_fits_63_bytes_with_long_session(self) -> None:
+        long_session = "x" * 200
+        name = HoloAnnouncer(session=long_session)._instance_name()
+        assert len(name) <= 63, f"instance name too long: {name!r} ({len(name)} bytes)"
+
+    def test_instance_name_preserves_session_prefix(self) -> None:
+        name = HoloAnnouncer(session="claude-1")._instance_name()
+        assert name.startswith("holo-claude-1-")
+
+
 class TestServiceTypeConstants:
     def test_service_type_format(self) -> None:
         assert SERVICE_TYPE == "_holo-session._tcp.local."
