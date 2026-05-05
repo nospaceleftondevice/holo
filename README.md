@@ -243,8 +243,8 @@ per platform:
 | Layer | Sources |
 | --- | --- |
 | Hardware | `os`, `os_version`, `arch`, `cpu_model`, `cores`, `ram_gb` (macOS `sysctl`, Linux `/proc`, Windows ctypes / Win32 API) |
-| Applications (macOS) | `/Applications`, `/Applications/Utilities`, `/System/Applications`, `~/Applications` + `mdfind` for outliers; private system agents under `/System/Library/`, `/Library/`, `/usr/libexec/` filtered out |
-| Applications (Windows) | `HKLM` + `HKCU` Uninstall registry keys |
+| Applications (macOS) | `/Applications`, `/Applications/Utilities`, `/System/Applications`, `~/Applications` + `mdfind` for outliers; private system agents under `/System/Library/`, `/Library/`, `/usr/libexec/` filtered out. Per-app `version` + `bundle_id` read from `Contents/Info.plist`. |
+| Applications (Windows) | `HKLM` + `HKCU` Uninstall registry keys. Per-app `path`, `version`, `publisher`, `install_date`. |
 | Packages | Every supported manager whose binary is on PATH gets queried: `brew`, `port`, `apt`/`dpkg`, `dnf`/`yum`/`rpm`, `pacman`, `snap`, `flatpak`, `winget`, `choco`, `scoop`, plus language-level `pip`, `pipx`, `cargo`, `npm` (-g), `gem`, `conda` (base env). Aliases collapse to canonical keys (`dpkg` → `apt`; `dnf`/`yum` → `rpm`). |
 
 Walking `$PATH` would be wrong: on Linux `/bin` is just a symlink to

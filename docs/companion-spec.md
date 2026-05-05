@@ -237,9 +237,18 @@ response that you wouldn't put in the TXT record itself.
     "ram_gb": 36.0                            // total physical RAM
   },
   "applications": {                           // platform-native catalog
-    "Google Chrome": {"path": "/Applications/Google Chrome.app"},
-    "Firefox":       {"path": "/Applications/Firefox.app"}
-    // Windows: also has version + publisher; Linux: empty
+    "Google Chrome": {
+      "path":      "/Applications/Google Chrome.app",
+      "version":   "147.0.7727.138",          // CFBundleShortVersionString
+      "bundle_id": "com.google.Chrome"        // CFBundleIdentifier
+    },
+    "Firefox": {
+      "path":      "/Applications/Firefox.app",
+      "version":   "125.0.3",
+      "bundle_id": "org.mozilla.firefox"
+    }
+    // Windows entries also include `publisher` and `install_date`.
+    // Linux: applications dict is empty (use `packages.*`).
   },
   "packages": {                               // per-manager arrays — every
                                               // manager whose binary is on
@@ -271,9 +280,11 @@ binary is present:
 Aliases collapse onto canonical keys: `dpkg` → `apt`; `dnf`/`yum` → `rpm`.
 
 **Applications catalog** is platform-specific:
-- **macOS:** walk `/Applications`, `/Applications/Utilities`, `/System/Applications`, `~/Applications`, then `mdfind 'kMDItemKind == "Application"'` to pick up bundles outside those dirs. Private OS agents under `/System/Library/`, `/Library/`, `/usr/libexec/` are filtered out (hundreds of internal helper apps that aren't user-facing).
-- **Windows:** read the `HKLM\…\Uninstall` and `HKCU\…\Uninstall` registry keys (canonical "installed programs" list). Each entry includes `path`, `version`, and `publisher` when registry-supplied.
+- **macOS:** walk `/Applications`, `/Applications/Utilities`, `/System/Applications`, `~/Applications`, then `mdfind 'kMDItemKind == "Application"'` to pick up bundles outside those dirs. Each entry's `version` and `bundle_id` are read from `Contents/Info.plist` (`CFBundleShortVersionString` → falls back to `CFBundleVersion`; `CFBundleIdentifier`). Both fields are optional — omitted if the plist is unreadable. Private OS agents under `/System/Library/`, `/Library/`, `/usr/libexec/` are filtered out (hundreds of internal helper apps that aren't user-facing).
+- **Windows:** read the `HKLM\…\Uninstall` and `HKCU\…\Uninstall` registry keys (canonical "installed programs" list). Each entry includes `path` (from `InstallLocation`), `version` (from `DisplayVersion`), `publisher` (from `Publisher`), and `install_date` (from `InstallDate`, typically `YYYYMMDD`) when registry-supplied. Any field missing from the registry key is omitted from the entry.
 - **Linux:** empty — desktop apps come via `packages.snap` / `packages.flatpak` / `packages.apt` etc.
+
+All fields beyond `path` are optional — agents should treat absence as "not known" rather than "not installed".
 
 The probe result is cached server-side for ~60 s — companions can
 poll without driving repeated `brew list` / `pip list` invocations

@@ -229,6 +229,90 @@ class TestProbeApplicationsMacOS:
             apps = probe_applications()
         assert apps["Chrome"]["path"] == "/Applications/Chrome.app"
 
+    def test_walk_picks_up_version_and_bundle_id_from_real_plist(
+        self, tmp_path: Any
+    ) -> None:
+        """End-to-end metadata read against actual `plistlib`-written
+        Info.plists in a tmp dir."""
+        import plistlib
+
+        apps_dir = tmp_path / "Applications"
+        apps_dir.mkdir()
+
+        def _make_app(name: str, plist: dict[str, str]) -> None:
+            bundle = apps_dir / f"{name}.app"
+            (bundle / "Contents").mkdir(parents=True)
+            with open(bundle / "Contents" / "Info.plist", "wb") as f:
+                plistlib.dump(plist, f)
+
+        _make_app(
+            "FakeChrome",
+            {
+                "CFBundleShortVersionString": "147.0.7727.138",
+                "CFBundleIdentifier": "com.fake.Chrome",
+            },
+        )
+        _make_app(
+            "FakeBare",
+            {},  # no version, no bundle_id
+        )
+        _make_app(
+            "FakeBuildOnly",
+            {"CFBundleVersion": "42"},  # falls back to build version
+        )
+
+        # Need a real scandir against the tmp_path for this test, so
+        # don't patch os.scandir. Just patch _MACOS_APP_DIRS to point
+        # at the tmp dir, and platform.system + _run_pkg_command.
+        with (
+            patch(
+                "holo.capabilities.platform.system", return_value="Darwin"
+            ),
+            patch(
+                "holo.capabilities._MACOS_APP_DIRS",
+                (str(apps_dir),),
+            ),
+            patch(
+                "holo.capabilities._run_pkg_command", return_value=""
+            ),
+        ):
+            apps = probe_applications()
+
+        assert apps["FakeChrome"]["version"] == "147.0.7727.138"
+        assert apps["FakeChrome"]["bundle_id"] == "com.fake.Chrome"
+        # Bare app — only `path` populated.
+        assert "version" not in apps["FakeBare"]
+        assert "bundle_id" not in apps["FakeBare"]
+        # Falls back to CFBundleVersion when CFBundleShortVersionString is missing.
+        assert apps["FakeBuildOnly"]["version"] == "42"
+
+    def test_unreadable_plist_falls_back_to_path_only(
+        self, tmp_path: Any
+    ) -> None:
+        # Create a .app whose Info.plist is corrupt — the entry should
+        # still appear in the result with just `path`.
+        apps_dir = tmp_path / "Applications"
+        apps_dir.mkdir()
+        bundle = apps_dir / "Corrupt.app"
+        (bundle / "Contents").mkdir(parents=True)
+        (bundle / "Contents" / "Info.plist").write_bytes(b"not a plist")
+
+        with (
+            patch(
+                "holo.capabilities.platform.system", return_value="Darwin"
+            ),
+            patch(
+                "holo.capabilities._MACOS_APP_DIRS", (str(apps_dir),)
+            ),
+            patch(
+                "holo.capabilities._run_pkg_command", return_value=""
+            ),
+        ):
+            apps = probe_applications()
+
+        assert "Corrupt" in apps
+        assert apps["Corrupt"] == {"path": str(bundle)}
+
     def test_skips_system_library_paths(self) -> None:
         from holo.capabilities import _is_system_app_bundle
 
@@ -247,6 +331,128 @@ class TestProbeApplicationsMacOS:
         assert not _is_system_app_bundle(
             "/System/Applications/Safari.app"
         )
+
+
+class TestProbeApplicationsWindows:
+    """`winreg` only exists on Windows; we inject a minimal fake module
+    via sys.modules so the function-internal `import winreg` line picks
+    it up. Verifies the field extraction list (including the new
+    install_date addition)."""
+
+    def test_install_date_extracted(self, monkeypatch: Any) -> None:
+        import sys
+        from unittest.mock import MagicMock
+
+        # The values for the one app we'll surface.
+        per_app_values = {
+            "DisplayName": ("MyTestApp", 1),
+            "DisplayVersion": ("1.2.3", 1),
+            "Publisher": ("Acme Corp", 1),
+            "InstallLocation": (r"C:\Program Files\MyTestApp", 1),
+            "InstallDate": ("20251102", 1),
+        }
+
+        # Track per-root state so EnumKey only returns subkeys for one root.
+        state: dict[str, Any] = {"subkey_count": 0}
+
+        def open_key(hive_or_handle: Any, subkey: str | None = None):
+            handle = MagicMock()
+            if subkey is not None:
+                # Top-level open — only the plain HKLM\...\Uninstall
+                # (not WOW6432Node, not HKCU) gets a non-empty list.
+                if (
+                    hive_or_handle == 0  # HKLM
+                    and "WOW6432Node" not in subkey
+                ):
+                    state["subkey_count"] = 1
+                else:
+                    state["subkey_count"] = 0
+            return handle
+
+        def enum_key(root_handle: Any, i: int) -> str:
+            if i < state["subkey_count"]:
+                return "MyAppRegEntry"
+            raise OSError("end of enumeration")
+
+        def query_value_ex(sub_handle: Any, src: str) -> tuple[Any, int]:
+            if src in per_app_values:
+                return per_app_values[src]
+            raise OSError(f"value missing: {src}")
+
+        wr = MagicMock()
+        wr.HKEY_LOCAL_MACHINE = 0
+        wr.HKEY_CURRENT_USER = 1
+        wr.OpenKey = open_key
+        wr.EnumKey = enum_key
+        wr.QueryValueEx = query_value_ex
+
+        monkeypatch.setitem(sys.modules, "winreg", wr)
+
+        from holo.capabilities import _probe_applications_windows
+
+        out = _probe_applications_windows()
+
+        assert "MyTestApp" in out
+        e = out["MyTestApp"]
+        assert e["version"] == "1.2.3"
+        assert e["publisher"] == "Acme Corp"
+        assert e["path"] == r"C:\Program Files\MyTestApp"
+        assert e["install_date"] == "20251102"
+
+    def test_install_date_omitted_when_absent(
+        self, monkeypatch: Any
+    ) -> None:
+        # InstallDate is registry-optional — many entries don't have
+        # it. Verify we omit the key rather than emit "" or null.
+        import sys
+        from unittest.mock import MagicMock
+
+        per_app_values = {
+            "DisplayName": ("AppNoDate", 1),
+            "DisplayVersion": ("0.9.0", 1),
+            # No InstallDate, no Publisher, no InstallLocation.
+        }
+        state: dict[str, Any] = {"subkey_count": 0}
+
+        def open_key(hive_or_handle: Any, subkey: str | None = None):
+            handle = MagicMock()
+            if subkey is not None:
+                state["subkey_count"] = (
+                    1
+                    if hive_or_handle == 0 and "WOW6432Node" not in subkey
+                    else 0
+                )
+            return handle
+
+        def enum_key(root_handle: Any, i: int) -> str:
+            if i < state["subkey_count"]:
+                return "AppNoDateRegEntry"
+            raise OSError("end")
+
+        def query_value_ex(sub_handle: Any, src: str) -> tuple[Any, int]:
+            if src in per_app_values:
+                return per_app_values[src]
+            raise OSError(f"value missing: {src}")
+
+        wr = MagicMock()
+        wr.HKEY_LOCAL_MACHINE = 0
+        wr.HKEY_CURRENT_USER = 1
+        wr.OpenKey = open_key
+        wr.EnumKey = enum_key
+        wr.QueryValueEx = query_value_ex
+
+        monkeypatch.setitem(sys.modules, "winreg", wr)
+
+        from holo.capabilities import _probe_applications_windows
+
+        out = _probe_applications_windows()
+
+        assert "AppNoDate" in out
+        e = out["AppNoDate"]
+        assert "install_date" not in e
+        assert "publisher" not in e
+        # `path` always present (defaults to "" when InstallLocation absent).
+        assert e["path"] == ""
 
 
 # ============================================================================
