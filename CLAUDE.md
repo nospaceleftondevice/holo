@@ -192,6 +192,8 @@ dns-sd -L <instance> _holo-session._tcp local | grep caps_
 curl -H "X-Holo-Caps-Token: <token from above>" http://127.0.0.1:<caps_port>/capabilities | jq .
 ```
 
+**MCP tool surface for the read side** (always exposed, no `--bookmarklet`/`--screen` dependency): `holo_discover_sessions(wait_s=3)` returns the same JSON `holo discover --json` produces; `holo_fetch_capabilities(instance, wait_s=3, timeout_s=5)` accepts an instance label / session / host (matched in that order via `_match_session`), runs a fresh browse, picks the first reachable IP from the broadcast list, and returns `{instance, host, session, ip_used, capabilities}`. Both are how an agent connected to one holo session does capability-aware routing — without them, `--announce-capabilities` is invisible to the agent and only useful via `holo discover` + `curl` from the user's shell.
+
 ## UI template cache (desktop DOM analog)
 
 For UI elements outside any browser tab — Chrome's kebab/bookmarks bar, the dock, menu-bar items, native app buttons — `src/holo/templates.py` + the `ui_template_*` MCP tools provide a persistent name → image cache. Capture an element once (`ui_template_capture` blocks for a SikuliX `Region.userCapture()` rect drag, or accepts an explicit `region` for programmatic stash), then `ui_template_click("kebab", app="chrome")` in future sessions does template matching via `find_image_path` and clicks the center. Avoids re-doing vision each session for stable on-screen elements.

@@ -577,6 +577,145 @@ class HoloMCPServer:
             cmd["prop"] = prop
         return self.send_command(sid, cmd, timeout=timeout)
 
+    # ---- LAN session discovery / capabilities --------------------------------
+    #
+    # Lets an agent enumerate other `holo mcp --announce` sessions on the
+    # same broadcast domain and fetch their hardware/software/package
+    # inventories — the read-side of the `--announce-capabilities` feature.
+    # Routing decisions ("send transcription to the M4, not the M1"; "find
+    # a host with Chrome Canary installed") happen agent-side once these
+    # tools return.
+
+    def holo_discover_sessions(self, wait_s: float = 3.0) -> dict[str, Any]:
+        """Browse mDNS for live `_holo-session._tcp.local.` broadcasts.
+
+        Spins up a temporary zeroconf browser, waits ``wait_s`` seconds
+        for replies, and returns the snapshot. The returned sessions
+        include `caps_port` + `caps_token` when the broadcasting host
+        was launched with `--announce-capabilities`; pass either the
+        `instance` or `session` field back to ``holo_fetch_capabilities``
+        to read its inventory.
+
+        mDNS is link-local — sessions on the other side of a router or
+        most VPNs won't appear. For cross-network discovery, use the
+        `holo connect HOST:PORT` flow instead.
+        """
+        import time as _time
+
+        from holo.discover import _start_browser
+
+        zc, _browser, store = _start_browser()
+        try:
+            _time.sleep(max(0.0, float(wait_s)))
+            sessions = store.snapshot()
+        finally:
+            zc.close()
+        return {"sessions": sessions, "count": len(sessions)}
+
+    def holo_fetch_capabilities(
+        self,
+        instance: str,
+        wait_s: float = 3.0,
+        timeout_s: float = 5.0,
+    ) -> dict[str, Any]:
+        """Fetch a remote holo host's hardware/software/package inventory.
+
+        ``instance`` is matched against (in order) the mDNS instance
+        label, the ``session`` field, then the ``host`` field — pass
+        whatever the user typed and we'll find it. The remote must have
+        been launched with `--announce-capabilities`; otherwise we
+        raise rather than silently return an empty inventory.
+
+        The advertised IPs are tried in order with a per-attempt
+        timeout (the first IP can be a VPN tunnel address that's not
+        reachable from the discoverer). The first successful fetch
+        wins; if none reach, raises with the list of attempts.
+        """
+        import json as _json
+        import time as _time
+        import urllib.error
+        import urllib.request
+
+        from holo.capabilities_server import CAPS_TOKEN_HEADER
+        from holo.discover import _start_browser
+
+        zc, _browser, store = _start_browser()
+        try:
+            _time.sleep(max(0.0, float(wait_s)))
+            sessions = store.snapshot()
+        finally:
+            zc.close()
+
+        target = _match_session(sessions, instance)
+        if target is None:
+            seen = [s.get("instance") for s in sessions]
+            raise RuntimeError(
+                f"no holo session matching {instance!r} on the LAN; "
+                f"saw: {seen!r}"
+            )
+
+        caps_port = target.get("caps_port")
+        caps_token = target.get("caps_token")
+        if not caps_port or not caps_token:
+            raise RuntimeError(
+                f"session {target.get('instance')!r} has no capabilities "
+                "endpoint — was it launched with `--announce-capabilities`?"
+            )
+
+        ips = target.get("ips") or []
+        if not ips:
+            raise RuntimeError(
+                f"session {target.get('instance')!r} broadcast no IPs; "
+                "nothing to fetch from"
+            )
+
+        attempts: list[dict[str, str]] = []
+        for ip in ips:
+            url = f"http://{ip}:{caps_port}/capabilities"
+            req = urllib.request.Request(
+                url, headers={CAPS_TOKEN_HEADER: caps_token}
+            )
+            try:
+                with urllib.request.urlopen(req, timeout=timeout_s) as resp:
+                    body = _json.loads(resp.read().decode("utf-8"))
+            except (urllib.error.URLError, OSError, TimeoutError) as e:
+                attempts.append({"ip": ip, "error": str(e)})
+                continue
+            return {
+                "instance": target.get("instance"),
+                "host": target.get("host"),
+                "session": target.get("session"),
+                "ip_used": ip,
+                "capabilities": body,
+            }
+
+        raise RuntimeError(
+            f"could not reach capabilities endpoint for "
+            f"{target.get('instance')!r}; tried: {attempts!r}"
+        )
+
+
+def _match_session(
+    sessions: list[dict[str, Any]], identifier: str
+) -> dict[str, Any] | None:
+    """Find the session whose instance / session / host matches ``identifier``.
+
+    Match priority is exact-instance > exact-session > exact-host so a
+    unique mDNS label always wins over a possibly-duplicated session
+    name. Returns None if nothing matches — the caller raises with a
+    helpful list-of-instances message.
+    """
+    for s in sessions:
+        if s.get("instance") == identifier:
+            return s
+    for s in sessions:
+        if s.get("session") == identifier:
+            return s
+    for s in sessions:
+        if s.get("host") == identifier:
+            return s
+    return None
+
 
 def _transport(ch: Channel) -> str:
     return "ws" if ch._ws_ready else "qr"
@@ -935,6 +1074,51 @@ def build_server(
             return holo.bookmarklet_query(
                 sid, selector, prop=prop, attr=attr, all=all, timeout=timeout
             )
+
+    # ---- LAN session discovery / capabilities (channel-independent) ---------
+    #
+    # Always exposed — these tools don't depend on a calibrated bookmarklet
+    # channel or the JVM bridge. They're how an agent connected to one holo
+    # instance learns about other holo hosts on the LAN and routes work to
+    # them by hardware/software/package capability.
+
+    @mcp.tool(
+        description=(
+            "Discover live `holo mcp --announce` sessions on the local "
+            "broadcast domain via mDNS. Returns a `sessions` array; each "
+            "entry includes `instance`, `host`, `user`, `ips`, optional "
+            "`session`/`ssh_user`/`tmux_*`, and (when the broadcaster used "
+            "`--announce-capabilities`) `caps_port` + `caps_token`. Pass "
+            "`instance` (or `session`/`host`) into `holo_fetch_capabilities` "
+            "to read the host's hardware/software/package inventory. "
+            "`wait_s` is the browse window — default 3.0 s."
+        )
+    )
+    def holo_discover_sessions(wait_s: float = 3.0) -> dict[str, Any]:
+        return holo.holo_discover_sessions(wait_s=wait_s)
+
+    @mcp.tool(
+        description=(
+            "Fetch a remote holo host's hardware / software / package "
+            "inventory over the authenticated `/capabilities` HTTP endpoint. "
+            "`instance` is matched against the mDNS instance label, then "
+            "`session`, then `host` — pass whichever the user gave you. "
+            "Returns `{instance, host, session, ip_used, capabilities}` "
+            "where `capabilities` follows the schema in "
+            "docs/companion-spec.md §3a (hardware: os/arch/cpu_model/cores/"
+            "ram_gb; software: which-lookup map; packages: per-manager arrays). "
+            "Raises if the target session has no capabilities endpoint or "
+            "if none of its advertised IPs is reachable."
+        )
+    )
+    def holo_fetch_capabilities(
+        instance: str,
+        wait_s: float = 3.0,
+        timeout_s: float = 5.0,
+    ) -> dict[str, Any]:
+        return holo.holo_fetch_capabilities(
+            instance, wait_s=wait_s, timeout_s=timeout_s
+        )
 
     return mcp, holo
 
