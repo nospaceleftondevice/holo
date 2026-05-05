@@ -258,6 +258,21 @@ the mDNS broadcast also gets the token. See
 [`docs/companion-spec.md`](docs/companion-spec.md#3a-capabilities-http-endpoint-optional)
 for the full wire contract.
 
+**MCP tools.** An agent connected to one `holo mcp` instance can read
+other holo hosts' inventories without leaving the agent loop:
+
+- `holo_discover_sessions(wait_s=3)` — lists every active holo session
+  on the LAN (same data as `holo discover --json`).
+- `holo_fetch_capabilities(instance, wait_s=3, timeout_s=5)` — fetches
+  one host's hardware/software/package inventory. `instance` matches
+  the mDNS instance label, `session`, or `host` (in that order), so
+  pass whatever the user typed. Falls through unreachable IPs to find
+  the first that responds.
+
+Both tools are always exposed (no `--bookmarklet` / `--screen`
+dependency), so an agent on the receiving side gets capability-aware
+routing for free.
+
 ## License
 
 Apache-2.0. See [LICENSE](LICENSE).

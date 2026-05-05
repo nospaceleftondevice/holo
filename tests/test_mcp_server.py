@@ -368,6 +368,8 @@ class TestShutdownAndBuild:
                 "ui_template_find",
                 "ui_template_click",
                 "ui_template_delete",
+                "holo_discover_sessions",
+                "holo_fetch_capabilities",
             }
         finally:
             holo.shutdown()
@@ -909,3 +911,367 @@ class TestUiTemplates:
         assert out["removed"] == ["kebab.png"]
         entry = store.get("kebab", "chrome")
         assert entry["variants"] == ["kebab_2.png"]
+
+
+# ============================================================================
+# LAN session discovery / capabilities
+# ============================================================================
+
+
+def _fake_session(
+    *,
+    instance: str = "holo-host-12345-abcdef",
+    host: str = "host.local",
+    session: str | None = None,
+    ips: list[str] | None = None,
+    caps_port: int | None = None,
+    caps_token: str | None = None,
+) -> dict[str, Any]:
+    """Build a discover-shaped session dict for tests."""
+    s: dict[str, Any] = {
+        "instance": instance,
+        "host": host,
+        "user": "alice",
+        "v": "1",
+        "holo_pid": 1234,
+        "holo_version": "0.1.0a15",
+        "started": 1_700_000_000,
+        "cwd": "/home/alice",
+        "last_seen": 1_700_000_001,
+    }
+    if session is not None:
+        s["session"] = session
+    if ips is not None:
+        s["ips"] = ips
+    if caps_port is not None:
+        s["caps_port"] = caps_port
+    if caps_token is not None:
+        s["caps_token"] = caps_token
+    return s
+
+
+class TestMatchSession:
+    """`_match_session` priority: instance > session > host."""
+
+    def test_matches_by_instance(self) -> None:
+        from holo.mcp_server import _match_session
+
+        sessions = [
+            _fake_session(instance="holo-x-1-aaa", session="x"),
+            _fake_session(instance="holo-y-2-bbb", session="y"),
+        ]
+        assert _match_session(sessions, "holo-x-1-aaa")["session"] == "x"
+
+    def test_matches_by_session_when_no_instance_hit(self) -> None:
+        from holo.mcp_server import _match_session
+
+        sessions = [_fake_session(instance="holo-x-1-aaa", session="claude-1")]
+        assert _match_session(sessions, "claude-1")["instance"] == "holo-x-1-aaa"
+
+    def test_matches_by_host_as_last_resort(self) -> None:
+        from holo.mcp_server import _match_session
+
+        sessions = [_fake_session(instance="holo-x-1-aaa", host="m4-pro.local")]
+        assert _match_session(sessions, "m4-pro.local") is sessions[0]
+
+    def test_instance_beats_session_collision(self) -> None:
+        from holo.mcp_server import _match_session
+
+        # Two sessions with the same `session` value; pass the unique
+        # instance label and we should get exactly that one back.
+        sessions = [
+            _fake_session(instance="holo-a-1-aaa", session="dup"),
+            _fake_session(instance="holo-b-2-bbb", session="dup"),
+        ]
+        out = _match_session(sessions, "holo-b-2-bbb")
+        assert out["instance"] == "holo-b-2-bbb"
+
+    def test_no_match_returns_none(self) -> None:
+        from holo.mcp_server import _match_session
+
+        sessions = [_fake_session(instance="holo-x-1-aaa")]
+        assert _match_session(sessions, "ghost") is None
+
+
+class TestHoloDiscoverSessions:
+    """`holo_discover_sessions` wraps `_start_browser` + a wait."""
+
+    def test_returns_snapshot_shape(self) -> None:
+        # Patch `_start_browser` to yield a fake store with two sessions.
+        from holo.discover import SessionStore
+
+        store = SessionStore()
+        store.upsert(_fake_session(instance="holo-a-1-aaa", session="alpha"))
+        store.upsert(_fake_session(instance="holo-b-2-bbb", session="beta"))
+
+        fake_zc: Any = type("ZC", (), {"close": lambda self: None})()
+
+        from unittest.mock import patch
+
+        with (
+            patch(
+                "holo.discover._start_browser",
+                return_value=(fake_zc, None, store),
+            ),
+            patch("time.sleep"),
+        ):
+            server = HoloMCPServer(no_bookmarklet=True)
+            try:
+                out = server.holo_discover_sessions(wait_s=0.0)
+            finally:
+                server.shutdown()
+
+        assert out["count"] == 2
+        instances = {s["instance"] for s in out["sessions"]}
+        assert instances == {"holo-a-1-aaa", "holo-b-2-bbb"}
+
+    def test_browser_closed_on_return(self) -> None:
+        from holo.discover import SessionStore
+
+        store = SessionStore()
+        closed: dict[str, bool] = {"yes": False}
+
+        class FakeZC:
+            def close(self) -> None:
+                closed["yes"] = True
+
+        from unittest.mock import patch
+
+        with (
+            patch(
+                "holo.discover._start_browser",
+                return_value=(FakeZC(), None, store),
+            ),
+            patch("time.sleep"),
+        ):
+            server = HoloMCPServer(no_bookmarklet=True)
+            try:
+                server.holo_discover_sessions(wait_s=0.0)
+            finally:
+                server.shutdown()
+        assert closed["yes"] is True
+
+
+class TestHoloFetchCapabilities:
+    """End-to-end: discover → match → HTTP fetch with auth header."""
+
+    def _setup_with_session(
+        self, target: dict[str, Any]
+    ) -> tuple[Any, dict[str, bool]]:
+        from holo.discover import SessionStore
+
+        store = SessionStore()
+        store.upsert(target)
+        closed: dict[str, bool] = {"closed": False}
+
+        class FakeZC:
+            def close(self) -> None:
+                closed["closed"] = True
+
+        return (FakeZC(), store), closed
+
+    def test_happy_path_returns_capabilities(self) -> None:
+        import io
+        from unittest.mock import patch
+
+        target = _fake_session(
+            instance="holo-x-1-aaa",
+            ips=["10.0.0.5"],
+            caps_port=49597,
+            caps_token="tok",
+        )
+        (zc, store), _ = self._setup_with_session(target)
+
+        caps_body = {
+            "schema": 1,
+            "host": {"os": "darwin", "arch": "arm64"},
+        }
+
+        captured_req = {"req": None}
+
+        def fake_urlopen(req: Any, timeout: float = 0) -> Any:
+            captured_req["req"] = req
+            resp = io.BytesIO(b'{"schema":1,"host":{"os":"darwin","arch":"arm64"}}')
+            resp.__enter__ = lambda self: self  # type: ignore[attr-defined]
+            resp.__exit__ = lambda self, *a: None  # type: ignore[attr-defined]
+            return resp
+
+        with (
+            patch(
+                "holo.discover._start_browser",
+                return_value=(zc, None, store),
+            ),
+            patch("time.sleep"),
+            patch("urllib.request.urlopen", side_effect=fake_urlopen),
+        ):
+            server = HoloMCPServer(no_bookmarklet=True)
+            try:
+                out = server.holo_fetch_capabilities(
+                    "holo-x-1-aaa", wait_s=0.0
+                )
+            finally:
+                server.shutdown()
+
+        assert out["instance"] == "holo-x-1-aaa"
+        assert out["ip_used"] == "10.0.0.5"
+        assert out["capabilities"] == caps_body
+        # Auth header on the request.
+        req = captured_req["req"]
+        assert req is not None
+        # Header lookup is case-insensitive in urllib's mapping.
+        assert req.get_header("X-holo-caps-token") == "tok"
+
+    def test_session_not_found(self) -> None:
+        from unittest.mock import patch
+
+        from holo.discover import SessionStore
+
+        store = SessionStore()
+        # No sessions registered.
+
+        class FakeZC:
+            def close(self) -> None:
+                pass
+
+        with (
+            patch(
+                "holo.discover._start_browser",
+                return_value=(FakeZC(), None, store),
+            ),
+            patch("time.sleep"),
+        ):
+            server = HoloMCPServer(no_bookmarklet=True)
+            try:
+                with pytest.raises(RuntimeError, match="no holo session matching"):
+                    server.holo_fetch_capabilities("ghost", wait_s=0.0)
+            finally:
+                server.shutdown()
+
+    def test_session_without_caps_endpoint_errors(self) -> None:
+        from unittest.mock import patch
+
+        target = _fake_session(
+            instance="holo-x-1-aaa", ips=["10.0.0.5"]
+        )  # no caps_port / caps_token
+        (zc, store), _ = self._setup_with_session(target)
+
+        with (
+            patch(
+                "holo.discover._start_browser",
+                return_value=(zc, None, store),
+            ),
+            patch("time.sleep"),
+        ):
+            server = HoloMCPServer(no_bookmarklet=True)
+            try:
+                with pytest.raises(RuntimeError, match="no capabilities endpoint"):
+                    server.holo_fetch_capabilities("holo-x-1-aaa", wait_s=0.0)
+            finally:
+                server.shutdown()
+
+    def test_falls_through_unreachable_ips_to_reachable_one(self) -> None:
+        """The motivating field issue: VPN tunnel address ahead of LAN
+        address. First IP times out, second succeeds; we report the
+        second."""
+        import io
+        from unittest.mock import patch
+
+        target = _fake_session(
+            instance="holo-x-1-aaa",
+            ips=["192.168.193.226", "192.168.1.111"],
+            caps_port=49597,
+            caps_token="tok",
+        )
+        (zc, store), _ = self._setup_with_session(target)
+
+        attempts: list[str] = []
+
+        def fake_urlopen(req: Any, timeout: float = 0) -> Any:
+            url = req.full_url
+            attempts.append(url)
+            # First IP raises; second returns a body.
+            if "192.168.193.226" in url:
+                raise OSError("connect timeout")
+            resp = io.BytesIO(b'{"schema":1,"host":{}}')
+            resp.__enter__ = lambda self: self  # type: ignore[attr-defined]
+            resp.__exit__ = lambda self, *a: None  # type: ignore[attr-defined]
+            return resp
+
+        with (
+            patch(
+                "holo.discover._start_browser",
+                return_value=(zc, None, store),
+            ),
+            patch("time.sleep"),
+            patch("urllib.request.urlopen", side_effect=fake_urlopen),
+        ):
+            server = HoloMCPServer(no_bookmarklet=True)
+            try:
+                out = server.holo_fetch_capabilities(
+                    "holo-x-1-aaa", wait_s=0.0
+                )
+            finally:
+                server.shutdown()
+
+        assert len(attempts) == 2
+        assert out["ip_used"] == "192.168.1.111"
+
+    def test_all_ips_unreachable_errors_with_attempts(self) -> None:
+        from unittest.mock import patch
+
+        target = _fake_session(
+            instance="holo-x-1-aaa",
+            ips=["10.0.0.5", "10.0.0.6"],
+            caps_port=49597,
+            caps_token="tok",
+        )
+        (zc, store), _ = self._setup_with_session(target)
+
+        with (
+            patch(
+                "holo.discover._start_browser",
+                return_value=(zc, None, store),
+            ),
+            patch("time.sleep"),
+            patch(
+                "urllib.request.urlopen",
+                side_effect=OSError("no route"),
+            ),
+        ):
+            server = HoloMCPServer(no_bookmarklet=True)
+            try:
+                with pytest.raises(
+                    RuntimeError, match="could not reach capabilities endpoint"
+                ) as ei:
+                    server.holo_fetch_capabilities(
+                        "holo-x-1-aaa", wait_s=0.0
+                    )
+            finally:
+                server.shutdown()
+        # Error message names every IP we tried.
+        assert "10.0.0.5" in str(ei.value)
+        assert "10.0.0.6" in str(ei.value)
+
+
+class TestCapabilityToolsAlwaysExposed:
+    """The two tools must be registered regardless of bookmarklet/screen flags."""
+
+    def _tool_names(self, **kwargs: Any) -> set[str]:
+        import asyncio
+
+        mcp, holo = build_server(**kwargs)
+        try:
+            tools = asyncio.run(mcp.list_tools())
+            return {t.name for t in tools}
+        finally:
+            holo.shutdown()
+
+    def test_no_bookmarklet_still_exposes_them(self) -> None:
+        names = self._tool_names(no_bookmarklet=True)
+        assert "holo_discover_sessions" in names
+        assert "holo_fetch_capabilities" in names
+
+    def test_default_build_exposes_them(self) -> None:
+        names = self._tool_names(no_bookmarklet=False)
+        assert "holo_discover_sessions" in names
+        assert "holo_fetch_capabilities" in names
