@@ -25,6 +25,7 @@ from holo.announce import (
     HoloAnnouncer,
     _enumerate_local_ipv4,
     _is_usable_ipv4,
+    _resolve_ip_overrides,
 )
 
 
@@ -180,6 +181,116 @@ class TestIPCollection:
         ):
             ips = _enumerate_local_ipv4()
         assert ips == ["192.168.1.7"]
+
+
+class TestResolveIPOverrides:
+    """`--announce-ip` accepts a mixed list of full IPs and trailing-dot
+    prefixes. Prefixes filter the enumerated interface set; full IPs go
+    through unchanged."""
+
+    def test_full_ip_passes_through_without_enumeration(self) -> None:
+        # No prefix in the list → enumeration must NOT be called.
+        with patch(
+            "holo.announce._enumerate_local_ipv4"
+        ) as enum_mock:
+            assert _resolve_ip_overrides(["10.0.0.5"]) == ["10.0.0.5"]
+        assert not enum_mock.called
+
+    def test_prefix_matches_enumerated(self) -> None:
+        with patch(
+            "holo.announce._enumerate_local_ipv4",
+            return_value=["192.168.1.111", "192.168.1.15", "10.0.0.5"],
+        ):
+            assert _resolve_ip_overrides(["192.168.1."]) == [
+                "192.168.1.111",
+                "192.168.1.15",
+            ]
+
+    def test_short_prefix_matches_broadly(self) -> None:
+        with patch(
+            "holo.announce._enumerate_local_ipv4",
+            return_value=["192.168.1.111", "192.168.5.5", "10.0.0.5"],
+        ):
+            assert _resolve_ip_overrides(["192."]) == [
+                "192.168.1.111",
+                "192.168.5.5",
+            ]
+
+    def test_prefix_with_no_match_returns_empty(self) -> None:
+        # Intentional: the user said "advertise only this subnet"; if
+        # that subnet isn't on any interface, advertise nothing rather
+        # than silently widening the broadcast.
+        with patch(
+            "holo.announce._enumerate_local_ipv4",
+            return_value=["192.168.1.111"],
+        ):
+            assert _resolve_ip_overrides(["10.0.0."]) == []
+
+    def test_mixed_full_and_prefix_preserves_order(self) -> None:
+        with patch(
+            "holo.announce._enumerate_local_ipv4",
+            return_value=["192.168.1.111", "10.0.0.5"],
+        ):
+            # Prefix entry comes first → matched IPs come first;
+            # literal entry follows → appended verbatim.
+            assert _resolve_ip_overrides(["192.168.1.", "8.8.8.8"]) == [
+                "192.168.1.111",
+                "8.8.8.8",
+            ]
+
+    def test_dedupe_across_prefix_and_literal(self) -> None:
+        # If the same IP comes via both prefix-match and literal, it
+        # should appear once at the position of the first occurrence.
+        with patch(
+            "holo.announce._enumerate_local_ipv4",
+            return_value=["192.168.1.111"],
+        ):
+            assert _resolve_ip_overrides(
+                ["192.168.1.", "192.168.1.111"]
+            ) == ["192.168.1.111"]
+
+    def test_empty_string_entries_skipped(self) -> None:
+        with patch(
+            "holo.announce._enumerate_local_ipv4",
+            return_value=["10.0.0.5"],
+        ):
+            assert _resolve_ip_overrides(["", "10.0.0.5", ""]) == [
+                "10.0.0.5"
+            ]
+
+
+class TestCollectIPsWithPrefixOverride:
+    """`HoloAnnouncer._collect_ips` integrates the prefix resolver
+    with the existing _is_usable_ipv4 filter."""
+
+    def test_prefix_filters_to_lan_address(self) -> None:
+        # The motivating case: a remote box with a VPN tunnel address
+        # at index 0 sometimes broadcasts to a discoverer that can only
+        # reach the LAN address. `--announce-ip 192.168.1.` lets the
+        # operator pick.
+        with patch(
+            "holo.announce._enumerate_local_ipv4",
+            return_value=[
+                "192.168.193.226",
+                "192.168.1.111",
+                "192.168.1.15",
+            ],
+        ):
+            a = HoloAnnouncer(ips=["192.168.1."])
+            assert a._collect_ips() == ["192.168.1.111", "192.168.1.15"]
+
+    def test_prefix_resolution_runs_through_is_usable_filter(self) -> None:
+        # If a prefix happens to match a loopback address (constructed
+        # carefully — _enumerate_local_ipv4 already strips loopback,
+        # but _is_usable_ipv4 is the load-bearing safety net for the
+        # literal-IP path and must not be skipped on this code path).
+        with patch(
+            "holo.announce._enumerate_local_ipv4",
+            return_value=["10.0.0.5"],
+        ):
+            a = HoloAnnouncer(ips=["127.0.0.1"])
+            # Literal loopback in override is still filtered out.
+            assert a._collect_ips() == []
 
 
 class TestIPsInTXTRecord:

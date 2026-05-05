@@ -316,8 +316,10 @@ def _cmd_mcp(
     Optional metadata: `--announce-session NAME` (logical session
     id), `--announce-user NAME` (display label, defaults to $USER),
     `--announce-ssh-user NAME` (SSH login user, omitted if not set),
-    `--announce-ip A,B,C` (comma-separated IPv4 override; default
-    is to enumerate every non-loopback interface).
+    `--announce-ip A,B,C` (comma-separated IPv4 list; each entry is
+    either a literal IP that's advertised verbatim or a trailing-dot
+    prefix like `192.168.1.` that filters the enumerated interfaces.
+    Default is to enumerate every non-loopback interface).
 
     Either way we print only to stderr — stdout carries protocol.
     """
@@ -724,7 +726,10 @@ Commands:
                           --announce-session NAME    logical session id
                           --announce-user NAME       display label (default: $USER)
                           --announce-ssh-user NAME   SSH login user
-                          --announce-ip A,B,C        comma-separated IPv4 override
+                          --announce-ip A,B,C        IPv4 override; each entry is a
+                                                     literal IP or a trailing-dot
+                                                     prefix (e.g. `192.168.1.`) that
+                                                     filters the enumerated set
                           --announce-capabilities    serve hardware/software inventory
                                                      over a token-auth HTTP endpoint
                           --probe-software A,B,C     extra `which`-lookup names

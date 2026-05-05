@@ -173,6 +173,7 @@ holo mcp --announce \
 | `--announce-session NAME` | Logical session id (omitted if not set) |
 | `--announce-user NAME` | Display label (default: current user) |
 | `--announce-ssh-user NAME` | SSH login user (omitted if not set) |
+| `--announce-ip A,B,C` | IPv4 override (default: enumerate every interface). Each entry is a literal IP or a trailing-dot prefix (e.g. `192.168.1.`) that filters the enumerated set — useful when you want to advertise only the LAN-side address and skip a VPN tunnel. |
 
 If `$TMUX` is set, tmux session and window names are auto-detected
 and added to the TXT record so the companion can `tmux attach -t`.
