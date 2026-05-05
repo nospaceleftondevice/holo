@@ -259,15 +259,20 @@ the mDNS broadcast also gets the token. See
 for the full wire contract.
 
 **MCP tools.** An agent connected to one `holo mcp` instance can read
-other holo hosts' inventories without leaving the agent loop:
+other holo hosts' inventories without leaving the agent loop. Both
+tools answer instantly — `holo mcp` keeps a long-lived mDNS browser
+(`DiscoverHandle`) running for the lifetime of the session, so the
+cache is already populated by the time the agent queries it.
 
-- `holo_discover_sessions(wait_s=3)` — lists every active holo session
-  on the LAN (same data as `holo discover --json`).
-- `holo_fetch_capabilities(instance, wait_s=3, timeout_s=5)` — fetches
-  one host's hardware/software/package inventory. `instance` matches
-  the mDNS instance label, `session`, or `host` (in that order), so
-  pass whatever the user typed. Falls through unreachable IPs to find
-  the first that responds.
+- `holo_discover_sessions(wait_s=0)` — lists every active holo session
+  on the LAN from the cache. `wait_s` is an optional grace period
+  for "I just spawned a daemon, give it time to land in the cache".
+- `holo_fetch_capabilities(instance, timeout_s=5)` — reads the
+  matching session from the cache and HTTP-fetches its
+  `/capabilities` endpoint. `instance` matches the mDNS instance
+  label, `session`, or `host` (in that order), so pass whatever the
+  user typed. Falls through unreachable IPs to find the first that
+  responds.
 
 Both tools are always exposed (no `--bookmarklet` / `--screen`
 dependency), so an agent on the receiving side gets capability-aware
