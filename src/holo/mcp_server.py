@@ -124,6 +124,28 @@ class HoloMCPServer:
                 )
                 self._announcer = None
 
+        # Long-lived LAN discovery cache. Always on, regardless of
+        # `--announce` — even non-announcing holos want to be able to
+        # answer "what other holos are around?" for the agent's
+        # `holo_discover_sessions` / `holo_fetch_capabilities` tools.
+        # mDNS startup failure logs and downgrades to "tools return
+        # empty / raise"; it should never kill the MCP server.
+        self._discover: Any | None = None
+        try:
+            from holo.discover import DiscoverHandle
+
+            self._discover = DiscoverHandle()
+            self._discover.start()
+        except Exception as e:  # noqa: BLE001 — surface and continue
+            print(
+                f"holo mcp: LAN discovery cache failed ({e}); "
+                "holo_discover_sessions will return empty and "
+                "holo_fetch_capabilities will raise",
+                file=sys.stderr,
+                flush=True,
+            )
+            self._discover = None
+
     @property
     def daemon(self) -> Daemon:
         with self._daemon_lock:
@@ -152,6 +174,12 @@ class HoloMCPServer:
             except Exception:  # noqa: BLE001 — shutdown must not raise
                 pass
             self._caps_server = None
+        if self._discover is not None:
+            try:
+                self._discover.stop()
+            except Exception:  # noqa: BLE001 — shutdown must not raise
+                pass
+            self._discover = None
         with self._daemon_lock:
             if self._daemon is not None:
                 self._daemon.shutdown()
@@ -586,65 +614,77 @@ class HoloMCPServer:
     # a host with Chrome Canary installed") happen agent-side once these
     # tools return.
 
-    def holo_discover_sessions(self, wait_s: float = 3.0) -> dict[str, Any]:
-        """Browse mDNS for live `_holo-session._tcp.local.` broadcasts.
+    def holo_discover_sessions(self, wait_s: float = 0.0) -> dict[str, Any]:
+        """Return live `_holo-session._tcp.local.` broadcasts from cache.
 
-        Spins up a temporary zeroconf browser, waits ``wait_s`` seconds
-        for replies, and returns the snapshot. The returned sessions
-        include `caps_port` + `caps_token` when the broadcasting host
-        was launched with `--announce-capabilities`; pass either the
-        `instance` or `session` field back to ``holo_fetch_capabilities``
-        to read its inventory.
+        The HoloMCPServer keeps a long-lived zeroconf browser running
+        (see `DiscoverHandle`), so this call returns instantly with
+        whatever the cache has seen — no per-call browse delay. The
+        cache is continuously refreshed as new announce broadcasts
+        arrive and old ones expire (stale-swept at 2× the mDNS TTL).
 
-        mDNS is link-local — sessions on the other side of a router or
-        most VPNs won't appear. For cross-network discovery, use the
-        `holo connect HOST:PORT` flow instead.
+        ``wait_s`` is an optional grace period: pass a small value
+        (e.g. 1.5 s) if you just told the user to start a new daemon
+        and want to give it time to land in the cache before
+        snapshotting. Default 0 — the cache is usually already fresh.
+
+        Each session includes `caps_port` + `caps_token` when the
+        broadcaster used `--announce-capabilities`; pass `instance`
+        (or `session`/`host`) into `holo_fetch_capabilities` to read
+        its inventory.
+
+        mDNS is link-local — sessions on the other side of a router
+        or most VPNs won't appear. For cross-network discovery, use
+        the `holo connect HOST:PORT` flow instead.
         """
-        import time as _time
+        if self._discover is None:
+            return {"sessions": [], "count": 0}
+        if wait_s > 0:
+            import time as _time
 
-        from holo.discover import _start_browser
-
-        zc, _browser, store = _start_browser()
-        try:
-            _time.sleep(max(0.0, float(wait_s)))
-            sessions = store.snapshot()
-        finally:
-            zc.close()
+            _time.sleep(float(wait_s))
+        sessions = self._discover.snapshot()
         return {"sessions": sessions, "count": len(sessions)}
 
     def holo_fetch_capabilities(
         self,
         instance: str,
-        wait_s: float = 3.0,
         timeout_s: float = 5.0,
     ) -> dict[str, Any]:
         """Fetch a remote holo host's hardware/software/package inventory.
 
+        Reads the instance from the live discovery cache (no per-call
+        zeroconf browse — see `DiscoverHandle`), then HTTP-fetches its
+        `/capabilities` endpoint with the broadcast token.
+
         ``instance`` is matched against (in order) the mDNS instance
         label, the ``session`` field, then the ``host`` field — pass
-        whatever the user typed and we'll find it. The remote must have
-        been launched with `--announce-capabilities`; otherwise we
-        raise rather than silently return an empty inventory.
+        whatever the user typed and we'll find it. The remote must
+        have been launched with `--announce-capabilities`; otherwise
+        we raise rather than silently return an empty inventory.
 
-        The advertised IPs are tried in order with a per-attempt
-        timeout (the first IP can be a VPN tunnel address that's not
-        reachable from the discoverer). The first successful fetch
-        wins; if none reach, raises with the list of attempts.
+        Advertised IPs are tried in order with a per-attempt timeout
+        (the first IP can be a VPN tunnel address that isn't reachable
+        from the discoverer). The first successful fetch wins; if none
+        reach, raises with the list of attempts.
+
+        If the target session isn't in the cache yet, raises a clear
+        error — the agent can call `holo_discover_sessions(wait_s=1.5)`
+        first to give a freshly-started daemon time to appear.
         """
         import json as _json
-        import time as _time
         import urllib.error
         import urllib.request
 
         from holo.capabilities_server import CAPS_TOKEN_HEADER
-        from holo.discover import _start_browser
 
-        zc, _browser, store = _start_browser()
-        try:
-            _time.sleep(max(0.0, float(wait_s)))
-            sessions = store.snapshot()
-        finally:
-            zc.close()
+        if self._discover is None:
+            raise RuntimeError(
+                "discover cache unavailable — mDNS browser failed to start; "
+                "no LAN sessions are visible to this MCP server"
+            )
+
+        sessions = self._discover.snapshot()
 
         target = _match_session(sessions, instance)
         if target is None:
@@ -1084,40 +1124,47 @@ def build_server(
 
     @mcp.tool(
         description=(
-            "Discover live `holo mcp --announce` sessions on the local "
-            "broadcast domain via mDNS. Returns a `sessions` array; each "
-            "entry includes `instance`, `host`, `user`, `ips`, optional "
-            "`session`/`ssh_user`/`tmux_*`, and (when the broadcaster used "
-            "`--announce-capabilities`) `caps_port` + `caps_token`. Pass "
-            "`instance` (or `session`/`host`) into `holo_fetch_capabilities` "
-            "to read the host's hardware/software/package inventory. "
-            "`wait_s` is the browse window — default 3.0 s."
+            "Return live `holo mcp --announce` sessions on the local "
+            "broadcast domain. Reads from a continuously-running mDNS "
+            "cache, so the call is instant — no per-request browse "
+            "delay. Each entry includes `instance`, `host`, `user`, "
+            "`ips`, optional `session`/`ssh_user`/`tmux_*`, and (when "
+            "the broadcaster used `--announce-capabilities`) "
+            "`caps_port` + `caps_token`. Pass `instance` (or "
+            "`session`/`host`) into `holo_fetch_capabilities` to read "
+            "the host's hardware/software/package inventory. "
+            "`wait_s` is an optional grace period — default 0; pass a "
+            "small value (e.g. 1.5) only if you just told the user to "
+            "start a new daemon and want it to land in the cache "
+            "before the snapshot."
         )
     )
-    def holo_discover_sessions(wait_s: float = 3.0) -> dict[str, Any]:
+    def holo_discover_sessions(wait_s: float = 0.0) -> dict[str, Any]:
         return holo.holo_discover_sessions(wait_s=wait_s)
 
     @mcp.tool(
         description=(
             "Fetch a remote holo host's hardware / software / package "
             "inventory over the authenticated `/capabilities` HTTP endpoint. "
-            "`instance` is matched against the mDNS instance label, then "
-            "`session`, then `host` — pass whichever the user gave you. "
-            "Returns `{instance, host, session, ip_used, capabilities}` "
-            "where `capabilities` follows the schema in "
-            "docs/companion-spec.md §3a (hardware: os/arch/cpu_model/cores/"
-            "ram_gb; software: which-lookup map; packages: per-manager arrays). "
-            "Raises if the target session has no capabilities endpoint or "
-            "if none of its advertised IPs is reachable."
+            "Reads the target session from the live discovery cache "
+            "(no per-call mDNS browse), then HTTP-fetches with the "
+            "broadcast token. `instance` is matched against the mDNS "
+            "instance label, then `session`, then `host` — pass "
+            "whichever the user gave you. Returns "
+            "`{instance, host, session, ip_used, capabilities}` where "
+            "`capabilities` follows the schema in docs/companion-spec.md "
+            "§3a. Raises if the target session has no capabilities "
+            "endpoint or if none of its advertised IPs is reachable. "
+            "If the target isn't in the cache yet, call "
+            "`holo_discover_sessions(wait_s=1.5)` first."
         )
     )
     def holo_fetch_capabilities(
         instance: str,
-        wait_s: float = 3.0,
         timeout_s: float = 5.0,
     ) -> dict[str, Any]:
         return holo.holo_fetch_capabilities(
-            instance, wait_s=wait_s, timeout_s=timeout_s
+            instance, timeout_s=timeout_s
         )
 
     return mcp, holo

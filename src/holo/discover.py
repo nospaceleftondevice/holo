@@ -304,6 +304,83 @@ def _start_browser() -> tuple[Any, Any, SessionStore]:
     return zc, browser, store
 
 
+class DiscoverHandle:
+    """Long-lived zeroconf browser + SessionStore + stale-sweeper bundle.
+
+    Lets a long-running process keep a continuously-fresh view of the
+    LAN broadcasts without spawning a new zeroconf browser for every
+    query. The intended owner is `HoloMCPServer`: a connected agent
+    can call `holo_discover_sessions` / `holo_fetch_capabilities`
+    repeatedly and get instant answers because the cache is already
+    populated by the time it's queried.
+
+    Idempotent — repeat ``start()``/``stop()`` are no-ops, and
+    ``stop()`` is safe to call before ``start()``. Stale sweep runs
+    on the same schedule as ``--tail`` mode (default 150 s, 2× the
+    zeroconf TTL) so crashed announcers eventually fall out of the
+    cache without us having to plumb anything per-call.
+    """
+
+    def __init__(
+        self, *, stale_after_s: float = DEFAULT_STALE_AFTER_S
+    ) -> None:
+        self._stale_after_s = stale_after_s
+        self._zc: Any = None
+        self._browser: Any = None
+        self._store: SessionStore | None = None
+        self._stop_event: threading.Event | None = None
+        self._sweeper: threading.Thread | None = None
+        self._lock = threading.Lock()
+
+    def start(self) -> None:
+        with self._lock:
+            if self._zc is not None:
+                return
+            self._zc, self._browser, self._store = _start_browser()
+            self._stop_event = threading.Event()
+            self._sweeper = _start_stale_sweeper(
+                self._store, self._stale_after_s, self._stop_event
+            )
+
+    def stop(self) -> None:
+        # Snapshot under the lock so concurrent stop() calls don't
+        # double-close. The actual close + join happen outside the lock
+        # so we don't hold it across a 2-second sweeper.join().
+        with self._lock:
+            stop_event = self._stop_event
+            sweeper = self._sweeper
+            zc = self._zc
+            self._stop_event = None
+            self._sweeper = None
+            self._zc = None
+            self._browser = None
+            self._store = None
+        if stop_event is not None:
+            stop_event.set()
+        if sweeper is not None:
+            sweeper.join(timeout=2.0)
+        if zc is not None:
+            try:
+                zc.close()
+            except Exception:  # noqa: BLE001 — shutdown must not raise
+                _log.exception("DiscoverHandle: zeroconf close failed")
+
+    @property
+    def is_running(self) -> bool:
+        return self._zc is not None
+
+    @property
+    def store(self) -> SessionStore | None:
+        return self._store
+
+    def snapshot(self) -> list[dict[str, Any]]:
+        """Return the current session list, or [] if not started."""
+        store = self._store
+        if store is None:
+            return []
+        return store.snapshot()
+
+
 # -------------------------------------------------------------- mode adapters
 
 
@@ -577,6 +654,7 @@ __all__ = [
     "DEFAULT_JSON_WAIT_S",
     "DEFAULT_SERVE_PORT",
     "DEFAULT_STALE_AFTER_S",
+    "DiscoverHandle",
     "HoloListener",
     "SessionStore",
     "build_app",

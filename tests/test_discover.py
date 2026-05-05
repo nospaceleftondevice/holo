@@ -515,3 +515,142 @@ class TestHTTPApp:
             assert resp.headers.get("access-control-allow-origin") == (
                 "https://only-this.test"
             )
+
+
+# ============================================================================
+# DiscoverHandle — long-lived browser used by HoloMCPServer
+# ============================================================================
+
+
+class TestDiscoverHandle:
+    """`DiscoverHandle` bundles `_start_browser` + `_start_stale_sweeper`
+    behind a start/stop lifecycle so HoloMCPServer can keep one running
+    for the lifetime of the MCP session."""
+
+    def _stub_zc(self) -> object:
+        # Minimal stand-in — we never let the real zeroconf socket open.
+        class _Z:
+            def __init__(self) -> None:
+                self.close_called = False
+
+            def close(self) -> None:
+                self.close_called = True
+
+        return _Z()
+
+    def test_start_calls_start_browser_once(self) -> None:
+        from unittest.mock import MagicMock, patch
+
+        from holo.discover import DiscoverHandle, SessionStore
+
+        store = SessionStore()
+        with (
+            patch(
+                "holo.discover._start_browser",
+                return_value=(self._stub_zc(), None, store),
+            ) as start_browser,
+            patch(
+                "holo.discover._start_stale_sweeper",
+                return_value=MagicMock(),
+            ),
+        ):
+            h = DiscoverHandle()
+            h.start()
+            try:
+                assert start_browser.call_count == 1
+                # Repeated start must be a no-op.
+                h.start()
+                assert start_browser.call_count == 1
+            finally:
+                h.stop()
+
+    def test_snapshot_reflects_store(self) -> None:
+        from unittest.mock import MagicMock, patch
+
+        from holo.discover import DiscoverHandle, SessionStore
+
+        store = SessionStore()
+        store.upsert(
+            {
+                "instance": "holo-x-1-aaa",
+                "host": "host.local",
+                "user": "alice",
+                "v": "1",
+                "holo_pid": 1,
+                "holo_version": "0.1.0a16",
+                "started": 1_700_000_000,
+                "cwd": "/x",
+                "last_seen": 1_700_000_001,
+            }
+        )
+        with (
+            patch(
+                "holo.discover._start_browser",
+                return_value=(self._stub_zc(), None, store),
+            ),
+            patch(
+                "holo.discover._start_stale_sweeper",
+                return_value=MagicMock(),
+            ),
+        ):
+            h = DiscoverHandle()
+            h.start()
+            try:
+                snap = h.snapshot()
+            finally:
+                h.stop()
+        assert len(snap) == 1
+        assert snap[0]["instance"] == "holo-x-1-aaa"
+
+    def test_snapshot_before_start_returns_empty(self) -> None:
+        from holo.discover import DiscoverHandle
+
+        # Cleanly handles "queried before started" — we want callers
+        # to get [] rather than an exception so the MCP tool can
+        # degrade gracefully.
+        h = DiscoverHandle()
+        assert h.snapshot() == []
+
+    def test_stop_before_start_is_noop(self) -> None:
+        from holo.discover import DiscoverHandle
+
+        DiscoverHandle().stop()  # must not raise
+
+    def test_stop_closes_zeroconf_and_signals_sweeper(self) -> None:
+        from unittest.mock import patch
+
+        from holo.discover import DiscoverHandle, SessionStore
+
+        store = SessionStore()
+        zc = self._stub_zc()
+
+        # Capture the stop_event so we can verify it was set.
+        captured: dict[str, Any] = {}
+
+        def fake_sweeper(store_, stale_after_s, stop_event):  # noqa: ARG001
+            import threading
+
+            captured["stop_event"] = stop_event
+            t = threading.Thread(
+                target=lambda: stop_event.wait(timeout=5.0),
+                daemon=True,
+            )
+            t.start()
+            return t
+
+        with (
+            patch(
+                "holo.discover._start_browser",
+                return_value=(zc, None, store),
+            ),
+            patch(
+                "holo.discover._start_stale_sweeper",
+                side_effect=fake_sweeper,
+            ),
+        ):
+            h = DiscoverHandle()
+            h.start()
+            h.stop()
+
+        assert zc.close_called is True
+        assert captured["stop_event"].is_set()

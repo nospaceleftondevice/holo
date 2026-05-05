@@ -10,12 +10,47 @@ Channel/Daemon paths in their own test files.
 from __future__ import annotations
 
 from typing import Any
+from unittest.mock import MagicMock, patch
 
 import pytest
 
 from holo.channel import CalibrationError, CommandError
 from holo.mcp_server import HoloMCPServer, build_server
 from holo.registry import ChannelRegistry
+
+
+@pytest.fixture(autouse=True)
+def _stub_discover_handle():
+    """Replace the persistent zeroconf browser that `HoloMCPServer`
+    eagerly starts in __init__ with a no-op stub.
+
+    Without this, every test that constructs `HoloMCPServer()` would
+    open a real multicast socket and register a real `ServiceBrowser`
+    — bleed-through of zeroconf callback threads into other tests was
+    surfacing as `NotRunningException` in unrelated cases.
+
+    Tests that exercise discover behaviour shadow this with their own
+    `with patch("holo.discover._start_browser", ...)` block; the inner
+    patch takes precedence for its scope, then the autouse stub takes
+    over again.
+    """
+    from holo.discover import SessionStore
+
+    class _FakeZC:
+        def close(self) -> None:
+            pass
+
+    with (
+        patch(
+            "holo.discover._start_browser",
+            return_value=(_FakeZC(), None, SessionStore()),
+        ),
+        patch(
+            "holo.discover._start_stale_sweeper",
+            return_value=MagicMock(),
+        ),
+    ):
+        yield
 
 
 class _StubChannel:
@@ -1106,9 +1141,7 @@ class TestHoloFetchCapabilities:
         ):
             server = HoloMCPServer(no_bookmarklet=True)
             try:
-                out = server.holo_fetch_capabilities(
-                    "holo-x-1-aaa", wait_s=0.0
-                )
+                out = server.holo_fetch_capabilities("holo-x-1-aaa")
             finally:
                 server.shutdown()
 
@@ -1143,7 +1176,7 @@ class TestHoloFetchCapabilities:
             server = HoloMCPServer(no_bookmarklet=True)
             try:
                 with pytest.raises(RuntimeError, match="no holo session matching"):
-                    server.holo_fetch_capabilities("ghost", wait_s=0.0)
+                    server.holo_fetch_capabilities("ghost")
             finally:
                 server.shutdown()
 
@@ -1165,7 +1198,7 @@ class TestHoloFetchCapabilities:
             server = HoloMCPServer(no_bookmarklet=True)
             try:
                 with pytest.raises(RuntimeError, match="no capabilities endpoint"):
-                    server.holo_fetch_capabilities("holo-x-1-aaa", wait_s=0.0)
+                    server.holo_fetch_capabilities("holo-x-1-aaa")
             finally:
                 server.shutdown()
 
@@ -1207,9 +1240,7 @@ class TestHoloFetchCapabilities:
         ):
             server = HoloMCPServer(no_bookmarklet=True)
             try:
-                out = server.holo_fetch_capabilities(
-                    "holo-x-1-aaa", wait_s=0.0
-                )
+                out = server.holo_fetch_capabilities("holo-x-1-aaa")
             finally:
                 server.shutdown()
 
@@ -1243,14 +1274,122 @@ class TestHoloFetchCapabilities:
                 with pytest.raises(
                     RuntimeError, match="could not reach capabilities endpoint"
                 ) as ei:
-                    server.holo_fetch_capabilities(
-                        "holo-x-1-aaa", wait_s=0.0
-                    )
+                    server.holo_fetch_capabilities("holo-x-1-aaa")
             finally:
                 server.shutdown()
         # Error message names every IP we tried.
         assert "10.0.0.5" in str(ei.value)
         assert "10.0.0.6" in str(ei.value)
+
+
+class TestPersistentDiscoverCache:
+    """The persistent DiscoverHandle should be created once at __init__
+    and reused across every tool call — no per-request mDNS browse."""
+
+    def test_start_browser_called_exactly_once_for_many_calls(self) -> None:
+        from holo.discover import SessionStore
+
+        store = SessionStore()
+        store.upsert(
+            _fake_session(
+                instance="holo-x-1-aaa",
+                ips=["10.0.0.5"],
+                caps_port=49597,
+                caps_token="tok",
+            )
+        )
+
+        class FakeZC:
+            def close(self) -> None:
+                pass
+
+        with (
+            patch(
+                "holo.discover._start_browser",
+                return_value=(FakeZC(), None, store),
+            ) as start_browser,
+            patch(
+                "holo.discover._start_stale_sweeper",
+                return_value=MagicMock(),
+            ),
+        ):
+            server = HoloMCPServer(no_bookmarklet=True)
+            try:
+                # Ten back-to-back queries.
+                for _ in range(10):
+                    server.holo_discover_sessions()
+            finally:
+                server.shutdown()
+            # __init__ called start once; the ten tool calls didn't
+            # add to the count.
+            assert start_browser.call_count == 1
+
+    def test_fetch_capabilities_does_not_re_browse(self) -> None:
+        import io
+
+        from holo.discover import SessionStore
+
+        store = SessionStore()
+        store.upsert(
+            _fake_session(
+                instance="holo-x-1-aaa",
+                ips=["10.0.0.5"],
+                caps_port=49597,
+                caps_token="tok",
+            )
+        )
+
+        class FakeZC:
+            def close(self) -> None:
+                pass
+
+        def fake_urlopen(req: Any, timeout: float = 0) -> Any:
+            resp = io.BytesIO(b'{"schema":1,"host":{}}')
+            resp.__enter__ = lambda self: self  # type: ignore[attr-defined]
+            resp.__exit__ = lambda self, *a: None  # type: ignore[attr-defined]
+            return resp
+
+        with (
+            patch(
+                "holo.discover._start_browser",
+                return_value=(FakeZC(), None, store),
+            ) as start_browser,
+            patch(
+                "holo.discover._start_stale_sweeper",
+                return_value=MagicMock(),
+            ),
+            patch("urllib.request.urlopen", side_effect=fake_urlopen),
+        ):
+            server = HoloMCPServer(no_bookmarklet=True)
+            try:
+                server.holo_fetch_capabilities("holo-x-1-aaa")
+                server.holo_fetch_capabilities("holo-x-1-aaa")
+                server.holo_fetch_capabilities("holo-x-1-aaa")
+            finally:
+                server.shutdown()
+            # One browser, ever — three fetches did NOT spawn new
+            # zeroconf instances.
+            assert start_browser.call_count == 1
+
+    def test_discover_handle_failure_downgrades_gracefully(self) -> None:
+        # If mDNS startup blows up (no network, multicast disabled),
+        # the server must still build — the tools just degrade.
+        with patch(
+            "holo.discover._start_browser",
+            side_effect=OSError("no multicast"),
+        ):
+            server = HoloMCPServer(no_bookmarklet=True)
+            try:
+                # discover_sessions returns empty rather than raising
+                out = server.holo_discover_sessions()
+                assert out == {"sessions": [], "count": 0}
+                # fetch_capabilities raises with a clear error
+                with pytest.raises(
+                    RuntimeError, match="discover cache unavailable"
+                ):
+                    server.holo_fetch_capabilities("anything")
+            finally:
+                server.shutdown()
 
 
 class TestCapabilityToolsAlwaysExposed:
