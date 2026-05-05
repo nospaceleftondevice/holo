@@ -169,7 +169,10 @@ class HoloAnnouncer:
 
         Order of preference:
         1. Explicit ``ips=`` constructor override (user-curated, e.g.
-           "only the VPN-side address").
+           "only the VPN-side address"). Each entry is either a
+           literal IPv4 (advertised as-is) or a trailing-dot prefix
+           (``192.168.1.``) used to filter the enumerated interface
+           list — see :func:`_resolve_ip_overrides`.
         2. Auto-enumerate every interface via ``ifaddr``, dropping
            loopback (127.0.0.0/8) and link-local (169.254.0.0/16).
         3. Fall back to ``gethostbyname`` so we never advertise an
@@ -180,7 +183,8 @@ class HoloAnnouncer:
         helping anyone today.
         """
         if self.ips_override:
-            return [ip for ip in self.ips_override if _is_usable_ipv4(ip)]
+            resolved = _resolve_ip_overrides(self.ips_override)
+            return [ip for ip in resolved if _is_usable_ipv4(ip)]
         enumerated = _enumerate_local_ipv4()
         if enumerated:
             return enumerated
@@ -273,6 +277,45 @@ def _tmux_field(spec: str) -> str | None:
         return None
     out = result.stdout.strip()
     return out or None
+
+
+def _resolve_ip_overrides(entries: list[str]) -> list[str]:
+    """Resolve a mixed override list of literal IPs and prefix filters.
+
+    Each entry in ``entries`` is one of:
+      - a complete dotted-quad (``"192.168.1.5"``): kept verbatim, even
+        if it's not on any local interface — sometimes the operator
+        knows about a routable address holo can't see locally.
+      - a trailing-dot prefix (``"192.168.1."``, ``"192."``): used as
+        a string-prefix filter against locally enumerated interfaces.
+        Only enumerated IPs starting with the prefix are kept.
+
+    Order is preserved (entry order in the input drives entry order in
+    the output) and duplicates are dropped. If a prefix matches no
+    interface, it contributes nothing — the caller does NOT fall back
+    to advertising every interface, since the user's intent in
+    specifying a filter is "advertise only this subnet".
+
+    Enumeration is skipped entirely when the override list contains
+    no prefixes — the literal-only path was the original behaviour
+    and shouldn't pay an ifaddr.get_adapters() cost on every start.
+    """
+    needs_enumeration = any(e.endswith(".") for e in entries if e)
+    enumerated = _enumerate_local_ipv4() if needs_enumeration else []
+    out: list[str] = []
+    seen: set[str] = set()
+    for entry in entries:
+        if not entry:
+            continue
+        if entry.endswith("."):
+            for ip in enumerated:
+                if ip.startswith(entry) and ip not in seen:
+                    seen.add(ip)
+                    out.append(ip)
+        elif entry not in seen:
+            seen.add(entry)
+            out.append(entry)
+    return out
 
 
 def _is_usable_ipv4(addr: str) -> bool:
