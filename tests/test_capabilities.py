@@ -313,6 +313,47 @@ class TestProbeApplicationsMacOS:
         assert "Corrupt" in apps
         assert apps["Corrupt"] == {"path": str(bundle)}
 
+    def test_old_style_ascii_plist_falls_back_to_path_only(
+        self, tmp_path: Any
+    ) -> None:
+        """Regression: NeXTSTEP-style ASCII plists raise
+        `xml.parsers.expat.ExpatError` from `plistlib.load`. Earlier
+        versions only caught `OSError` / `InvalidFileException` /
+        `ValueError`, so the exception bubbled up the entire ASGI
+        stack and crashed the /capabilities request with HTTP 500
+        (which discover.sh reports as `unreachable` because of
+        `curl --fail`). Apple still ships some bundles in this format.
+        """
+        apps_dir = tmp_path / "Applications"
+        apps_dir.mkdir()
+        bundle = apps_dir / "AsciiPlist.app"
+        (bundle / "Contents").mkdir(parents=True)
+        (bundle / "Contents" / "Info.plist").write_bytes(
+            b"{\n"
+            b"    CFBundleName = \"AsciiPlist\";\n"
+            b"    CFBundleVersion = \"1.0\";\n"
+            b"    CFBundleIdentifier = \"com.example.AsciiPlist\";\n"
+            b"}\n"
+        )
+
+        with (
+            patch(
+                "holo.capabilities.platform.system", return_value="Darwin"
+            ),
+            patch(
+                "holo.capabilities._MACOS_APP_DIRS", (str(apps_dir),)
+            ),
+            patch(
+                "holo.capabilities._run_pkg_command", return_value=""
+            ),
+        ):
+            apps = probe_applications()
+
+        # Entry still appears — just no metadata. The probe MUST NOT
+        # raise, because that crashes the whole capabilities sweep.
+        assert "AsciiPlist" in apps
+        assert apps["AsciiPlist"] == {"path": str(bundle)}
+
     def test_skips_system_library_paths(self) -> None:
         from holo.capabilities import _is_system_app_bundle
 

@@ -742,7 +742,21 @@ def _read_app_metadata(bundle_path: str) -> dict[str, str]:
     try:
         with open(plist_path, "rb") as f:
             data = plistlib.load(f)
-    except (OSError, plistlib.InvalidFileException, ValueError):
+    except Exception as e:  # noqa: BLE001 — any read failure → "metadata unknown"
+        # Real-world failures we've hit:
+        #   * `xml.parsers.expat.ExpatError` — old-style ASCII (NeXTSTEP)
+        #     plists ({ key = "value"; } syntax) that plistlib can't
+        #     parse. Apple still ships some bundles in this format.
+        #   * `plistlib.InvalidFileException` — corrupt binary plist.
+        #   * `OSError` — missing or permission-denied Info.plist.
+        # All of these collapse to "no metadata for this app", and the
+        # caller still surfaces the entry with `path` populated. Logged
+        # at DEBUG so a verbose run can list which plists were skipped.
+        _log.debug(
+            "capabilities: failed to read Info.plist for %s: %s",
+            bundle_path,
+            e,
+        )
         return {}
     if not isinstance(data, dict):
         return {}
