@@ -184,6 +184,40 @@ Verify the broadcast on macOS:
 dns-sd -B _holo-session._tcp local
 ```
 
+### Session discovery
+
+`holo discover` is the in-tree consumer of the announce contract. The
+desktop companion app talks to its `--serve` mode; you can also use it
+from the CLI for ad-hoc inspection.
+
+```bash
+# One-shot JSON snapshot (default browse window: 3s)
+holo discover --json
+
+# Long-running JSONL event stream
+holo discover --tail
+
+# HTTP + WebSocket server (default :7082, talks to the desktop SPA)
+holo discover --serve 7082
+```
+
+`--serve` exposes:
+
+| Endpoint | Returns |
+| --- | --- |
+| `GET /sessions` | JSON array of currently-known sessions |
+| `GET /healthz` | `{status, interfaces, zt_present}` |
+| `WS /events` | newline-delimited `add`/`update`/`remove` events |
+
+CORS allow-list defaults to `http://localhost:8888,https://app-dev.tai.sh`
+for development; override with `--cors-origin A,B,C`. Stale entries
+(announcer crashed without sending a Goodbye) are swept after
+`--stale-after` seconds, default 150.
+
+The wire contract is documented in
+[`docs/companion-spec.md`](docs/companion-spec.md) — `holo discover`
+is the reference implementation of that spec.
+
 ## License
 
 Apache-2.0. See [LICENSE](LICENSE).

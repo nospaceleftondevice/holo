@@ -575,6 +575,113 @@ def _cmd_install_bookmarklet(rest: list[str]) -> int:
     return install_bookmarklet.run(url=url)
 
 
+_DISCOVER_USAGE = (
+    "usage: holo discover [--json | --tail | --serve PORT] [options]\n"
+    "  --json              one-shot snapshot, JSON array, exit\n"
+    "  --tail              long-running JSONL event stream\n"
+    "  --serve PORT        HTTP+WebSocket server (default 7082)\n"
+    "  --wait SECS         --json browse window (default 3.0)\n"
+    "  --stale-after SECS  drop sessions older than this (default 150)\n"
+    "  --cors-origin O     comma-separated CORS allow-list "
+    "(default: http://localhost:8888,https://app-dev.tai.sh)"
+)
+
+
+def _cmd_discover(rest: list[str]) -> int:
+    """Browse the LAN for `_holo-session._tcp.local.` broadcasts.
+
+    Reference consumer of `docs/companion-spec.md`. See `--help` for
+    the three output modes (`--json`, `--tail`, `--serve PORT`).
+    """
+    from holo import discover
+
+    json_mode = "--json" in rest
+    tail_mode = "--tail" in rest
+    serve_port_raw = _value_flag(rest, "--serve")
+
+    selected = sum([json_mode, tail_mode, serve_port_raw is not None])
+    if selected == 0:
+        sys.stderr.write(
+            "holo discover: pick exactly one mode (--json | --tail | --serve PORT)\n"
+            f"{_DISCOVER_USAGE}\n"
+        )
+        return 2
+    if selected > 1:
+        sys.stderr.write(
+            "holo discover: --json / --tail / --serve are mutually exclusive\n"
+        )
+        return 2
+
+    if serve_port_raw is _MISSING_ARG:
+        sys.stderr.write("holo discover: --serve requires a port number\n")
+        return 2
+
+    wait_raw = _value_flag(rest, "--wait")
+    if wait_raw is _MISSING_ARG:
+        sys.stderr.write("holo discover: --wait requires a value\n")
+        return 2
+    wait_s = discover.DEFAULT_JSON_WAIT_S
+    if isinstance(wait_raw, str):
+        try:
+            wait_s = float(wait_raw)
+        except ValueError:
+            sys.stderr.write(
+                f"holo discover: invalid --wait value {wait_raw!r}\n"
+            )
+            return 2
+
+    stale_raw = _value_flag(rest, "--stale-after")
+    if stale_raw is _MISSING_ARG:
+        sys.stderr.write("holo discover: --stale-after requires a value\n")
+        return 2
+    stale_after_s = discover.DEFAULT_STALE_AFTER_S
+    if isinstance(stale_raw, str):
+        try:
+            stale_after_s = float(stale_raw)
+        except ValueError:
+            sys.stderr.write(
+                f"holo discover: invalid --stale-after value {stale_raw!r}\n"
+            )
+            return 2
+
+    cors_raw = _value_flag(rest, "--cors-origin")
+    if cors_raw is _MISSING_ARG:
+        sys.stderr.write("holo discover: --cors-origin requires a value\n")
+        return 2
+    cors_origins: list[str] | None = None
+    if isinstance(cors_raw, str):
+        cors_origins = [
+            o.strip() for o in cors_raw.split(",") if o.strip()
+        ]
+        if not cors_origins:
+            sys.stderr.write(
+                "holo discover: --cors-origin requires at least one origin\n"
+            )
+            return 2
+
+    if json_mode:
+        return discover.run_oneshot(wait_s=wait_s)
+    if tail_mode:
+        return discover.run_tail(stale_after_s=stale_after_s)
+    # --serve
+    assert isinstance(serve_port_raw, str)  # _value_flag already returned a str
+    try:
+        port = int(serve_port_raw)
+    except ValueError:
+        sys.stderr.write(
+            f"holo discover: invalid --serve port {serve_port_raw!r}\n"
+        )
+        return 2
+    if not (0 < port < 65536):
+        sys.stderr.write(f"holo discover: --serve port {port} out of range\n")
+        return 2
+    return discover.run_serve(
+        port=port,
+        cors_origins=cors_origins,
+        stale_after_s=stale_after_s,
+    )
+
+
 COMMANDS = {
     "windows": _cmd_windows,
     "doctor": _cmd_doctor,
@@ -607,6 +714,10 @@ Commands:
                           --announce-ip A,B,C        comma-separated IPv4 override
   connect HOST:PORT       stdio↔TCP bridge to a listening `holo mcp`
   mcp-remote -- CMD ...   spawn-per-connection stdio proxy
+  discover [--json | --tail | --serve PORT] [--wait SECS]
+           [--stale-after SECS] [--cors-origin O,O,...]
+                          discover live `_holo-session._tcp.local.` broadcasts
+                          (reference consumer for docs/companion-spec.md)
   windows                 print visible windows (smoke for windows reader)
   screen <verb>           smoke-test the SikuliX-backed screen tools directly
   install-screen          pre-download the SikuliX jar into the user cache
@@ -740,6 +851,8 @@ def main(argv: list[str] | None = None) -> int:
         return _cmd_screen(rest)
     if cmd == "install-bookmarklet":
         return _cmd_install_bookmarklet(rest)
+    if cmd == "discover":
+        return _cmd_discover(rest)
     if cmd in COMMANDS:
         return COMMANDS[cmd]()
     print(

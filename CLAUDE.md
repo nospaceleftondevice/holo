@@ -138,6 +138,26 @@ dns-sd -L <instance> _holo-session._tcp local   # full TXT dump
 
 The advertised SRV port is `0` in stdio mode and the `--listen` port in TCP mode. The desktop companion uses TXT data + SSH config for the actual connection — the SRV port is metadata, not an endpoint to dial directly.
 
+## Session discovery (`holo discover`)
+
+`src/holo/discover.py` is the in-tree consumer of the announce contract. Three output modes:
+
+| Mode | Use |
+|---|---|
+| `holo discover --json [--wait SECS]` | One-shot snapshot, JSON array on stdout, exit. Default browse window 3 s. |
+| `holo discover --tail [--stale-after SECS]` | Long-running JSONL event stream (`{"type":"add"\|"remove"\|"update", ...}`). Stale sweep at 2× cache TTL. |
+| `holo discover --serve PORT [--cors-origin ...]` | HTTP + WebSocket server (default port `7082`). `GET /sessions`, `GET /healthz`, `WS /events`. |
+
+The R2D2 desktop SPA on the user's laptop hits `--serve 7082`. The HTTP layer is Starlette (lifespan ctx mgr, no `on_startup`/`on_shutdown` — those were removed in Starlette 1.0). uvicorn drives the loop. Default CORS allow-list is `http://localhost:8888,https://app-dev.tai.sh`; override with `--cors-origin A,B,C`.
+
+**Schema validation:** `parse_txt` shares field-name constants and the `REQUIRED_FIELDS` / `INT_FIELDS` tuples with `announce.py`. A TXT with `v != "1"` or missing required fields is logged at WARNING and dropped — fail closed, per spec §2.4.
+
+**Thread model:** `SessionStore` uses `threading.RLock`. Zeroconf callbacks run on its own thread; the stale-sweep is a daemon thread; `--serve`'s WS handler hops events from the zeroconf thread to the asyncio loop via `loop.call_soon_threadsafe`. Subscribers are called *while the lock is held*, so they must not block.
+
+**Goodbye vs. stale sweep:** if the announcer exits cleanly (SIGINT / SIGTERM), zeroconf delivers a `Rmv` event ~100 ms later → `remove` event downstream. If the host crashes / SIGKILL'd, no Goodbye fires; the stale sweep drops the entry after `--stale-after` seconds (default 150 = 2× zeroconf's 75 s TTL).
+
+**`/healthz`** returns `{status, interfaces, zt_present}`. `zt_present` is a heuristic — checks for any interface name starting with `zt`. ZeroTier on macOS/Linux uses that prefix. Windows ZT names interfaces by description, not prefix; the heuristic returns false there but doesn't break anything.
+
 ## UI template cache (desktop DOM analog)
 
 For UI elements outside any browser tab — Chrome's kebab/bookmarks bar, the dock, menu-bar items, native app buttons — `src/holo/templates.py` + the `ui_template_*` MCP tools provide a persistent name → image cache. Capture an element once (`ui_template_capture` blocks for a SikuliX `Region.userCapture()` rect drag, or accepts an explicit `region` for programmatic stash), then `ui_template_click("kebab", app="chrome")` in future sessions does template matching via `find_image_path` and clicks the center. Avoids re-doing vision each session for stable on-screen elements.

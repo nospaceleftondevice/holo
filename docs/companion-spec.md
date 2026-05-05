@@ -13,6 +13,13 @@ and provides a UI for connecting to them (SSH + tmux). The companion is
 > holo repo (`https://github.com/nospaceleftondevice/holo`). This spec
 > describes schema version `v=1`, current as of holo `0.1.0a12`. If the
 > code and this doc disagree, the code wins.
+>
+> **Reference consumer:** `holo discover` (`src/holo/discover.py`) is the
+> in-tree implementation of this contract. It exposes the same data the
+> desktop companion needs through three modes — `--json` (snapshot),
+> `--tail` (JSONL events), and `--serve PORT` (HTTP + WebSocket).
+> Cross-check ambiguous wording in this spec against `discover.py` and
+> the test suite (`tests/test_discover.py`).
 
 ---
 

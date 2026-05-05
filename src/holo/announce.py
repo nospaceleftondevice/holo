@@ -39,6 +39,37 @@ if TYPE_CHECKING:
 SERVICE_TYPE = "_holo-session._tcp.local."
 TXT_SCHEMA_VERSION = "1"
 
+# TXT field names — single source of truth shared with discover.py so the
+# announcer and the consumer can't drift. Spec: docs/companion-spec.md §2.4.
+FIELD_V = "v"
+FIELD_HOST = "host"
+FIELD_USER = "user"
+FIELD_SSH_USER = "ssh_user"
+FIELD_SESSION = "session"
+FIELD_HOLO_PID = "holo_pid"
+FIELD_HOLO_VERSION = "holo_version"
+FIELD_STARTED = "started"
+FIELD_CWD = "cwd"
+FIELD_IPS = "ips"
+FIELD_TMUX_SESSION = "tmux_session"
+FIELD_TMUX_WINDOW = "tmux_window"
+
+# Required even when other fields are missing. A TXT missing any of these
+# is malformed and should be dropped.
+REQUIRED_FIELDS: tuple[str, ...] = (
+    FIELD_V,
+    FIELD_HOST,
+    FIELD_USER,
+    FIELD_HOLO_PID,
+    FIELD_HOLO_VERSION,
+    FIELD_STARTED,
+    FIELD_CWD,
+)
+
+# Fields parsed/emitted as integers in the JSON contract. TXT carries them
+# as UTF-8 strings; discover.py converts.
+INT_FIELDS: frozenset[str] = frozenset({FIELD_HOLO_PID, FIELD_STARTED})
+
 _log = logging.getLogger(__name__)
 
 
@@ -82,26 +113,26 @@ class HoloAnnouncer:
                 return
             props[key.encode("utf-8")] = value.encode("utf-8")
 
-        put("v", TXT_SCHEMA_VERSION)
-        put("host", socket.gethostname())
-        put("user", self.user)
-        put("ssh_user", self.ssh_user)
-        put("session", self.session)
-        put("holo_pid", str(os.getpid()))
-        put("holo_version", __version__)
-        put("started", str(int(time.time())))
-        put("cwd", os.getcwd())
+        put(FIELD_V, TXT_SCHEMA_VERSION)
+        put(FIELD_HOST, socket.gethostname())
+        put(FIELD_USER, self.user)
+        put(FIELD_SSH_USER, self.ssh_user)
+        put(FIELD_SESSION, self.session)
+        put(FIELD_HOLO_PID, str(os.getpid()))
+        put(FIELD_HOLO_VERSION, __version__)
+        put(FIELD_STARTED, str(int(time.time())))
+        put(FIELD_CWD, os.getcwd())
 
         ips = self._collect_ips()
         if ips:
             # Belt-and-suspenders: also expose IPs in TXT so a client
             # that doesn't follow up with an A-record query can dial
             # the host directly without resolving `<host>.local.`.
-            put("ips", ",".join(ips))
+            put(FIELD_IPS, ",".join(ips))
 
         if os.environ.get("TMUX"):
-            put("tmux_session", _tmux_field("#S"))
-            put("tmux_window", _tmux_field("#W"))
+            put(FIELD_TMUX_SESSION, _tmux_field("#S"))
+            put(FIELD_TMUX_WINDOW, _tmux_field("#W"))
 
         return props
 
@@ -267,4 +298,22 @@ def _enumerate_local_ipv4() -> list[str]:
     return out
 
 
-__all__ = ["HoloAnnouncer", "SERVICE_TYPE", "TXT_SCHEMA_VERSION"]
+__all__ = [
+    "FIELD_CWD",
+    "FIELD_HOLO_PID",
+    "FIELD_HOLO_VERSION",
+    "FIELD_HOST",
+    "FIELD_IPS",
+    "FIELD_SESSION",
+    "FIELD_SSH_USER",
+    "FIELD_STARTED",
+    "FIELD_TMUX_SESSION",
+    "FIELD_TMUX_WINDOW",
+    "FIELD_USER",
+    "FIELD_V",
+    "HoloAnnouncer",
+    "INT_FIELDS",
+    "REQUIRED_FIELDS",
+    "SERVICE_TYPE",
+    "TXT_SCHEMA_VERSION",
+]
