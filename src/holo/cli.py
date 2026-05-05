@@ -291,8 +291,6 @@ def _cmd_mcp(
     announce_ssh_user: str | None = None,
     announce_ips: list[str] | None = None,
     announce_capabilities: bool = False,
-    probe_software: list[str] | None = None,
-    probe_packages: list[str] | None = None,
 ) -> int:
     """Run the MCP server.
 
@@ -344,10 +342,9 @@ def _cmd_mcp(
             label = " ".join(label_bits) if label_bits else "(defaults)"
             lines.append(f"mDNS announce: enabled — {label}")
         if announce_capabilities:
-            sw = ",".join(probe_software) if probe_software else "default"
-            pkg = ",".join(probe_packages) if probe_packages else "(none)"
             lines.append(
-                f"Capabilities endpoint: enabled — software={sw} pkg={pkg}"
+                "Capabilities endpoint: enabled "
+                "(applications + packages auto-discovered per platform)"
             )
         return lines
 
@@ -358,8 +355,6 @@ def _cmd_mcp(
         "announce_ssh_user": announce_ssh_user,
         "announce_ips": announce_ips,
         "announce_capabilities": announce_capabilities,
-        "probe_software": probe_software,
-        "probe_packages": probe_packages,
     }
 
     if listen_port is not None:
@@ -718,7 +713,7 @@ Commands:
   mcp [--listen PORT] [--hide-qr] [--screen] [--no-bookmarklet]
       [--announce] [--announce-session NAME] [--announce-user NAME]
       [--announce-ssh-user NAME] [--announce-ip A,B,C]
-      [--announce-capabilities] [--probe-software a,b,c] [--probe-pkg a,b,c]
+      [--announce-capabilities]
                           run the MCP server over stdio (or TCP with --listen)
                           --screen          enable screen / template / app_activate tools
                           --no-bookmarklet  drop channel tools; no WS server
@@ -730,12 +725,11 @@ Commands:
                                                      literal IP or a trailing-dot
                                                      prefix (e.g. `192.168.1.`) that
                                                      filters the enumerated set
-                          --announce-capabilities    serve hardware/software inventory
-                                                     over a token-auth HTTP endpoint
-                          --probe-software A,B,C     extra `which`-lookup names
-                          --probe-pkg M,M,M          probe package managers
-                                                     (brew,apt,dpkg,dnf,yum,rpm,
-                                                      port,pacman,winget,choco)
+                          --announce-capabilities    serve hardware + applications +
+                                                     packages inventory over a
+                                                     token-auth HTTP endpoint
+                                                     (everything auto-discovered;
+                                                     no per-probe flags)
   connect HOST:PORT       stdio↔TCP bridge to a listening `holo mcp`
   mcp-remote -- CMD ...   spawn-per-connection stdio proxy
   discover [--json | --tail | --serve PORT] [--wait SECS]
@@ -820,23 +814,32 @@ def main(argv: list[str] | None = None) -> int:
         announce_user = _value_flag(rest, "--announce-user")
         announce_ssh_user = _value_flag(rest, "--announce-ssh-user")
         announce_ip_raw = _value_flag(rest, "--announce-ip")
-        probe_software_raw = _value_flag(rest, "--probe-software")
-        probe_pkg_raw = _value_flag(rest, "--probe-pkg")
         announce = "--announce" in rest
         announce_capabilities = "--announce-capabilities" in rest
+
+        # `--probe-software` and `--probe-pkg` were removed when
+        # capabilities went auto. Catch old commands so users see a
+        # useful error instead of "unrecognised flag".
+        if "--probe-software" in rest or "--probe-pkg" in rest:
+            sys.stderr.write(
+                "holo mcp: --probe-software / --probe-pkg were removed in "
+                "0.1.0a16; software (applications + packages) is now "
+                "auto-discovered per platform when --announce-capabilities "
+                "is set. Drop the flag and re-run.\n"
+            )
+            return 2
+
         if not announce and (
             announce_session is not None
             or announce_user is not None
             or announce_ssh_user is not None
             or announce_ip_raw is not None
             or announce_capabilities
-            or probe_software_raw is not None
-            or probe_pkg_raw is not None
         ):
             sys.stderr.write(
                 "holo mcp: --announce-session/--announce-user/"
-                "--announce-ssh-user/--announce-ip/--announce-capabilities/"
-                "--probe-software/--probe-pkg require --announce\n"
+                "--announce-ssh-user/--announce-ip/--announce-capabilities "
+                "require --announce\n"
             )
             return 2
         if announce_session is _MISSING_ARG:
@@ -851,22 +854,6 @@ def main(argv: list[str] | None = None) -> int:
         if announce_ip_raw is _MISSING_ARG:
             sys.stderr.write("holo mcp: --announce-ip requires a value\n")
             return 2
-        if probe_software_raw is _MISSING_ARG:
-            sys.stderr.write(
-                "holo mcp: --probe-software requires a value\n"
-            )
-            return 2
-        if probe_pkg_raw is _MISSING_ARG:
-            sys.stderr.write("holo mcp: --probe-pkg requires a value\n")
-            return 2
-        if (
-            probe_software_raw is not None or probe_pkg_raw is not None
-        ) and not announce_capabilities:
-            sys.stderr.write(
-                "holo mcp: --probe-software / --probe-pkg require "
-                "--announce-capabilities\n"
-            )
-            return 2
 
         announce_ips: list[str] | None = None
         if isinstance(announce_ip_raw, str):
@@ -879,39 +866,6 @@ def main(argv: list[str] | None = None) -> int:
                 )
                 return 2
 
-        probe_software: list[str] | None = None
-        if isinstance(probe_software_raw, str):
-            from holo.capabilities import parse_software_list
-
-            probe_software = parse_software_list(probe_software_raw)
-            if not probe_software:
-                sys.stderr.write(
-                    "holo mcp: --probe-software requires at least one name\n"
-                )
-                return 2
-
-        probe_packages: list[str] | None = None
-        if isinstance(probe_pkg_raw, str):
-            from holo.capabilities import (
-                SUPPORTED_PKG_MANAGERS,
-                parse_pkg_managers,
-            )
-
-            accepted, unknown = parse_pkg_managers(probe_pkg_raw)
-            if unknown:
-                sys.stderr.write(
-                    f"holo mcp: --probe-pkg unknown manager(s): "
-                    f"{','.join(unknown)} "
-                    f"(supported: {','.join(SUPPORTED_PKG_MANAGERS)})\n"
-                )
-                return 2
-            if not accepted:
-                sys.stderr.write(
-                    "holo mcp: --probe-pkg requires at least one manager\n"
-                )
-                return 2
-            probe_packages = accepted
-
         return _cmd_mcp(
             hide_qr="--hide-qr" in rest,
             enable_screen="--screen" in rest,
@@ -923,8 +877,6 @@ def main(argv: list[str] | None = None) -> int:
             announce_ssh_user=announce_ssh_user,
             announce_ips=announce_ips,
             announce_capabilities=announce_capabilities,
-            probe_software=probe_software,
-            probe_packages=probe_packages,
         )
     if cmd == "connect":
         return _cmd_connect(rest)

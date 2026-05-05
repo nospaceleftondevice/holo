@@ -58,8 +58,6 @@ class HoloMCPServer:
         announce_ips: list[str] | None = None,
         announce_port: int = 0,
         announce_capabilities: bool = False,
-        probe_software: list[str] | None = None,
-        probe_packages: list[str] | None = None,
     ) -> None:
         self.hide_qr = hide_qr
         self.enable_screen = enable_screen
@@ -83,10 +81,7 @@ class HoloMCPServer:
                 from holo.capabilities import CapabilitiesProbe
                 from holo.capabilities_server import CapabilitiesServer
 
-                probe = CapabilitiesProbe(
-                    software=probe_software,
-                    packages=probe_packages,
-                )
+                probe = CapabilitiesProbe()
                 self._caps_server = CapabilitiesServer(probe=probe)
                 self._caps_server.start()
                 caps_port = self._caps_server.actual_port
@@ -782,8 +777,6 @@ def build_server(
     announce_ips: list[str] | None = None,
     announce_port: int = 0,
     announce_capabilities: bool = False,
-    probe_software: list[str] | None = None,
-    probe_packages: list[str] | None = None,
 ) -> tuple[FastMCP, HoloMCPServer]:
     """Build a FastMCP instance with the holo tools registered.
 
@@ -812,8 +805,6 @@ def build_server(
         announce_ips=announce_ips,
         announce_port=announce_port,
         announce_capabilities=announce_capabilities,
-        probe_software=probe_software,
-        probe_packages=probe_packages,
     )
     mcp = FastMCP("holo")
 
@@ -1214,8 +1205,6 @@ def run(
     announce_ssh_user: str | None = None,
     announce_ips: list[str] | None = None,
     announce_capabilities: bool = False,
-    probe_software: list[str] | None = None,
-    probe_packages: list[str] | None = None,
 ) -> None:
     """Entrypoint used by `holo mcp` — runs the server over stdio."""
     mcp, holo = build_server(
@@ -1228,8 +1217,6 @@ def run(
         announce_ssh_user=announce_ssh_user,
         announce_ips=announce_ips,
         announce_capabilities=announce_capabilities,
-        probe_software=probe_software,
-        probe_packages=probe_packages,
     )
     try:
         with _sigterm_as_keyboard_interrupt():
@@ -1253,8 +1240,6 @@ def run_tcp(
     announce_ssh_user: str | None = None,
     announce_ips: list[str] | None = None,
     announce_capabilities: bool = False,
-    probe_software: list[str] | None = None,
-    probe_packages: list[str] | None = None,
     stop_event: threading.Event | None = None,
 ) -> None:
     """Entrypoint used by `holo mcp --listen PORT`.
@@ -1280,8 +1265,6 @@ def run_tcp(
         announce_ips=announce_ips,
         announce_port=port,
         announce_capabilities=announce_capabilities,
-        probe_software=probe_software,
-        probe_packages=probe_packages,
     )
     listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)

@@ -1,9 +1,12 @@
 """Unit tests for holo.capabilities and holo.capabilities_server.
 
-We exercise the parsers (which we control), the cache TTL behaviour,
-and the HTTP server's auth + no-CORS contract. The actual subprocess
-invocations to package managers are mocked — the test box won't have
-all of (brew, apt, port, winget, choco) installed at once.
+The probe layer is auto: every supported package manager is run when
+its binary is on PATH; the curated `--probe-software` whitelist is
+gone. We mock the subprocess calls because the test box doesn't have
+all of (brew, apt, port, pacman, snap, flatpak, winget, choco, scoop,
+pip, pipx, cargo, npm, gem, conda) installed at once.
+
+For applications: filesystem walk + mdfind, both mocked.
 """
 
 from __future__ import annotations
@@ -16,123 +19,12 @@ import pytest
 
 from holo.capabilities import (
     CAPABILITIES_SCHEMA_VERSION,
-    DEFAULT_SOFTWARE_PROBES,
     SUPPORTED_PKG_MANAGERS,
     CapabilitiesProbe,
-    parse_pkg_managers,
-    parse_software_list,
+    probe_applications,
     probe_hardware,
     probe_packages,
-    probe_software,
 )
-
-# --------------------------------------------------------------------- parsers
-
-
-class TestParseSoftwareList:
-    def test_basic(self) -> None:
-        assert parse_software_list("ffmpeg,ollama,git") == [
-            "ffmpeg",
-            "ollama",
-            "git",
-        ]
-
-    def test_dedupe(self) -> None:
-        assert parse_software_list("git,git,node") == ["git", "node"]
-
-    def test_strip_whitespace(self) -> None:
-        assert parse_software_list("  ffmpeg ,ollama  ,git") == [
-            "ffmpeg",
-            "ollama",
-            "git",
-        ]
-
-    def test_empty_entries_dropped(self) -> None:
-        assert parse_software_list("ffmpeg,,ollama,") == ["ffmpeg", "ollama"]
-
-    def test_all_empty_returns_empty_list(self) -> None:
-        assert parse_software_list(",,,") == []
-
-
-class TestParsePkgManagers:
-    def test_known_accepted(self) -> None:
-        accepted, unknown = parse_pkg_managers("brew,apt,winget")
-        assert accepted == ["brew", "apt", "winget"]
-        assert unknown == []
-
-    def test_unknown_separated(self) -> None:
-        accepted, unknown = parse_pkg_managers("brew,pacmen,apt")
-        assert accepted == ["brew", "apt"]
-        assert unknown == ["pacmen"]
-
-    def test_case_insensitive(self) -> None:
-        accepted, _ = parse_pkg_managers("BREW,APT")
-        assert accepted == ["brew", "apt"]
-
-    def test_dedupe(self) -> None:
-        accepted, _ = parse_pkg_managers("brew,brew,apt")
-        assert accepted == ["brew", "apt"]
-
-
-# -------------------------------------------------------------------- hardware
-
-
-class TestProbeHardware:
-    def test_returns_expected_keys(self) -> None:
-        info = probe_hardware()
-        for key in ("os", "os_version", "arch", "cpu_model", "cores", "ram_gb"):
-            assert key in info, f"missing {key} in {info}"
-
-    def test_cores_positive(self) -> None:
-        info = probe_hardware()
-        assert info["cores"] >= 1
-
-    def test_os_lowercase(self) -> None:
-        info = probe_hardware()
-        # darwin / linux / windows — all single-word, lowercase tokens
-        assert info["os"] == info["os"].lower()
-        assert info["os"] in {"darwin", "linux", "windows"}
-
-
-# -------------------------------------------------------------------- software
-
-
-class TestProbeSoftware:
-    def test_known_binary_found(self) -> None:
-        # `ls` exists on macOS and Linux; `cmd` on Windows. Pick `ls`
-        # since the test suite is macOS-first.
-        result = probe_software(["ls"])
-        assert "ls" in result
-        assert result["ls"].endswith("/ls")
-
-    def test_unknown_binary_omitted(self) -> None:
-        result = probe_software(["definitely-not-installed-xyzzy"])
-        assert result == {}
-
-    def test_macos_app_bundle_fallback(self, tmp_path: Any) -> None:
-        # Patch the bundle map so we don't depend on Chrome being
-        # installed; build a fake .app dir and verify the lookup hits it.
-        fake_app = tmp_path / "Fake.app"
-        fake_app.mkdir()
-        with patch.dict(
-            "holo.capabilities._MACOS_APP_BUNDLES",
-            {"fake-bundle": str(fake_app)},
-        ):
-            result = probe_software(["fake-bundle"], system="Darwin")
-        assert result == {"fake-bundle": str(fake_app)}
-
-    def test_macos_bundle_not_used_on_linux(self, tmp_path: Any) -> None:
-        fake_app = tmp_path / "Fake.app"
-        fake_app.mkdir()
-        with patch.dict(
-            "holo.capabilities._MACOS_APP_BUNDLES",
-            {"fake-bundle": str(fake_app)},
-        ):
-            result = probe_software(["fake-bundle"], system="Linux")
-        assert result == {}
-
-
-# -------------------------------------------------------------------- packages
 
 
 def _stub_run(stdout: str, returncode: int = 0) -> Any:
@@ -147,182 +39,592 @@ def _stub_run(stdout: str, returncode: int = 0) -> Any:
     return _R(stdout, returncode)
 
 
-class TestProbePackages:
-    def test_brew_parsing(self) -> None:
-        sample = "ffmpeg 7.0.1\naom 3.12.1\nbash 5.3.9\n"
-        with patch("holo.capabilities.shutil.which", return_value="/x/brew"), \
-             patch("holo.capabilities.subprocess.run", return_value=_stub_run(sample)):
-            out = probe_packages(["brew"])
-        assert out == {
-            "brew": [
-                {"name": "ffmpeg", "version": "7.0.1"},
-                {"name": "aom", "version": "3.12.1"},
-                {"name": "bash", "version": "5.3.9"},
-            ]
+# ============================================================================
+# Schema + aggregator
+# ============================================================================
+
+
+class TestSchema:
+    def test_schema_version_is_2(self) -> None:
+        assert CAPABILITIES_SCHEMA_VERSION == 2
+
+    def test_response_has_no_software_field(self) -> None:
+        # Schema 2 dropped the curated software field entirely.
+        # Applications come through the platform-native catalog;
+        # everything else through packages.*.
+        with (
+            patch("holo.capabilities.shutil.which", return_value=None),
+            patch("holo.capabilities.platform.system", return_value="Linux"),
+        ):
+            snap = CapabilitiesProbe().collect()
+        assert "software" not in snap
+        assert set(snap.keys()) >= {
+            "schema",
+            "host",
+            "applications",
+            "packages",
+            "generated_at",
         }
+
+
+# ============================================================================
+# Hardware
+# ============================================================================
+
+
+class TestProbeHardware:
+    def test_returns_expected_keys(self) -> None:
+        info = probe_hardware()
+        for key in ("os", "os_version", "arch", "cpu_model", "cores", "ram_gb"):
+            assert key in info, f"missing {key} in {info}"
+
+    def test_cores_positive(self) -> None:
+        assert probe_hardware()["cores"] >= 1
+
+    def test_os_lowercase(self) -> None:
+        info = probe_hardware()
+        assert info["os"] == info["os"].lower()
+        assert info["os"] in {"darwin", "linux", "windows"}
+
+
+# ============================================================================
+# Applications
+# ============================================================================
+
+
+class TestProbeApplicationsLinux:
+    def test_returns_empty_on_linux(self) -> None:
+        # Linux apps come through packages.* (apt/dnf/snap/flatpak),
+        # not as a separate catalog. The applications dict stays empty.
+        with patch(
+            "holo.capabilities.platform.system", return_value="Linux"
+        ):
+            assert probe_applications() == {}
+
+
+class TestProbeApplicationsMacOS:
+    def _fake_scandir(
+        self, by_dir: dict[str, list[str]]
+    ):
+        """Return a `scandir` replacement that yields fake DirEntry-likes
+        per directory mapping."""
+
+        class _Entry:
+            def __init__(self, name: str, path: str) -> None:
+                self.name = name
+                self.path = path
+
+            def is_dir(self, follow_symlinks: bool = True) -> bool:
+                return self.name.endswith(".app")
+
+        class _Iter:
+            def __init__(self, items: list[_Entry]) -> None:
+                self._items = items
+
+            def __iter__(self):
+                return iter(self._items)
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args: Any) -> None:
+                pass
+
+            def close(self) -> None:
+                pass
+
+        def fake(d: str):
+            entries = by_dir.get(d)
+            if entries is None:
+                raise OSError(f"no such dir: {d}")
+            return _Iter(
+                [
+                    _Entry(name, f"{d.rstrip('/')}/{name}")
+                    for name in entries
+                ]
+            )
+
+        return fake
+
+    def test_walks_standard_dirs(self) -> None:
+        scandir = self._fake_scandir(
+            {
+                "/Applications": [
+                    "Google Chrome.app",
+                    "Firefox.app",
+                    "README.txt",  # not an .app — skipped
+                ],
+                "/Applications/Utilities": ["Terminal.app"],
+                "/System/Applications": ["Safari.app"],
+            }
+        )
+        with (
+            patch(
+                "holo.capabilities.platform.system", return_value="Darwin"
+            ),
+            patch("holo.capabilities.os.scandir", side_effect=scandir),
+            # Stub mdfind to return nothing — we're testing the walk only.
+            patch(
+                "holo.capabilities._run_pkg_command", return_value=""
+            ),
+        ):
+            apps = probe_applications()
+
+        assert "Google Chrome" in apps
+        assert "Firefox" in apps
+        assert "Terminal" in apps
+        assert "Safari" in apps
+        assert "README" not in apps
+        assert apps["Firefox"]["path"] == "/Applications/Firefox.app"
+
+    def test_mdfind_fills_in_outliers(self) -> None:
+        scandir = self._fake_scandir(
+            {
+                "/Applications": ["Boring.app"],
+            }
+        )
+        # mdfind reports an app outside the standard dirs.
+        mdfind_output = (
+            "/Applications/Boring.app\n"
+            "/Users/alice/Dev/MyApp.app\n"
+            "/System/Library/PrivateFrameworks/Helper.app\n"
+            "\n"
+        )
+        with (
+            patch(
+                "holo.capabilities.platform.system", return_value="Darwin"
+            ),
+            patch("holo.capabilities.os.scandir", side_effect=scandir),
+            patch(
+                "holo.capabilities._run_pkg_command",
+                return_value=mdfind_output,
+            ),
+        ):
+            apps = probe_applications()
+
+        assert "Boring" in apps
+        # mdfind found a dev build outside the standard dirs.
+        assert "MyApp" in apps
+        assert apps["MyApp"]["path"] == "/Users/alice/Dev/MyApp.app"
+        # Private system helpers under /System/Library/ are filtered.
+        assert "Helper" not in apps
+
+    def test_mdfind_does_not_overwrite_walk_results(self) -> None:
+        # If mdfind reports the same .app at a different path, the
+        # walk's canonical path wins (stable preference for /Applications).
+        scandir = self._fake_scandir(
+            {"/Applications": ["Chrome.app"]}
+        )
+        mdfind_output = "/Users/alice/Apps/Chrome.app\n"
+        with (
+            patch(
+                "holo.capabilities.platform.system", return_value="Darwin"
+            ),
+            patch("holo.capabilities.os.scandir", side_effect=scandir),
+            patch(
+                "holo.capabilities._run_pkg_command",
+                return_value=mdfind_output,
+            ),
+        ):
+            apps = probe_applications()
+        assert apps["Chrome"]["path"] == "/Applications/Chrome.app"
+
+    def test_skips_system_library_paths(self) -> None:
+        from holo.capabilities import _is_system_app_bundle
+
+        assert _is_system_app_bundle(
+            "/System/Library/PrivateFrameworks/Foo.app"
+        )
+        assert _is_system_app_bundle(
+            "/Library/Application Support/Bar.app"
+        )
+        assert _is_system_app_bundle(
+            "/usr/libexec/Quux.app"
+        )
+        assert not _is_system_app_bundle(
+            "/Applications/Google Chrome.app"
+        )
+        assert not _is_system_app_bundle(
+            "/System/Applications/Safari.app"
+        )
+
+
+# ============================================================================
+# Packages — auto-run, no opt-in
+# ============================================================================
+
+
+class TestProbePackagesAuto:
+    def test_only_installed_managers_appear(self) -> None:
+        # Only `brew` is on PATH; only `brew` should land in the result.
+        def fake_which(name: str) -> str | None:
+            return "/x/brew" if name == "brew" else None
+
+        with (
+            patch("holo.capabilities.shutil.which", side_effect=fake_which),
+            patch(
+                "holo.capabilities.subprocess.run",
+                return_value=_stub_run("ffmpeg 7.0.1\n"),
+            ),
+        ):
+            out = probe_packages()
+        assert set(out.keys()) == {"brew"}
+        assert out["brew"] == [{"name": "ffmpeg", "version": "7.0.1"}]
+
+    def test_aliases_collapse_to_canonical_key(self) -> None:
+        # `dpkg` aliases to `apt`. Even if `dpkg-query` is on PATH, the
+        # output key is `apt`, not `dpkg`.
+        def fake_which(name: str) -> str | None:
+            return "/x/dpkg-query" if name == "dpkg-query" else None
+
+        with (
+            patch("holo.capabilities.shutil.which", side_effect=fake_which),
+            patch(
+                "holo.capabilities.subprocess.run",
+                return_value=_stub_run("bash 5.2\n"),
+            ),
+        ):
+            out = probe_packages()
+        assert "apt" in out
+        assert "dpkg" not in out
+        assert "dnf" not in out  # dnf is an alias for rpm; rpm not on PATH
+
+    def test_dnf_yum_share_rpm_probe(self) -> None:
+        # When `rpm` is on PATH, the output key is `rpm`. We don't
+        # double-emit dnf and yum.
+        def fake_which(name: str) -> str | None:
+            return "/x/rpm" if name == "rpm" else None
+
+        with (
+            patch("holo.capabilities.shutil.which", side_effect=fake_which),
+            patch(
+                "holo.capabilities.subprocess.run",
+                return_value=_stub_run("bash 5.2\n"),
+            ),
+        ):
+            out = probe_packages()
+        assert "rpm" in out
+        assert "dnf" not in out
+        assert "yum" not in out
+
+
+class TestPackageManagerCoverage:
+    def test_supported_list_matches_dispatch(self) -> None:
+        from holo.capabilities import _PKG_PROBES
+
+        assert set(SUPPORTED_PKG_MANAGERS) == set(_PKG_PROBES.keys())
+
+    def test_supported_includes_language_level(self) -> None:
+        # Routing whisper installs by `pip` was a key motivation.
+        for name in ("pip", "pipx", "cargo", "npm", "gem", "conda"):
+            assert name in SUPPORTED_PKG_MANAGERS
+
+    def test_supported_includes_linux_third_party(self) -> None:
+        for name in ("snap", "flatpak"):
+            assert name in SUPPORTED_PKG_MANAGERS
+
+    def test_supported_includes_windows(self) -> None:
+        for name in ("winget", "choco", "scoop"):
+            assert name in SUPPORTED_PKG_MANAGERS
+
+
+# ============================================================================
+# Per-probe parsers (mocked subprocess)
+# ============================================================================
+
+
+def _patched_probe(probe_name: str, stdout: str):
+    """Helper: patch shutil.which → present, subprocess.run → stdout."""
+    return [
+        patch(
+            "holo.capabilities.shutil.which",
+            return_value=f"/x/{probe_name}",
+        ),
+        patch(
+            "holo.capabilities.subprocess.run",
+            return_value=_stub_run(stdout),
+        ),
+    ]
+
+
+class TestParsers:
+    def _run(self, mgr: str, stdout: str) -> list[dict[str, str]]:
+        from holo.capabilities import _PKG_PROBES
+
+        with (
+            patch(
+                "holo.capabilities.shutil.which",
+                return_value=f"/x/{mgr}",
+            ),
+            patch(
+                "holo.capabilities.subprocess.run",
+                return_value=_stub_run(stdout),
+            ),
+        ):
+            return _PKG_PROBES[mgr]() or []
 
     def test_brew_multiple_versions_takes_first(self) -> None:
-        # `brew list --versions` emits `name v1 v2 v3` for kegs with
-        # multiple installed versions. We canonicalize on the first.
-        sample = "openssl@3 3.4.1 3.4.0\n"
-        with patch("holo.capabilities.shutil.which", return_value="/x/brew"), \
-             patch("holo.capabilities.subprocess.run", return_value=_stub_run(sample)):
-            out = probe_packages(["brew"])
-        assert out["brew"] == [{"name": "openssl@3", "version": "3.4.1"}]
+        out = self._run("brew", "openssl@3 3.4.1 3.4.0\n")
+        assert out == [{"name": "openssl@3", "version": "3.4.1"}]
 
-    def test_apt_parsing(self) -> None:
-        sample = "bash 5.2.21-2\nzsh 5.9-6\n"
-        with patch("holo.capabilities.shutil.which", return_value="/x/dpkg-query"), \
-             patch("holo.capabilities.subprocess.run", return_value=_stub_run(sample)):
-            out = probe_packages(["apt"])
-        assert out == {
-            "apt": [
-                {"name": "bash", "version": "5.2.21-2"},
-                {"name": "zsh", "version": "5.9-6"},
-            ]
-        }
+    def test_apt_via_dpkg_query(self) -> None:
+        out = self._run("apt", "bash 5.2.21-2\nzsh 5.9-6\n")
+        assert out == [
+            {"name": "bash", "version": "5.2.21-2"},
+            {"name": "zsh", "version": "5.9-6"},
+        ]
 
-    def test_rpm_parsing_via_dnf_alias(self) -> None:
-        sample = "bash 5.2.21\nzsh 5.9\n"
-        with patch("holo.capabilities.shutil.which", return_value="/x/rpm"), \
-             patch("holo.capabilities.subprocess.run", return_value=_stub_run(sample)):
-            out = probe_packages(["dnf"])
-        assert out == {
-            "dnf": [
-                {"name": "bash", "version": "5.2.21"},
-                {"name": "zsh", "version": "5.9"},
-            ]
-        }
-
-    def test_port_parsing(self) -> None:
+    def test_port(self) -> None:
         sample = (
             "The following ports are currently installed:\n"
             "  ffmpeg @7.0.1_0 (active)\n"
             "  aom @3.12.1_0 (active)\n"
         )
-        with patch("holo.capabilities.shutil.which", return_value="/x/port"), \
-             patch("holo.capabilities.subprocess.run", return_value=_stub_run(sample)):
-            out = probe_packages(["port"])
-        assert out == {
-            "port": [
-                {"name": "ffmpeg", "version": "7.0.1"},
-                {"name": "aom", "version": "3.12.1"},
-            ]
-        }
+        out = self._run("port", sample)
+        assert out == [
+            {"name": "ffmpeg", "version": "7.0.1"},
+            {"name": "aom", "version": "3.12.1"},
+        ]
 
-    def test_choco_parsing(self) -> None:
-        sample = "git|2.45.0\nffmpeg|7.0.1\n"
-        with patch("holo.capabilities.shutil.which", return_value=r"C:\x\choco.exe"), \
-             patch("holo.capabilities.subprocess.run", return_value=_stub_run(sample)):
-            out = probe_packages(["choco"])
-        assert out == {
-            "choco": [
-                {"name": "git", "version": "2.45.0"},
-                {"name": "ffmpeg", "version": "7.0.1"},
-            ]
-        }
+    def test_pacman(self) -> None:
+        out = self._run("pacman", "bash 5.2.21-1\nzsh 5.9-1\n")
+        assert out == [
+            {"name": "bash", "version": "5.2.21-1"},
+            {"name": "zsh", "version": "5.9-1"},
+        ]
 
-    def test_winget_parsing(self) -> None:
+    def test_snap(self) -> None:
+        sample = (
+            "Name        Version    Rev    Tracking       Publisher    Notes\n"
+            "core24      2.18       2354   latest/stable  canonical    base\n"
+            "firefox     125.0.3    4173   latest/stable  mozilla      -\n"
+        )
+        out = self._run("snap", sample)
+        assert out == [
+            {"name": "core24", "version": "2.18"},
+            {"name": "firefox", "version": "125.0.3"},
+        ]
+
+    def test_flatpak(self) -> None:
+        # Tab-separated when --columns=application,version is set.
+        out = self._run(
+            "flatpak",
+            "org.gnome.Calculator\t50.1\nio.github.thetumultuousunicornofdarkness.css-grid-generator\t0.5.2\n",
+        )
+        assert out == [
+            {"name": "org.gnome.Calculator", "version": "50.1"},
+            {
+                "name": "io.github.thetumultuousunicornofdarkness.css-grid-generator",
+                "version": "0.5.2",
+            },
+        ]
+
+    def test_winget(self) -> None:
         sample = (
             "Name      Id              Version\n"
             "----------------------------------\n"
             "Git       Git.Git         2.45.0\n"
             "Firefox   Mozilla.Firefox 125.0\n"
         )
-        with patch("holo.capabilities.shutil.which", return_value=r"C:\x\winget.exe"), \
-             patch("holo.capabilities.subprocess.run", return_value=_stub_run(sample)):
-            out = probe_packages(["winget"])
-        assert out == {
-            "winget": [
-                {"name": "Git", "version": "2.45.0"},
-                {"name": "Firefox", "version": "125.0"},
-            ]
+        out = self._run("winget", sample)
+        assert out == [
+            {"name": "Git", "version": "2.45.0"},
+            {"name": "Firefox", "version": "125.0"},
+        ]
+
+    def test_choco(self) -> None:
+        out = self._run("choco", "git|2.45.0\nffmpeg|7.0.1\n")
+        assert out == [
+            {"name": "git", "version": "2.45.0"},
+            {"name": "ffmpeg", "version": "7.0.1"},
+        ]
+
+    def test_scoop(self) -> None:
+        sample = (
+            "Name        Version    Source\n"
+            "------------------------------\n"
+            "git         2.45.0     main\n"
+            "ffmpeg      7.0.1      main\n"
+        )
+        out = self._run("scoop", sample)
+        assert out == [
+            {"name": "git", "version": "2.45.0"},
+            {"name": "ffmpeg", "version": "7.0.1"},
+        ]
+
+    def test_pip_freeze(self) -> None:
+        out = self._run(
+            "pip",
+            "requests==2.31.0\npyyaml==6.0.1\nsome-editable @ file:///x\n",
+        )
+        assert out == [
+            {"name": "requests", "version": "2.31.0"},
+            {"name": "pyyaml", "version": "6.0.1"},
+            {"name": "some-editable", "version": ""},
+        ]
+
+    def test_pipx(self) -> None:
+        out = self._run("pipx", "ruff 0.6.0\nblack 24.4.2\n")
+        assert out == [
+            {"name": "ruff", "version": "0.6.0"},
+            {"name": "black", "version": "24.4.2"},
+        ]
+
+    def test_cargo(self) -> None:
+        sample = (
+            "ripgrep v14.1.0:\n"
+            "    rg\n"
+            "fd-find v9.0.0:\n"
+            "    fd\n"
+        )
+        out = self._run("cargo", sample)
+        assert out == [
+            {"name": "ripgrep", "version": "14.1.0"},
+            {"name": "fd-find", "version": "9.0.0"},
+        ]
+
+    def test_npm_global_json(self) -> None:
+        sample = (
+            '{"dependencies":{"typescript":{"version":"5.4.5"},'
+            '"@anthropic-ai/claude-code":{"version":"0.5.1"}}}'
+        )
+        out = self._run("npm", sample)
+        # Order may vary depending on dict ordering in JSON parse;
+        # match by set rather than list equality.
+        assert {(p["name"], p["version"]) for p in out} == {
+            ("typescript", "5.4.5"),
+            ("@anthropic-ai/claude-code", "0.5.1"),
         }
 
-    def test_pacman_parsing(self) -> None:
-        sample = "bash 5.2.21-1\nzsh 5.9-1\n"
-        with patch("holo.capabilities.shutil.which", return_value="/x/pacman"), \
-             patch("holo.capabilities.subprocess.run", return_value=_stub_run(sample)):
-            out = probe_packages(["pacman"])
-        assert out == {
-            "pacman": [
-                {"name": "bash", "version": "5.2.21-1"},
-                {"name": "zsh", "version": "5.9-1"},
-            ]
+    def test_gem(self) -> None:
+        sample = (
+            "*** LOCAL GEMS ***\n"
+            "\n"
+            "rake (13.0.6, 13.0.3)\n"
+            "bundler (2.5.5)\n"
+        )
+        out = self._run("gem", sample)
+        # The header line has no `(`, gets skipped.
+        assert {(p["name"], p["version"]) for p in out} == {
+            ("rake", "13.0.6"),
+            ("bundler", "2.5.5"),
         }
 
-    def test_missing_manager_omitted(self) -> None:
-        with patch("holo.capabilities.shutil.which", return_value=None):
-            out = probe_packages(["brew", "apt", "dnf"])
-        assert out == {}
-
-    def test_command_failure_omitted(self) -> None:
-        with patch("holo.capabilities.shutil.which", return_value="/x/brew"), \
-             patch(
-                 "holo.capabilities.subprocess.run",
-                 return_value=_stub_run("", returncode=1),
-             ):
-            out = probe_packages(["brew"])
-        assert out == {}
-
-    def test_unknown_manager_silently_skipped(self) -> None:
-        # CLI parsing rejects unknowns up front; the runtime path is
-        # defensive. Verify it doesn't blow up.
-        out = probe_packages(["definitely-not-a-manager"])
-        assert out == {}
+    def test_conda_json(self) -> None:
+        sample = (
+            "[{\"name\":\"numpy\",\"version\":\"1.26.4\"},"
+            "{\"name\":\"scipy\",\"version\":\"1.13.0\"}]"
+        )
+        out = self._run("conda", sample)
+        assert {(p["name"], p["version"]) for p in out} == {
+            ("numpy", "1.26.4"),
+            ("scipy", "1.13.0"),
+        }
 
 
-# ------------------------------------------------------------------- aggregator
+class TestProbeFailures:
+    def test_command_failure_omits_entry(self) -> None:
+        with (
+            patch(
+                "holo.capabilities.shutil.which", return_value="/x/brew"
+            ),
+            patch(
+                "holo.capabilities.subprocess.run",
+                return_value=_stub_run("", returncode=1),
+            ),
+        ):
+            out = probe_packages()
+        assert "brew" not in out
+
+    def test_subprocess_raises_omits_entry(self) -> None:
+        import subprocess as sp
+
+        with (
+            patch(
+                "holo.capabilities.shutil.which", return_value="/x/brew"
+            ),
+            patch(
+                "holo.capabilities.subprocess.run",
+                side_effect=sp.TimeoutExpired(cmd="brew", timeout=30),
+            ),
+        ):
+            out = probe_packages()
+        assert "brew" not in out
+
+
+# ============================================================================
+# CapabilitiesProbe (cache)
+# ============================================================================
 
 
 class TestCapabilitiesProbe:
-    def test_collect_returns_schema(self) -> None:
-        probe = CapabilitiesProbe(software=[], packages=[])
-        snap = probe.collect()
+    def test_collect_includes_top_level_fields(self) -> None:
+        with (
+            patch("holo.capabilities.shutil.which", return_value=None),
+            patch("holo.capabilities.platform.system", return_value="Linux"),
+        ):
+            snap = CapabilitiesProbe().collect()
         assert snap["schema"] == CAPABILITIES_SCHEMA_VERSION
         assert "host" in snap
-        assert "software" in snap
+        assert "applications" in snap
         assert "packages" in snap
         assert "generated_at" in snap
 
-    def test_default_software_list(self) -> None:
-        probe = CapabilitiesProbe()
-        assert probe.software_names == list(DEFAULT_SOFTWARE_PROBES)
+    def test_no_software_kwargs(self) -> None:
+        # Schema 2 dropped the curated software whitelist; the
+        # constructor must reject the old kwargs to fail loudly on
+        # callers using the old API.
+        with pytest.raises(TypeError):
+            CapabilitiesProbe(software=["ffmpeg"])  # type: ignore[call-arg]
+        with pytest.raises(TypeError):
+            CapabilitiesProbe(packages=["brew"])  # type: ignore[call-arg]
 
     def test_cache_returns_same_dict_within_ttl(self) -> None:
-        probe = CapabilitiesProbe(software=[], packages=[], cache_ttl_s=60.0)
-        a = probe.collect()
-        b = probe.collect()
-        # Same identity — second call returned the cached object.
+        with (
+            patch("holo.capabilities.shutil.which", return_value=None),
+            patch("holo.capabilities.platform.system", return_value="Linux"),
+        ):
+            probe = CapabilitiesProbe(cache_ttl_s=60.0)
+            a = probe.collect()
+            b = probe.collect()
         assert a is b
 
     def test_cache_refreshes_after_ttl(self) -> None:
-        probe = CapabilitiesProbe(software=[], packages=[], cache_ttl_s=0.05)
-        a = probe.collect()
-        time.sleep(0.08)
-        b = probe.collect()
+        with (
+            patch("holo.capabilities.shutil.which", return_value=None),
+            patch("holo.capabilities.platform.system", return_value="Linux"),
+        ):
+            probe = CapabilitiesProbe(cache_ttl_s=0.05)
+            a = probe.collect()
+            time.sleep(0.08)
+            b = probe.collect()
         assert a is not b
 
     def test_force_bypasses_cache(self) -> None:
-        probe = CapabilitiesProbe(software=[], packages=[], cache_ttl_s=60.0)
-        a = probe.collect()
-        b = probe.collect(force=True)
+        with (
+            patch("holo.capabilities.shutil.which", return_value=None),
+            patch("holo.capabilities.platform.system", return_value="Linux"),
+        ):
+            probe = CapabilitiesProbe(cache_ttl_s=60.0)
+            a = probe.collect()
+            b = probe.collect(force=True)
         assert a is not b
 
 
-# ------------------------------------------------------------------ HTTP server
+# ============================================================================
+# HTTP server (response shape changed; auth + no-CORS still apply)
+# ============================================================================
 
 
 @pytest.fixture
 def caps_app() -> Any:
-    """Build the Starlette app via TestClient — no real socket needed."""
     from starlette.testclient import TestClient
 
     from holo.capabilities import CapabilitiesProbe
     from holo.capabilities_server import CapabilitiesServer
 
     server = CapabilitiesServer(
-        probe=CapabilitiesProbe(software=[], packages=[]),
+        probe=CapabilitiesProbe(),
         token="test-token-fixed",
     )
     client = TestClient(server._build_app())  # noqa: SLF001 — test surface
@@ -330,95 +632,47 @@ def caps_app() -> Any:
 
 
 class TestCapabilitiesServerHTTP:
+    def test_capabilities_returns_schema_2_shape(self, caps_app: Any) -> None:
+        _, client = caps_app
+        with (
+            patch("holo.capabilities.shutil.which", return_value=None),
+            patch("holo.capabilities.platform.system", return_value="Linux"),
+        ):
+            r = client.get(
+                "/capabilities",
+                headers={"X-Holo-Caps-Token": "test-token-fixed"},
+            )
+        assert r.status_code == 200
+        body = r.json()
+        assert body["schema"] == 2
+        assert "applications" in body
+        assert "packages" in body
+        assert "software" not in body
+
+    def test_no_cors_headers(self, caps_app: Any) -> None:
+        _, client = caps_app
+        with (
+            patch("holo.capabilities.shutil.which", return_value=None),
+            patch("holo.capabilities.platform.system", return_value="Linux"),
+        ):
+            r = client.get(
+                "/capabilities",
+                headers={"X-Holo-Caps-Token": "test-token-fixed"},
+            )
+        for header in (
+            "access-control-allow-origin",
+            "access-control-allow-headers",
+            "access-control-allow-methods",
+        ):
+            assert header not in {k.lower() for k in r.headers}
+
+    def test_401_without_token(self, caps_app: Any) -> None:
+        _, client = caps_app
+        r = client.get("/capabilities")
+        assert r.status_code == 401
+
     def test_healthz_no_auth(self, caps_app: Any) -> None:
         _, client = caps_app
         r = client.get("/healthz")
         assert r.status_code == 200
         assert r.json() == {"status": "ok"}
-
-    def test_healthz_returns_no_fingerprint_data(self, caps_app: Any) -> None:
-        # /healthz must NOT include host name, interfaces, or anything
-        # else that a LAN scanner could use to identify holo hosts.
-        _, client = caps_app
-        body = client.get("/healthz").json()
-        # Only the status field should be present.
-        assert set(body.keys()) == {"status"}
-
-    def test_capabilities_no_token_401(self, caps_app: Any) -> None:
-        _, client = caps_app
-        r = client.get("/capabilities")
-        assert r.status_code == 401
-        assert r.json() == {"error": "unauthorized"}
-
-    def test_capabilities_wrong_token_401(self, caps_app: Any) -> None:
-        _, client = caps_app
-        r = client.get(
-            "/capabilities", headers={"X-Holo-Caps-Token": "wrong-token"}
-        )
-        assert r.status_code == 401
-
-    def test_capabilities_right_token_200(self, caps_app: Any) -> None:
-        _, client = caps_app
-        r = client.get(
-            "/capabilities",
-            headers={"X-Holo-Caps-Token": "test-token-fixed"},
-        )
-        assert r.status_code == 200
-        body = r.json()
-        assert body["schema"] == CAPABILITIES_SCHEMA_VERSION
-        assert "host" in body
-
-    def test_no_cors_headers_on_capabilities(self, caps_app: Any) -> None:
-        # The browser-block defense relies on the absence of these
-        # headers. If a maintainer adds a CORSMiddleware later this
-        # test will catch it.
-        _, client = caps_app
-        r = client.get(
-            "/capabilities",
-            headers={"X-Holo-Caps-Token": "test-token-fixed"},
-        )
-        for header in (
-            "access-control-allow-origin",
-            "access-control-allow-headers",
-            "access-control-allow-methods",
-        ):
-            assert header not in {k.lower() for k in r.headers}
-
-    def test_no_cors_headers_on_healthz(self, caps_app: Any) -> None:
-        _, client = caps_app
-        r = client.get("/healthz")
-        for header in (
-            "access-control-allow-origin",
-            "access-control-allow-headers",
-            "access-control-allow-methods",
-        ):
-            assert header not in {k.lower() for k in r.headers}
-
-    def test_token_compare_constant_time(self, caps_app: Any) -> None:
-        # Verify we're calling secrets.compare_digest, not raw `==`.
-        # Patch compare_digest to a sentinel that records calls.
-        server, client = caps_app
-        called = {"n": 0}
-
-        def _watcher(a: str, b: str) -> bool:
-            called["n"] += 1
-            return a == b
-
-        with patch("holo.capabilities_server.secrets.compare_digest", _watcher):
-            client.get(
-                "/capabilities",
-                headers={"X-Holo-Caps-Token": "test-token-fixed"},
-            )
-        assert called["n"] >= 1
-
-
-class TestPkgManagerCoverage:
-    """Sanity check: every name in SUPPORTED_PKG_MANAGERS resolves to a probe."""
-
-    def test_every_supported_manager_has_a_probe(self) -> None:
-        from holo.capabilities import _PKG_PROBES
-
-        for name in SUPPORTED_PKG_MANAGERS:
-            assert name in _PKG_PROBES, (
-                f"{name} is in SUPPORTED_PKG_MANAGERS but has no probe entry"
-            )

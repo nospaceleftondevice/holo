@@ -223,11 +223,11 @@ This stops the browser path; it does **not** stop a same-LAN attacker
 who can read the TXT record. Don't put secrets in the capabilities
 response that you wouldn't put in the TXT record itself.
 
-### Response shape
+### Response shape (schema 2)
 
 ```jsonc
 {
-  "schema": 1,                                // bump on incompatible changes
+  "schema": 2,                                // bump on incompatible changes
   "host": {
     "os": "darwin",                           // darwin | linux | windows
     "os_version": "14.5",                     // marketing version (sw_vers on macOS)
@@ -236,30 +236,48 @@ response that you wouldn't put in the TXT record itself.
     "cores": 14,                              // logical cores (os.cpu_count)
     "ram_gb": 36.0                            // total physical RAM
   },
-  "software": {                               // shutil.which lookups
-    "chrome": "/Applications/Google Chrome.app",
-    "ffmpeg": "/opt/homebrew/bin/ffmpeg"
-    // missing names are omitted
+  "applications": {                           // platform-native catalog
+    "Google Chrome": {"path": "/Applications/Google Chrome.app"},
+    "Firefox":       {"path": "/Applications/Firefox.app"}
+    // Windows: also has version + publisher; Linux: empty
   },
-  "packages": {                               // per-manager probe results
+  "packages": {                               // per-manager arrays — every
+                                              // manager whose binary is on
+                                              // PATH was queried
     "brew": [
       {"name": "ffmpeg",  "version": "7.0.1"},
       {"name": "whisper", "version": "1.7.0"}
     ],
-    "apt": [...]                              // only if --probe-pkg apt
+    "pip":   [...],
+    "cargo": [...],
+    "npm":   [...]
   },
   "generated_at": 1714900000                  // unix epoch when collected
 }
 ```
 
-Probes are **opt-in**: `software` only contains names the daemon was
-asked to look up (`--probe-software a,b,c`, default list documented in
-the daemon source); `packages` only contains entries for managers in
-`--probe-pkg`. A daemon launched with no extra probe flags returns the
-default software list and an empty `packages` dict.
+**Auto-discovery, no opt-in.** When `--announce-capabilities` is set
+on the daemon, the probe runs every supported package manager whose
+binary is present:
 
-The probe result is cached server-side for ~60 s — companions can poll
-without driving repeated `brew list` invocations on the host.
+| Layer | Members |
+|---|---|
+| macOS third-party | `brew`, `port` |
+| Linux OS-supplied | `apt` (via `dpkg-query`), `dnf`/`yum`/`rpm` (via `rpm -qa`), `pacman` |
+| Linux third-party | `snap`, `flatpak`, `brew` (linuxbrew) |
+| Windows | `winget`, `choco`, `scoop` |
+| Cross-platform language-level | `pip`, `pipx`, `cargo`, `npm` (global), `gem`, `conda` (base env) |
+
+Aliases collapse onto canonical keys: `dpkg` → `apt`; `dnf`/`yum` → `rpm`.
+
+**Applications catalog** is platform-specific:
+- **macOS:** walk `/Applications`, `/Applications/Utilities`, `/System/Applications`, `~/Applications`, then `mdfind 'kMDItemKind == "Application"'` to pick up bundles outside those dirs. Private OS agents under `/System/Library/`, `/Library/`, `/usr/libexec/` are filtered out (hundreds of internal helper apps that aren't user-facing).
+- **Windows:** read the `HKLM\…\Uninstall` and `HKCU\…\Uninstall` registry keys (canonical "installed programs" list). Each entry includes `path`, `version`, and `publisher` when registry-supplied.
+- **Linux:** empty — desktop apps come via `packages.snap` / `packages.flatpak` / `packages.apt` etc.
+
+The probe result is cached server-side for ~60 s — companions can
+poll without driving repeated `brew list` / `pip list` invocations
+on the host.
 
 ### Schema versioning
 
@@ -267,6 +285,15 @@ without driving repeated `brew list` invocations on the host.
 companion **must** drop the response if `schema` is greater than the
 version it understands. Additive new fields within the current major
 are safe and must not break older companions.
+
+**Migration: schema 1 → 2.** The old `software` field (a curated
+`shutil.which` whitelist controlled by `--probe-software`) was removed.
+PATH-walking proved wrong on Linux, where `/usr/bin` holds both
+OS-baseline binaries AND apt-installed software — filtering one would
+lose the other. Trusting the package managers as source of truth solves
+this. The `applications` field replaces what `software` covered for
+macOS GUI apps. Callers querying "is whisper installed?" should now
+scan `applications` keys + `packages.*[].name` arrays.
 
 ---
 

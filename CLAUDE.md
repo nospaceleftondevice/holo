@@ -84,7 +84,7 @@ Two flags tailor the surface:
 
 Plus separate orthogonal capabilities:
 - `--announce` (kwargs `announce`, `announce_session`, `announce_user`, `announce_ssh_user`) — broadcasts an mDNS service record (`_holo-session._tcp.local.`) so a companion desktop app on the same LAN can discover live sessions. See **Session announcement** below.
-- `--announce-capabilities` (kwargs `announce_capabilities`, `probe_software`, `probe_packages`) — requires `--announce`. Stands up a token-auth HTTP endpoint (`GET /capabilities`) carrying hardware/software/package inventory; advertises `caps_port` + `caps_token` in the TXT record so an agent can route tasks by host capability. See **Capabilities endpoint** below.
+- `--announce-capabilities` (kwarg `announce_capabilities`) — requires `--announce`. Stands up a token-auth HTTP endpoint (`GET /capabilities`) carrying hardware + applications + packages inventory; advertises `caps_port` + `caps_token` in the TXT record so an agent can route tasks by host capability. Everything is auto-discovered per platform — no per-probe flags. See **Capabilities endpoint** below.
 
 Internal naming kept as-is: `BridgeClient`, `daemon.bridge`, `_require_bridge` describe the JVM bridge implementation accurately. Only the user-facing flag (`--bridge` → `--screen`), the matching kwarg (`use_bridge` → `enable_screen`), and two CLI subcommands (`holo bridge` → `holo screen`, `holo install-bridge` → `holo install-screen`) were renamed.
 
@@ -161,7 +161,7 @@ The R2D2 desktop SPA on the user's laptop hits `--serve 7082`. The HTTP layer is
 
 ## Capabilities endpoint (`--announce-capabilities`)
 
-`src/holo/capabilities.py` + `src/holo/capabilities_server.py` together stand up an opt-in HTTP endpoint that exposes the host's hardware/software/package inventory so an agent can route tasks to the most-capable host (M4 vs M1 transcription, Chrome-Canary-only flows, etc.).
+`src/holo/capabilities.py` + `src/holo/capabilities_server.py` together stand up an opt-in HTTP endpoint that exposes the host's hardware + applications + packages inventory so an agent can route tasks to the most-capable host (M4 vs M1 transcription, "find a host with Chrome Canary or whisper installed", etc.). Schema 2.
 
 Wiring: `HoloMCPServer.__init__` constructs `CapabilitiesProbe` + `CapabilitiesServer` *before* `HoloAnnouncer` so the bound port + auth token make it into the TXT record. Server runs uvicorn on a daemon thread bound to `0.0.0.0:<random>`. `_caps_server.actual_port` blocks until the listener is up (5 s timeout). On shutdown the announcer stops first (Goodbye), then the caps server, then the daemon — minimizes the window where a discoverer sees the broadcast but hits connection-refused on the URL.
 
@@ -177,16 +177,18 @@ Wiring: `HoloMCPServer.__init__` constructs `CapabilitiesProbe` + `CapabilitiesS
 
 This stops random web origins from fingerprinting the host. It does **not** stop a same-LAN attacker who can read the mDNS broadcast — they get the token. Threat model: web origins, not local LAN.
 
-**Probes:**
-- Hardware (always when capabilities is on): `os`, `os_version` (`sw_vers -productVersion` on macOS to dodge the libSystem 10.16 lie under Anaconda Python), `arch`, `cpu_model`, `cores`, `ram_gb`. Cross-platform (macOS sysctl, Linux /proc, Windows ctypes).
-- Software (`--probe-software a,b,c`): `shutil.which` lookups + macOS `.app` bundle fallback for `chrome*`, `firefox`, `safari*`. Default list documented in `DEFAULT_SOFTWARE_PROBES`.
-- Packages (`--probe-pkg brew,apt,dnf,yum,rpm,port,pacman,winget,choco`): shells out to each manager's "list installed" command; missing manager binary → silently skipped (key omitted from response). `dpkg` aliases to `apt`; `dnf`/`yum` alias to `rpm`.
+**Probes — all auto, no flags:**
+- **Hardware** (always when capabilities is on): `os`, `os_version` (`sw_vers -productVersion` on macOS to dodge the libSystem 10.16 lie under Anaconda Python), `arch`, `cpu_model`, `cores`, `ram_gb`. Cross-platform (macOS sysctl, Linux /proc, Windows ctypes).
+- **Applications**: macOS walks `/Applications`, `/Applications/Utilities`, `/System/Applications`, `~/Applications`, then merges `mdfind 'kMDItemKind == "Application"'` results — filters out private OS agents under `/System/Library/`, `/Library/`, `/usr/libexec/` (hundreds of internal helper apps). Windows reads HKLM + HKCU `…\Uninstall` registry keys. Linux empty (apps come via packages.*).
+- **Packages**: every supported manager whose binary is on PATH gets queried automatically. Members: `brew`, `port`, `apt` (via `dpkg-query`), `dnf`/`yum`/`rpm` (via `rpm -qa`), `pacman`, `snap`, `flatpak`, `winget`, `choco`, `scoop`, plus language-level `pip`, `pipx`, `cargo`, `npm` (-g), `gem`, `conda` (base env). Aliases collapse to canonical keys: `dpkg` → `apt`; `dnf`/`yum` → `rpm`.
+
+**Why no PATH walk?** The previous design walked `$PATH` for the `software` field, skipping system dirs. On Linux that's broken: `/bin` is a symlink to `/usr/bin`, and `/usr/bin` holds both OS-baseline binaries AND apt-installed software. Skipping it loses real signal; not skipping it floods the response with `ls` / `cat` / `grep` noise. Trusting the package managers as source of truth dodges the problem entirely — apt-installed `ffmpeg` shows up under `packages.apt` regardless of where on PATH it lives.
 
 Token: `secrets.token_urlsafe(32)`, generated per-process. Don't reuse across runs.
 
 Smoke verification:
 ```bash
-holo mcp --announce --announce-capabilities --probe-pkg brew --no-bookmarklet &
+holo mcp --announce --announce-capabilities --no-bookmarklet &
 dns-sd -L <instance> _holo-session._tcp local | grep caps_
 # then:
 curl -H "X-Holo-Caps-Token: <token from above>" http://127.0.0.1:<caps_port>/capabilities | jq .
