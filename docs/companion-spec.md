@@ -11,7 +11,7 @@ and provides a UI for connecting to them (SSH + tmux). The companion is
 
 > **Source of truth for the broadcaster:** `src/holo/announce.py` in the
 > holo repo (`https://github.com/nospaceleftondevice/holo`). This spec
-> describes schema version `v=1`, current as of holo `0.1.0a12`. If the
+> describes schema version `v=1`, current as of holo `0.1.0a14`. If the
 > code and this doc disagree, the code wins.
 >
 > **Reference consumer:** `holo discover` (`src/holo/discover.py`) is the
@@ -110,7 +110,7 @@ unset, not emitted with empty values — the companion must distinguish
 | `host` | yes | `dev-laptop.local` | Display name. Same value `socket.gethostname()` returns on the daemon's machine. |
 | `user` | yes | `balexand` | Display label. Local user running the daemon. |
 | `holo_pid` | yes | `64834` | Daemon PID. Useful for "kill session" UI features. |
-| `holo_version` | yes | `0.1.0a12` | Daemon version. Companion can compat-gate features. |
+| `holo_version` | yes | `0.1.0a14` | Daemon version. Companion can compat-gate features. |
 | `started` | yes | `1777924703` | Unix epoch seconds at daemon startup. Sort order for the UI. |
 | `cwd` | yes | `/Users/balexand/git/holo` | Working directory when the daemon launched. Project context. |
 | `ips` | yes (when any IP is locally available) | `192.168.1.106,10.0.0.5` | Comma-separated IPv4 addresses the daemon believes it's reachable on. **Preferred over A-record resolution** for cross-network UIs. |
