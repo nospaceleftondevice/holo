@@ -57,6 +57,9 @@ class HoloMCPServer:
         announce_ssh_user: str | None = None,
         announce_ips: list[str] | None = None,
         announce_port: int = 0,
+        announce_capabilities: bool = False,
+        probe_software: list[str] | None = None,
+        probe_packages: list[str] | None = None,
     ) -> None:
         self.hide_qr = hide_qr
         self.enable_screen = enable_screen
@@ -66,6 +69,36 @@ class HoloMCPServer:
         # Template cache lives across daemon restarts — it's a pure
         # filesystem store, not bound to any JVM/browser session.
         self.templates = templates if templates is not None else TemplateStore()
+
+        # Capabilities HTTP server has to come up BEFORE the announcer
+        # so we can include the bound port + auth token in the TXT
+        # record. If announce isn't on, capabilities is meaningless
+        # (no one would know how to find the URL or token), so we skip
+        # the server too — the CLI rejects the combination up front.
+        self._caps_server: Any | None = None
+        caps_port: int | None = None
+        caps_token: str | None = None
+        if announce and announce_capabilities:
+            try:
+                from holo.capabilities import CapabilitiesProbe
+                from holo.capabilities_server import CapabilitiesServer
+
+                probe = CapabilitiesProbe(
+                    software=probe_software,
+                    packages=probe_packages,
+                )
+                self._caps_server = CapabilitiesServer(probe=probe)
+                self._caps_server.start()
+                caps_port = self._caps_server.actual_port
+                caps_token = self._caps_server.token
+            except Exception as e:  # noqa: BLE001 — surface and continue
+                print(
+                    f"holo mcp: capabilities server failed ({e}); "
+                    "continuing without it",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                self._caps_server = None
 
         self._announcer: Any | None = None
         if announce:
@@ -78,6 +111,8 @@ class HoloMCPServer:
                     ssh_user=announce_ssh_user,
                     port=announce_port,
                     ips=announce_ips,
+                    caps_port=caps_port,
+                    caps_token=caps_token,
                 )
                 self._announcer.start()
             except Exception as e:  # noqa: BLE001 — surface and continue
@@ -101,12 +136,22 @@ class HoloMCPServer:
             return self._daemon
 
     def shutdown(self) -> None:
+        # Stop the announcer first so the LAN sees a Goodbye while the
+        # capabilities server is still up — minimizes the window where
+        # a discoverer could see the broadcast but get a connection
+        # refused on the caps URL.
         if self._announcer is not None:
             try:
                 self._announcer.stop()
             except Exception:  # noqa: BLE001 — shutdown must not raise
                 pass
             self._announcer = None
+        if self._caps_server is not None:
+            try:
+                self._caps_server.stop()
+            except Exception:  # noqa: BLE001 — shutdown must not raise
+                pass
+            self._caps_server = None
         with self._daemon_lock:
             if self._daemon is not None:
                 self._daemon.shutdown()
@@ -557,6 +602,9 @@ def build_server(
     announce_ssh_user: str | None = None,
     announce_ips: list[str] | None = None,
     announce_port: int = 0,
+    announce_capabilities: bool = False,
+    probe_software: list[str] | None = None,
+    probe_packages: list[str] | None = None,
 ) -> tuple[FastMCP, HoloMCPServer]:
     """Build a FastMCP instance with the holo tools registered.
 
@@ -584,6 +632,9 @@ def build_server(
         announce_ssh_user=announce_ssh_user,
         announce_ips=announce_ips,
         announce_port=announce_port,
+        announce_capabilities=announce_capabilities,
+        probe_software=probe_software,
+        probe_packages=probe_packages,
     )
     mcp = FastMCP("holo")
 
@@ -931,6 +982,9 @@ def run(
     announce_user: str | None = None,
     announce_ssh_user: str | None = None,
     announce_ips: list[str] | None = None,
+    announce_capabilities: bool = False,
+    probe_software: list[str] | None = None,
+    probe_packages: list[str] | None = None,
 ) -> None:
     """Entrypoint used by `holo mcp` — runs the server over stdio."""
     mcp, holo = build_server(
@@ -942,6 +996,9 @@ def run(
         announce_user=announce_user,
         announce_ssh_user=announce_ssh_user,
         announce_ips=announce_ips,
+        announce_capabilities=announce_capabilities,
+        probe_software=probe_software,
+        probe_packages=probe_packages,
     )
     try:
         with _sigterm_as_keyboard_interrupt():
@@ -964,6 +1021,9 @@ def run_tcp(
     announce_user: str | None = None,
     announce_ssh_user: str | None = None,
     announce_ips: list[str] | None = None,
+    announce_capabilities: bool = False,
+    probe_software: list[str] | None = None,
+    probe_packages: list[str] | None = None,
     stop_event: threading.Event | None = None,
 ) -> None:
     """Entrypoint used by `holo mcp --listen PORT`.
@@ -988,6 +1048,9 @@ def run_tcp(
         announce_ssh_user=announce_ssh_user,
         announce_ips=announce_ips,
         announce_port=port,
+        announce_capabilities=announce_capabilities,
+        probe_software=probe_software,
+        probe_packages=probe_packages,
     )
     listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)

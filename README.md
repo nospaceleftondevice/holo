@@ -218,6 +218,45 @@ The wire contract is documented in
 [`docs/companion-spec.md`](docs/companion-spec.md) — `holo discover`
 is the reference implementation of that spec.
 
+### Capabilities endpoint (`--announce-capabilities`)
+
+When the user wants an agent to **route tasks by host capability**
+("send transcription to the M4, not the M1"; "find a host with Chrome
+Canary"), the daemon can also serve a small JSON inventory over a
+token-authenticated HTTP endpoint. The bound port + auth token are
+broadcast in the same mDNS TXT record as the rest of the session
+metadata, so a discoverer reads them and fetches:
+
+```
+GET http://<ip>:<caps_port>/capabilities
+X-Holo-Caps-Token: <caps_token>
+```
+
+```bash
+holo mcp --announce --announce-capabilities \
+  --probe-software chrome-canary,ffmpeg,ollama \
+  --probe-pkg brew,apt
+```
+
+| Flag | Purpose |
+| --- | --- |
+| `--announce-capabilities` | Stand up the HTTP endpoint, advertise via TXT |
+| `--probe-software A,B,C` | `which`-lookup names (defaults to a curated list) |
+| `--probe-pkg M,M,M` | Package managers to query (`brew,apt,dpkg,dnf,yum,rpm,port,pacman,winget,choco`) |
+
+Cross-platform — hardware probes use `sysctl` on macOS, `/proc` on
+Linux, the Win32 API on Windows. Software probes use `shutil.which`
+plus a small known-bundle map for macOS `.app`s. Package probes only
+run for managers that exist on the host (`brew` skipped on Linux,
+`apt` skipped on macOS, etc).
+
+The endpoint is hardened against random web origins via a custom auth
+header + zero CORS allow-headers (preflight fails, fetch never fires).
+It is **not** hardened against same-LAN attackers — anyone who can read
+the mDNS broadcast also gets the token. See
+[`docs/companion-spec.md`](docs/companion-spec.md#3a-capabilities-http-endpoint-optional)
+for the full wire contract.
+
 ## License
 
 Apache-2.0. See [LICENSE](LICENSE).

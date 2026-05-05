@@ -250,6 +250,40 @@ class TestInstanceName:
         assert name.startswith("holo-claude-1-")
 
 
+class TestCapabilitiesFields:
+    """The optional caps_port / caps_token TXT fields."""
+
+    def test_caps_fields_omitted_by_default(self) -> None:
+        props = _decode(HoloAnnouncer().build_properties())
+        assert "caps_port" not in props
+        assert "caps_token" not in props
+
+    def test_caps_fields_present_when_both_set(self) -> None:
+        props = _decode(
+            HoloAnnouncer(
+                caps_port=49597, caps_token="abc-token"
+            ).build_properties()
+        )
+        assert props["caps_port"] == "49597"
+        assert props["caps_token"] == "abc-token"
+
+    def test_caps_pair_validation_rejects_port_only(self) -> None:
+        with pytest.raises(ValueError, match="must be set together"):
+            HoloAnnouncer(caps_port=49597)
+
+    def test_caps_pair_validation_rejects_token_only(self) -> None:
+        with pytest.raises(ValueError, match="must be set together"):
+            HoloAnnouncer(caps_token="abc")
+
+    def test_caps_port_in_int_fields(self) -> None:
+        # Sanity check: discover.py converts caps_port to int because
+        # the field name is in INT_FIELDS. Verify the contract here so
+        # adding the field can't accidentally drop the conversion.
+        from holo.announce import FIELD_CAPS_PORT, INT_FIELDS
+
+        assert FIELD_CAPS_PORT in INT_FIELDS
+
+
 class TestServiceTypeConstants:
     def test_service_type_format(self) -> None:
         assert SERVICE_TYPE == "_holo-session._tcp.local."
@@ -457,6 +491,116 @@ class TestCLIFlagParsing:
             assert kwargs["announce_ssh_user"] is None
 
 
+class TestCapabilitiesCLIFlags:
+    """Validate --announce-capabilities / --probe-software / --probe-pkg parsing."""
+
+    def test_announce_capabilities_without_announce_errors(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        from holo.cli import main
+
+        rc = main(["mcp", "--announce-capabilities"])
+        assert rc == 2
+        err = capsys.readouterr().err
+        assert "require --announce" in err
+
+    def test_probe_software_without_announce_capabilities_errors(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        from holo.cli import main
+
+        rc = main(
+            [
+                "mcp",
+                "--announce",
+                "--probe-software",
+                "ffmpeg,git",
+                "--no-bookmarklet",
+            ]
+        )
+        assert rc == 2
+        err = capsys.readouterr().err
+        assert "require --announce-capabilities" in err
+
+    def test_probe_pkg_without_announce_capabilities_errors(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        from holo.cli import main
+
+        rc = main(
+            [
+                "mcp",
+                "--announce",
+                "--probe-pkg",
+                "brew",
+                "--no-bookmarklet",
+            ]
+        )
+        assert rc == 2
+        err = capsys.readouterr().err
+        assert "require --announce-capabilities" in err
+
+    def test_probe_pkg_unknown_manager_errors(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        from holo.cli import main
+
+        rc = main(
+            [
+                "mcp",
+                "--announce",
+                "--announce-capabilities",
+                "--probe-pkg",
+                "brew,pacmen",
+                "--no-bookmarklet",
+            ]
+        )
+        assert rc == 2
+        err = capsys.readouterr().err
+        assert "pacmen" in err
+        assert "supported:" in err
+
+    def test_capabilities_kwargs_threaded_to_run(self) -> None:
+        from holo.cli import main
+
+        with patch("holo.mcp_server.run") as run:
+            main(
+                [
+                    "mcp",
+                    "--announce",
+                    "--announce-capabilities",
+                    "--probe-software",
+                    "ffmpeg,ollama",
+                    "--probe-pkg",
+                    "brew,apt",
+                    "--no-bookmarklet",
+                ]
+            )
+            kwargs = run.call_args.kwargs
+            assert kwargs["announce_capabilities"] is True
+            assert kwargs["probe_software"] == ["ffmpeg", "ollama"]
+            assert kwargs["probe_packages"] == ["brew", "apt"]
+
+    def test_capabilities_kwargs_threaded_to_run_tcp(self) -> None:
+        from holo.cli import main
+
+        with patch("holo.mcp_server.run_tcp") as run_tcp:
+            main(
+                [
+                    "mcp",
+                    "--listen",
+                    "7778",
+                    "--announce",
+                    "--announce-capabilities",
+                    "--no-bookmarklet",
+                ]
+            )
+            kwargs = run_tcp.call_args.kwargs
+            assert kwargs["announce_capabilities"] is True
+            assert kwargs["probe_software"] is None
+            assert kwargs["probe_packages"] is None
+
+
 class TestHoloMCPServerIntegration:
     def test_no_announce_means_no_announcer(self) -> None:
         from holo.mcp_server import HoloMCPServer
@@ -493,6 +637,82 @@ class TestHoloMCPServerIntegration:
             # Should swallow the error and continue with announcer=None.
             server = HoloMCPServer(no_bookmarklet=True, announce=True)
             assert server._announcer is None
+            server.shutdown()
+
+    def test_capabilities_flag_constructs_caps_server(self) -> None:
+        """When --announce-capabilities is on, the HoloMCPServer must
+        stand up the caps server *before* the announcer and pass the
+        bound port + token through."""
+        from holo.mcp_server import HoloMCPServer
+
+        # Stub both classes so we don't actually open sockets / multicast.
+        with (
+            patch(
+                "holo.capabilities_server.CapabilitiesServer"
+            ) as caps_cls,
+            patch("holo.announce.HoloAnnouncer") as ann_cls,
+        ):
+            caps_instance = caps_cls.return_value
+            caps_instance.actual_port = 49597
+            caps_instance.token = "fake-token-xyz"
+
+            server = HoloMCPServer(
+                no_bookmarklet=True,
+                announce=True,
+                announce_capabilities=True,
+                probe_software=["ffmpeg"],
+                probe_packages=["brew"],
+            )
+
+            # Caps server constructed and started.
+            assert caps_cls.called
+            assert caps_instance.start.called
+            # Announcer received the caps_port + caps_token.
+            ann_kwargs = ann_cls.call_args.kwargs
+            assert ann_kwargs["caps_port"] == 49597
+            assert ann_kwargs["caps_token"] == "fake-token-xyz"
+
+            server.shutdown()
+            # Both stopped on shutdown.
+            assert caps_instance.stop.called
+            assert ann_cls.return_value.stop.called
+
+    def test_capabilities_disabled_means_no_caps_server(self) -> None:
+        """When --announce-capabilities is off, no caps server is built
+        and the announcer gets caps_port=None / caps_token=None."""
+        from holo.mcp_server import HoloMCPServer
+
+        with (
+            patch(
+                "holo.capabilities_server.CapabilitiesServer"
+            ) as caps_cls,
+            patch("holo.announce.HoloAnnouncer") as ann_cls,
+        ):
+            server = HoloMCPServer(
+                no_bookmarklet=True,
+                announce=True,
+                announce_capabilities=False,
+            )
+
+            assert not caps_cls.called
+            ann_kwargs = ann_cls.call_args.kwargs
+            assert ann_kwargs["caps_port"] is None
+            assert ann_kwargs["caps_token"] is None
+            server.shutdown()
+
+    def test_capabilities_skipped_without_announce(self) -> None:
+        """Even if the kwarg slips through (CLI rejects it), the server
+        should refuse to stand up the caps endpoint without announce —
+        the URL would be unreachable without the TXT broadcast."""
+        from holo.mcp_server import HoloMCPServer
+
+        with patch("holo.capabilities_server.CapabilitiesServer") as caps_cls:
+            server = HoloMCPServer(
+                no_bookmarklet=True,
+                announce=False,
+                announce_capabilities=True,
+            )
+            assert not caps_cls.called
             server.shutdown()
 
 

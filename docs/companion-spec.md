@@ -118,6 +118,10 @@ unset, not emitted with empty values — the companion must distinguish
 | `ssh_user` | optional | `balexand` | Username for `ssh <ssh_user>@<host>`. If absent, fall back to `user`. |
 | `tmux_session` | optional | `claude-1` | Tmux session name (`#S`) — argument to `tmux attach -t`. Auto-detected when daemon runs inside `$TMUX`. |
 | `tmux_window` | optional | `0` | Tmux window (`#W`) for precise targeting. Optional even when `tmux_session` is present. |
+| `caps_port` | optional¹ | `49597` | TCP port of the host's capabilities HTTP endpoint (`/capabilities`). Companion fetches `http://<one of ips>:<caps_port>/capabilities` to read the host's hardware/software/package inventory. |
+| `caps_token` | optional¹ | `r4nDom-base64url-string` | Auth token for `X-Holo-Caps-Token` request header. **Must be sent on every `/capabilities` request** — wrong/missing token returns `401`. |
+
+¹ `caps_port` and `caps_token` are either **both present or both absent**; the daemon refuses to advertise one without the other. Absence means the host did not opt into the capabilities endpoint via `--announce-capabilities`.
 
 #### Field budget
 
@@ -169,6 +173,100 @@ directly. Examples:
 | Node.js | `multicast-dns` (MIT) | Low-level; or `bonjour-service` for higher-level |
 | Python | `python-zeroconf` (LGPL 2.1+) | Same library holo uses |
 | Go | `github.com/grandcat/zeroconf` | Stable, MIT |
+
+---
+
+## 3a. Capabilities HTTP endpoint (optional)
+
+When a daemon is launched with `--announce-capabilities`, it spins up
+a small HTTP server alongside the announce broadcast and advertises
+the port + auth token in the TXT record (`caps_port`, `caps_token`).
+The companion uses this to discover what the host *can do* — hardware
+specs, installed software, installed packages — so an agent can route
+tasks to the right machine ("send transcription to the M4, not the
+M1"; "find a host with Chrome Canary installed").
+
+### Request
+
+```
+GET http://<host-ip>:<caps_port>/capabilities
+X-Holo-Caps-Token: <caps_token from TXT>
+```
+
+The host IP comes from the broadcast `ips` field (preferred) or the A
+records. The companion **must** send the auth header — there is no
+unauthenticated path to capabilities data. Wrong/missing token returns
+`401 Unauthorized` with `{"error": "unauthorized"}`.
+
+There's also a `GET /healthz` endpoint that returns `{"status": "ok"}`
+with no auth required, suitable for liveness checks.
+
+### Threat model and CORS
+
+The capabilities server binds `0.0.0.0:<random-port>` so any host on
+the LAN can reach it. We assume the LAN is mostly trusted: anyone who
+can already snoop the mDNS broadcast has the auth token.
+
+The server is hardened against ONE specific scenario: a random web
+origin (`https://evil.com`) trying to fingerprint the host via
+cross-origin `fetch()`. Two defenses combine to block this:
+
+1. **Custom auth header.** The required `X-Holo-Caps-Token` is not on
+   the [CORS-safelisted request-headers list][cors-safelist], so any
+   `fetch()` carrying it triggers a CORS preflight.
+2. **No `Access-Control-Allow-*` headers.** The server emits none, so
+   the preflight fails — the browser never fires the actual request.
+
+[cors-safelist]: https://developer.mozilla.org/en-US/docs/Glossary/CORS-safelisted_request_header
+
+This stops the browser path; it does **not** stop a same-LAN attacker
+who can read the TXT record. Don't put secrets in the capabilities
+response that you wouldn't put in the TXT record itself.
+
+### Response shape
+
+```jsonc
+{
+  "schema": 1,                                // bump on incompatible changes
+  "host": {
+    "os": "darwin",                           // darwin | linux | windows
+    "os_version": "14.5",                     // marketing version (sw_vers on macOS)
+    "arch": "arm64",                          // arm64 | x86_64 | amd64
+    "cpu_model": "Apple M4 Pro",              // sysctl machdep.cpu.brand_string
+    "cores": 14,                              // logical cores (os.cpu_count)
+    "ram_gb": 36.0                            // total physical RAM
+  },
+  "software": {                               // shutil.which lookups
+    "chrome": "/Applications/Google Chrome.app",
+    "ffmpeg": "/opt/homebrew/bin/ffmpeg"
+    // missing names are omitted
+  },
+  "packages": {                               // per-manager probe results
+    "brew": [
+      {"name": "ffmpeg",  "version": "7.0.1"},
+      {"name": "whisper", "version": "1.7.0"}
+    ],
+    "apt": [...]                              // only if --probe-pkg apt
+  },
+  "generated_at": 1714900000                  // unix epoch when collected
+}
+```
+
+Probes are **opt-in**: `software` only contains names the daemon was
+asked to look up (`--probe-software a,b,c`, default list documented in
+the daemon source); `packages` only contains entries for managers in
+`--probe-pkg`. A daemon launched with no extra probe flags returns the
+default software list and an empty `packages` dict.
+
+The probe result is cached server-side for ~60 s — companions can poll
+without driving repeated `brew list` invocations on the host.
+
+### Schema versioning
+
+`schema` follows the same fail-closed rule as the mDNS `v` field: the
+companion **must** drop the response if `schema` is greater than the
+version it understands. Additive new fields within the current major
+are safe and must not break older companions.
 
 ---
 
