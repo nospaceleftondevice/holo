@@ -52,6 +52,7 @@ import json
 import logging
 import os
 import platform
+import plistlib
 import shutil
 import subprocess
 import threading
@@ -678,7 +679,7 @@ def _probe_applications_macos() -> dict[str, dict[str, str]]:
                     continue
                 name = entry.name[: -len(".app")]
                 if name not in out:
-                    out[name] = {"path": entry.path}
+                    out[name] = _build_app_entry(entry.path)
         finally:
             entries.close()
 
@@ -709,8 +710,51 @@ def _probe_applications_macos() -> dict[str, dict[str, str]]:
             name = os.path.basename(path)[: -len(".app")]
             if name in out:
                 continue
-            out[name] = {"path": path}
+            out[name] = _build_app_entry(path)
             seen_paths.add(path)
+    return out
+
+
+def _build_app_entry(bundle_path: str) -> dict[str, str]:
+    """Assemble the per-app dict — `path` plus whatever Info.plist gives us."""
+    entry: dict[str, str] = {"path": bundle_path}
+    entry.update(_read_app_metadata(bundle_path))
+    return entry
+
+
+def _read_app_metadata(bundle_path: str) -> dict[str, str]:
+    """Pull `version` + `bundle_id` from a `.app` bundle's Info.plist.
+
+    Returns whatever keys we can extract; missing keys are omitted so
+    the merged entry stays tight (no nulls for unread fields). Read
+    failures (corrupt plist, permission denied, missing file) yield
+    an empty dict — the caller still has `path` and the entry shows
+    up in the response with version omitted, which the agent
+    interprets as "version unknown" rather than "not installed".
+
+    We prefer ``CFBundleShortVersionString`` (the marketing version,
+    e.g. "125.0.6422.142") over ``CFBundleVersion`` (the build number,
+    sometimes the same, sometimes a much-shorter monotonic counter).
+    Routing decisions usually want the marketing version because
+    that's what the user / docs reference.
+    """
+    plist_path = os.path.join(bundle_path, "Contents", "Info.plist")
+    try:
+        with open(plist_path, "rb") as f:
+            data = plistlib.load(f)
+    except (OSError, plistlib.InvalidFileException, ValueError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    out: dict[str, str] = {}
+    version = data.get("CFBundleShortVersionString") or data.get(
+        "CFBundleVersion"
+    )
+    if version:
+        out["version"] = str(version)
+    bundle_id = data.get("CFBundleIdentifier")
+    if bundle_id:
+        out["bundle_id"] = str(bundle_id)
     return out
 
 
@@ -788,6 +832,12 @@ def _probe_applications_windows() -> dict[str, dict[str, str]]:
                         ("DisplayVersion", "version"),
                         ("Publisher", "publisher"),
                         ("InstallLocation", "path"),
+                        # Registry stores InstallDate as REG_SZ in the
+                        # form YYYYMMDD (e.g. "20251102") for most
+                        # MSI-installed packages. Some installers omit
+                        # it entirely; we just pass through whatever's
+                        # there — no parsing.
+                        ("InstallDate", "install_date"),
                     ):
                         try:
                             value, _ = winreg.QueryValueEx(sub, src)
