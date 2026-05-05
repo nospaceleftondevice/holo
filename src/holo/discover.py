@@ -1,0 +1,587 @@
+"""mDNS / DNS-SD discovery for holo sessions.
+
+Reference consumer of `docs/companion-spec.md`. Subscribes to the same
+`_holo-session._tcp.local.` service type that `holo.announce` broadcasts
+and exposes three output modes:
+
+    holo discover --json           one-shot snapshot, JSON array, exit
+    holo discover --tail           long-running JSONL event stream
+    holo discover --serve PORT     HTTP + WebSocket server (default 7082)
+
+The parser shares TXT field-name constants with `holo.announce` so the
+broadcaster and the consumer can't drift. Schema-version validation is
+"fail closed on `v != \"1\"`": malformed records are logged at WARNING
+and dropped from the session list.
+
+Architecture
+------------
+::
+
+    Zeroconf  →  ServiceBrowser  →  HoloListener
+                                          │
+                                          ▼
+                                    SessionStore  (thread-safe;
+                                          │       subscriber fanout)
+                                          ▼
+                              ┌───────────┼─────────────┐
+                              ▼           ▼             ▼
+                          --json       --tail        --serve
+                          snapshot     JSONL         Starlette + WS
+
+The SessionStore uses a `threading.RLock`, so zeroconf's callback
+thread, the stale-sweep thread, and the asyncio loop in `--serve`
+mode can all touch it safely. For `--serve` we hop the queue boundary
+via ``loop.call_soon_threadsafe`` since the WS handler is async.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+import sys
+import threading
+import time
+from collections.abc import Callable
+from typing import Any
+
+from holo.announce import (
+    FIELD_IPS,
+    FIELD_STARTED,
+    FIELD_V,
+    INT_FIELDS,
+    REQUIRED_FIELDS,
+    SERVICE_TYPE,
+    TXT_SCHEMA_VERSION,
+)
+
+_log = logging.getLogger(__name__)
+
+
+DEFAULT_SERVE_PORT = 7082
+DEFAULT_CORS_ORIGINS = ("http://localhost:8888", "https://app-dev.tai.sh")
+# Spec §2.5: drop sessions whose last_seen is older than 2× cache TTL.
+# zeroconf's default service TTL is ~75s, so 150s is the natural floor.
+DEFAULT_STALE_AFTER_S = 150.0
+# Sweep cadence; smaller = lower drop latency, more wake-ups.
+_STALE_SWEEP_INTERVAL_S = 15.0
+# How long --json waits for the browser to populate before printing.
+DEFAULT_JSON_WAIT_S = 3.0
+
+
+# --------------------------------------------------------------------- parser
+
+
+def _instance_from_name(name: str) -> str:
+    """Strip the trailing `._holo-session._tcp.local.` to get the instance."""
+    suffix = "." + SERVICE_TYPE
+    return name[: -len(suffix)] if name.endswith(suffix) else name
+
+
+def parse_txt(
+    properties: dict[bytes, bytes], instance: str
+) -> dict[str, Any] | None:
+    """Decode a TXT record into a Session dict, or return None if invalid.
+
+    Per spec §2.4:
+      - Required fields must all be present.
+      - Schema version (`v`) must equal "1"; unknown majors are dropped
+        with a WARNING.
+      - Optional fields are omitted from the returned dict when absent
+        (the desktop UI distinguishes "unset" from "set to empty").
+
+    The TXT bytes-to-str decode is UTF-8; on decode failure the entry
+    is logged and dropped — do not silently substitute lossy data.
+    """
+    decoded: dict[str, str] = {}
+    for raw_key, raw_val in properties.items():
+        try:
+            key = raw_key.decode("utf-8")
+            val = (raw_val or b"").decode("utf-8")
+        except UnicodeDecodeError:
+            _log.warning(
+                "discover: %s: dropping non-UTF-8 TXT field; bytes=%r=%r",
+                instance,
+                raw_key,
+                raw_val,
+            )
+            return None
+        decoded[key] = val
+
+    missing = [f for f in REQUIRED_FIELDS if f not in decoded]
+    if missing:
+        _log.warning(
+            "discover: %s: missing required TXT fields %s; dropping",
+            instance,
+            missing,
+        )
+        return None
+
+    if decoded[FIELD_V] != TXT_SCHEMA_VERSION:
+        _log.warning(
+            "discover: %s: unsupported schema v=%r (this build understands "
+            "v=%r); dropping",
+            instance,
+            decoded[FIELD_V],
+            TXT_SCHEMA_VERSION,
+        )
+        return None
+
+    session: dict[str, Any] = {"instance": instance}
+    for k, v in decoded.items():
+        if k in INT_FIELDS:
+            try:
+                session[k] = int(v)
+            except ValueError:
+                _log.warning(
+                    "discover: %s: non-integer %s=%r; dropping", instance, k, v
+                )
+                return None
+        elif k == FIELD_IPS:
+            # Comma-separated → list[str]. Empty entries are dropped.
+            session[k] = [x.strip() for x in v.split(",") if x.strip()]
+        else:
+            session[k] = v
+
+    session["last_seen"] = int(time.time())
+    return session
+
+
+# --------------------------------------------------------- session store + events
+
+
+class SessionStore:
+    """Thread-safe map of instance → Session, plus subscriber fanout.
+
+    Multiple writers (zeroconf callback thread, stale-sweep thread) and
+    multiple readers (HTTP handler, --tail printer, WS clients) share
+    one `RLock`. Subscribers receive every state change as an `Event`
+    dict; they're called *while the lock is held* so subscribers must
+    not block — for async consumers use ``loop.call_soon_threadsafe``
+    inside the callback.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.RLock()
+        self._sessions: dict[str, dict[str, Any]] = {}
+        self._subscribers: list[Callable[[dict[str, Any]], None]] = []
+
+    def upsert(self, session: dict[str, Any]) -> dict[str, Any]:
+        """Insert or replace a session by instance.
+
+        Emits ``{"type": "add", "session": ...}`` for new instances and
+        ``{"type": "update", "session": ...}`` for existing ones.
+        Returns the event that was emitted.
+        """
+        instance = session["instance"]
+        with self._lock:
+            existing = self._sessions.get(instance)
+            self._sessions[instance] = session
+            event_type = "update" if existing is not None else "add"
+            event = {"type": event_type, "session": session}
+            self._fanout(event)
+        return event
+
+    def remove(self, instance: str) -> dict[str, Any] | None:
+        with self._lock:
+            existing = self._sessions.pop(instance, None)
+            if existing is None:
+                return None
+            event = {"type": "remove", "instance": instance}
+            self._fanout(event)
+            return event
+
+    def snapshot(self) -> list[dict[str, Any]]:
+        """Return all sessions sorted by `started` ascending (oldest first).
+
+        Stable ordering matters for UI lists — without it, every poll
+        could show sessions in a different order even when nothing
+        actually changed.
+        """
+        with self._lock:
+            return sorted(
+                (dict(s) for s in self._sessions.values()),
+                key=lambda s: s.get(FIELD_STARTED, 0),
+            )
+
+    def subscribe(
+        self, callback: Callable[[dict[str, Any]], None]
+    ) -> Callable[[dict[str, Any]], None]:
+        """Register a callback. Returns the same callable as a token for unsubscribe."""
+        with self._lock:
+            self._subscribers.append(callback)
+        return callback
+
+    def unsubscribe(self, token: Callable[[dict[str, Any]], None]) -> None:
+        with self._lock:
+            try:
+                self._subscribers.remove(token)
+            except ValueError:
+                pass
+
+    def prune_stale(self, stale_after_s: float, now: float | None = None) -> int:
+        """Drop sessions whose ``last_seen`` is older than ``stale_after_s``.
+
+        Returns the count of pruned entries. Each removal emits a
+        ``remove`` event so subscribers see them.
+        """
+        if now is None:
+            now = time.time()
+        cutoff = now - stale_after_s
+        pruned = 0
+        with self._lock:
+            stale = [
+                inst
+                for inst, s in self._sessions.items()
+                if s.get("last_seen", 0) < cutoff
+            ]
+            for inst in stale:
+                if self.remove(inst) is not None:
+                    pruned += 1
+        return pruned
+
+    def _fanout(self, event: dict[str, Any]) -> None:
+        # Snapshot subscribers under the lock so unsubscribe during dispatch
+        # doesn't mutate the list mid-iteration.
+        for cb in list(self._subscribers):
+            try:
+                cb(event)
+            except Exception:  # noqa: BLE001 — subscriber bugs must not kill fanout
+                _log.exception("discover: subscriber raised; continuing")
+
+
+# ------------------------------------------------------------ zeroconf bridge
+
+
+class HoloListener:
+    """Adapt python-zeroconf's `ServiceListener` callbacks to a SessionStore.
+
+    The library invokes our methods on its own thread; we delegate
+    everything heavy to the store (which is thread-safe) and never
+    block in the callback path beyond a TXT lookup.
+    """
+
+    def __init__(self, zeroconf: Any, store: SessionStore) -> None:
+        self._zeroconf = zeroconf
+        self._store = store
+
+    def add_service(self, zeroconf: Any, service_type: str, name: str) -> None:
+        self._fetch_and_upsert(zeroconf, service_type, name)
+
+    def update_service(self, zeroconf: Any, service_type: str, name: str) -> None:
+        self._fetch_and_upsert(zeroconf, service_type, name)
+
+    def remove_service(self, zeroconf: Any, service_type: str, name: str) -> None:
+        instance = _instance_from_name(name)
+        self._store.remove(instance)
+
+    def _fetch_and_upsert(
+        self, zeroconf: Any, service_type: str, name: str
+    ) -> None:
+        info = zeroconf.get_service_info(service_type, name, timeout=2000)
+        if info is None:
+            return
+        instance = _instance_from_name(name)
+        properties = info.properties or {}
+        session = parse_txt(properties, instance)
+        if session is None:
+            return
+        self._store.upsert(session)
+
+
+def _start_browser() -> tuple[Any, Any, SessionStore]:
+    """Spin up a Zeroconf instance + ServiceBrowser bound to a fresh store.
+
+    Returns (zeroconf, browser, store). Callers are responsible for
+    calling `zeroconf.close()` to tear it all down.
+    """
+    from zeroconf import ServiceBrowser, Zeroconf
+
+    store = SessionStore()
+    zc = Zeroconf()
+    listener = HoloListener(zc, store)
+    browser = ServiceBrowser(zc, SERVICE_TYPE, listener=listener)
+    return zc, browser, store
+
+
+# -------------------------------------------------------------- mode adapters
+
+
+def run_oneshot(wait_s: float = DEFAULT_JSON_WAIT_S) -> int:
+    """`--json` mode: browse for `wait_s`, print snapshot, exit 0."""
+    zc, _browser, store = _start_browser()
+    try:
+        time.sleep(wait_s)
+        snapshot = store.snapshot()
+    finally:
+        zc.close()
+    json.dump(snapshot, sys.stdout)
+    sys.stdout.write("\n")
+    sys.stdout.flush()
+    return 0
+
+
+def run_tail(stale_after_s: float = DEFAULT_STALE_AFTER_S) -> int:
+    """`--tail` mode: stream JSONL events to stdout until SIGINT/SIGTERM."""
+    from holo.mcp_server import _sigterm_as_keyboard_interrupt
+
+    zc, _browser, store = _start_browser()
+    stop_event = threading.Event()
+
+    def emit(event: dict[str, Any]) -> None:
+        try:
+            sys.stdout.write(json.dumps(event) + "\n")
+            sys.stdout.flush()
+        except (BrokenPipeError, OSError):
+            stop_event.set()
+
+    # Initial snapshot as a series of `add` events so consumers don't need
+    # a separate "fetch then subscribe" handshake. Subscribe first so we
+    # don't miss anything that lands between the snapshot and the subscribe.
+    store.subscribe(emit)
+    for s in store.snapshot():
+        emit({"type": "add", "session": s})
+
+    sweeper = _start_stale_sweeper(store, stale_after_s, stop_event)
+
+    try:
+        with _sigterm_as_keyboard_interrupt():
+            while not stop_event.is_set():
+                stop_event.wait(timeout=0.5)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        stop_event.set()
+        sweeper.join(timeout=2.0)
+        zc.close()
+    return 0
+
+
+def run_serve(
+    port: int = DEFAULT_SERVE_PORT,
+    cors_origins: list[str] | None = None,
+    stale_after_s: float = DEFAULT_STALE_AFTER_S,
+    host: str = "127.0.0.1",
+) -> int:
+    """`--serve` mode: localhost HTTP+WS service on `port`."""
+    import uvicorn
+
+    app = build_app(cors_origins=cors_origins, stale_after_s=stale_after_s)
+    config = uvicorn.Config(
+        app,
+        host=host,
+        port=port,
+        log_level="warning",
+        access_log=False,
+    )
+    server = uvicorn.Server(config)
+    print(
+        f"holo discover: serving on http://{host}:{port} "
+        f"(routes: /sessions /healthz /events)",
+        file=sys.stderr,
+        flush=True,
+    )
+    try:
+        server.run()
+    except KeyboardInterrupt:
+        pass
+    return 0
+
+
+# ----------------------------------------------------------------- stale sweep
+
+
+def _start_stale_sweeper(
+    store: SessionStore, stale_after_s: float, stop_event: threading.Event
+) -> threading.Thread:
+    """Launch a daemon thread that prunes stale sessions periodically."""
+
+    def loop() -> None:
+        while not stop_event.is_set():
+            try:
+                store.prune_stale(stale_after_s)
+            except Exception:  # noqa: BLE001 — log and keep sweeping
+                _log.exception("discover: stale sweep raised")
+            stop_event.wait(timeout=_STALE_SWEEP_INTERVAL_S)
+
+    t = threading.Thread(
+        target=loop, name="holo-discover-sweeper", daemon=True
+    )
+    t.start()
+    return t
+
+
+# ------------------------------------------------------------------ HTTP+WS app
+
+
+def build_app(
+    *,
+    store: SessionStore | None = None,
+    cors_origins: list[str] | None = None,
+    stale_after_s: float = DEFAULT_STALE_AFTER_S,
+) -> Any:
+    """Construct the Starlette ASGI app for `--serve`.
+
+    `store` may be passed in for tests; production callers leave it None
+    so the app spins up its own zeroconf browser at startup.
+    """
+    from contextlib import asynccontextmanager
+
+    from starlette.applications import Starlette
+    from starlette.middleware import Middleware
+    from starlette.middleware.cors import CORSMiddleware
+    from starlette.responses import JSONResponse
+    from starlette.routing import Route, WebSocketRoute
+
+    origins = list(cors_origins) if cors_origins else list(DEFAULT_CORS_ORIGINS)
+
+    state: dict[str, Any] = {
+        "store": store,
+        "zc": None,
+        "browser": None,
+        "stop_event": threading.Event(),
+        "sweeper": None,
+    }
+
+    async def sessions_endpoint(request: Any) -> Any:
+        del request
+        return JSONResponse(state["store"].snapshot())
+
+    async def healthz_endpoint(request: Any) -> Any:
+        del request
+        return JSONResponse(
+            {
+                "status": "ok",
+                "interfaces": _list_interfaces(),
+                "zt_present": _zt_present(),
+            }
+        )
+
+    async def events_ws(websocket: Any) -> None:
+        await websocket.accept()
+        loop = asyncio.get_running_loop()
+        queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+
+        def forward(event: dict[str, Any]) -> None:
+            # Hop from zeroconf's thread to the asyncio loop.
+            loop.call_soon_threadsafe(queue.put_nowait, event)
+
+        token = state["store"].subscribe(forward)
+        try:
+            for s in state["store"].snapshot():
+                await websocket.send_json({"type": "add", "session": s})
+            while True:
+                event = await queue.get()
+                await websocket.send_json(event)
+        except Exception:
+            # Most often: client disconnected. Don't log every WS close
+            # as an error.
+            pass
+        finally:
+            state["store"].unsubscribe(token)
+            try:
+                await websocket.close()
+            except Exception:
+                pass
+
+    @asynccontextmanager
+    async def lifespan(app):  # type: ignore[no-untyped-def]
+        del app
+        if state["store"] is None:
+            zc, browser, store_ = _start_browser()
+            state["store"] = store_
+            state["zc"] = zc
+            state["browser"] = browser
+            state["sweeper"] = _start_stale_sweeper(
+                store_, stale_after_s, state["stop_event"]
+            )
+        try:
+            yield
+        finally:
+            state["stop_event"].set()
+            if state["sweeper"] is not None:
+                state["sweeper"].join(timeout=2.0)
+            if state["zc"] is not None:
+                state["zc"].close()
+
+    return Starlette(
+        debug=False,
+        routes=[
+            Route("/sessions", sessions_endpoint, methods=["GET"]),
+            Route("/healthz", healthz_endpoint, methods=["GET"]),
+            WebSocketRoute("/events", events_ws),
+        ],
+        middleware=[
+            Middleware(
+                CORSMiddleware,
+                allow_origins=origins,
+                allow_methods=["GET"],
+                allow_headers=["*"],
+            ),
+        ],
+        lifespan=lifespan,
+    )
+
+
+# --------------------------------------------------------------- /healthz info
+
+
+def _list_interfaces() -> list[dict[str, Any]]:
+    """Enumerate local interfaces with their IPv4 addresses for /healthz."""
+    try:
+        import ifaddr
+    except ImportError:
+        return []
+    out: list[dict[str, Any]] = []
+    for adapter in ifaddr.get_adapters():
+        ipv4: list[str] = []
+        for ip in adapter.ips:
+            if isinstance(ip.ip, str):
+                ipv4.append(ip.ip)
+        out.append({"name": adapter.name, "ipv4": ipv4})
+    return out
+
+
+def _zt_present() -> bool:
+    """Best-effort detection of a ZeroTier interface.
+
+    macOS/Linux name interfaces `ztXXXX` (10-char ZT id with `zt` prefix)
+    or `feth*` on some macOS configurations; we look for `zt` prefix as
+    the common case. Windows ZT uses adapter descriptions rather than
+    name prefixes — for v1 we only try the prefix heuristic.
+    """
+    try:
+        import ifaddr
+    except ImportError:
+        return False
+    for adapter in ifaddr.get_adapters():
+        name = (adapter.name or "").lower()
+        if name.startswith("zt"):
+            return True
+    return False
+
+
+# ---------------------- helpful when invoking the module manually ----------------
+
+
+def main(args: list[str]) -> int:
+    """Dispatcher for `holo discover`. CLI parsing lives in `holo.cli`."""
+    raise NotImplementedError(
+        "Call holo.discover.run_oneshot/run_tail/run_serve directly; "
+        "argument parsing happens in holo.cli."
+    )
+
+
+__all__ = [
+    "DEFAULT_CORS_ORIGINS",
+    "DEFAULT_JSON_WAIT_S",
+    "DEFAULT_SERVE_PORT",
+    "DEFAULT_STALE_AFTER_S",
+    "HoloListener",
+    "SessionStore",
+    "build_app",
+    "parse_txt",
+    "run_oneshot",
+    "run_serve",
+    "run_tail",
+]
