@@ -603,7 +603,13 @@ class TestCLIFlagParsing:
 
 
 class TestCapabilitiesCLIFlags:
-    """Validate --announce-capabilities / --probe-software / --probe-pkg parsing."""
+    """Validate --announce-capabilities CLI plumbing.
+
+    The per-probe flags `--probe-software` and `--probe-pkg` were removed
+    in 0.1.0a16; the CLI now errors helpfully if anyone passes them so
+    pasted-from-old-docs commands don't fail with a confusing
+    "unrecognised flag".
+    """
 
     def test_announce_capabilities_without_announce_errors(
         self, capsys: pytest.CaptureFixture[str]
@@ -615,7 +621,7 @@ class TestCapabilitiesCLIFlags:
         err = capsys.readouterr().err
         assert "require --announce" in err
 
-    def test_probe_software_without_announce_capabilities_errors(
+    def test_legacy_probe_software_flag_errors_with_migration_message(
         self, capsys: pytest.CaptureFixture[str]
     ) -> None:
         from holo.cli import main
@@ -624,6 +630,7 @@ class TestCapabilitiesCLIFlags:
             [
                 "mcp",
                 "--announce",
+                "--announce-capabilities",
                 "--probe-software",
                 "ffmpeg,git",
                 "--no-bookmarklet",
@@ -631,27 +638,10 @@ class TestCapabilitiesCLIFlags:
         )
         assert rc == 2
         err = capsys.readouterr().err
-        assert "require --announce-capabilities" in err
+        assert "removed in 0.1.0a16" in err
+        assert "auto-discovered" in err
 
-    def test_probe_pkg_without_announce_capabilities_errors(
-        self, capsys: pytest.CaptureFixture[str]
-    ) -> None:
-        from holo.cli import main
-
-        rc = main(
-            [
-                "mcp",
-                "--announce",
-                "--probe-pkg",
-                "brew",
-                "--no-bookmarklet",
-            ]
-        )
-        assert rc == 2
-        err = capsys.readouterr().err
-        assert "require --announce-capabilities" in err
-
-    def test_probe_pkg_unknown_manager_errors(
+    def test_legacy_probe_pkg_flag_errors_with_migration_message(
         self, capsys: pytest.CaptureFixture[str]
     ) -> None:
         from holo.cli import main
@@ -662,14 +652,13 @@ class TestCapabilitiesCLIFlags:
                 "--announce",
                 "--announce-capabilities",
                 "--probe-pkg",
-                "brew,pacmen",
+                "brew",
                 "--no-bookmarklet",
             ]
         )
         assert rc == 2
         err = capsys.readouterr().err
-        assert "pacmen" in err
-        assert "supported:" in err
+        assert "removed in 0.1.0a16" in err
 
     def test_capabilities_kwargs_threaded_to_run(self) -> None:
         from holo.cli import main
@@ -680,17 +669,15 @@ class TestCapabilitiesCLIFlags:
                     "mcp",
                     "--announce",
                     "--announce-capabilities",
-                    "--probe-software",
-                    "ffmpeg,ollama",
-                    "--probe-pkg",
-                    "brew,apt",
                     "--no-bookmarklet",
                 ]
             )
             kwargs = run.call_args.kwargs
             assert kwargs["announce_capabilities"] is True
-            assert kwargs["probe_software"] == ["ffmpeg", "ollama"]
-            assert kwargs["probe_packages"] == ["brew", "apt"]
+            # The per-probe kwargs are gone — verify they're not
+            # being threaded through.
+            assert "probe_software" not in kwargs
+            assert "probe_packages" not in kwargs
 
     def test_capabilities_kwargs_threaded_to_run_tcp(self) -> None:
         from holo.cli import main
@@ -708,8 +695,8 @@ class TestCapabilitiesCLIFlags:
             )
             kwargs = run_tcp.call_args.kwargs
             assert kwargs["announce_capabilities"] is True
-            assert kwargs["probe_software"] is None
-            assert kwargs["probe_packages"] is None
+            assert "probe_software" not in kwargs
+            assert "probe_packages" not in kwargs
 
 
 class TestHoloMCPServerIntegration:
@@ -771,8 +758,6 @@ class TestHoloMCPServerIntegration:
                 no_bookmarklet=True,
                 announce=True,
                 announce_capabilities=True,
-                probe_software=["ffmpeg"],
-                probe_packages=["brew"],
             )
 
             # Caps server constructed and started.

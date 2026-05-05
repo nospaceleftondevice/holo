@@ -234,22 +234,25 @@ X-Holo-Caps-Token: <caps_token>
 ```
 
 ```bash
-holo mcp --announce --announce-capabilities \
-  --probe-software chrome-canary,ffmpeg,ollama \
-  --probe-pkg brew,apt
+holo mcp --announce --announce-capabilities
 ```
 
-| Flag | Purpose |
-| --- | --- |
-| `--announce-capabilities` | Stand up the HTTP endpoint, advertise via TXT |
-| `--probe-software A,B,C` | `which`-lookup names (defaults to a curated list) |
-| `--probe-pkg M,M,M` | Package managers to query (`brew,apt,dpkg,dnf,yum,rpm,port,pacman,winget,choco`) |
+Single flag, no per-probe configuration — everything is auto-discovered
+per platform:
 
-Cross-platform — hardware probes use `sysctl` on macOS, `/proc` on
-Linux, the Win32 API on Windows. Software probes use `shutil.which`
-plus a small known-bundle map for macOS `.app`s. Package probes only
-run for managers that exist on the host (`brew` skipped on Linux,
-`apt` skipped on macOS, etc).
+| Layer | Sources |
+| --- | --- |
+| Hardware | `os`, `os_version`, `arch`, `cpu_model`, `cores`, `ram_gb` (macOS `sysctl`, Linux `/proc`, Windows ctypes / Win32 API) |
+| Applications (macOS) | `/Applications`, `/Applications/Utilities`, `/System/Applications`, `~/Applications` + `mdfind` for outliers; private system agents under `/System/Library/`, `/Library/`, `/usr/libexec/` filtered out |
+| Applications (Windows) | `HKLM` + `HKCU` Uninstall registry keys |
+| Packages | Every supported manager whose binary is on PATH gets queried: `brew`, `port`, `apt`/`dpkg`, `dnf`/`yum`/`rpm`, `pacman`, `snap`, `flatpak`, `winget`, `choco`, `scoop`, plus language-level `pip`, `pipx`, `cargo`, `npm` (-g), `gem`, `conda` (base env). Aliases collapse to canonical keys (`dpkg` → `apt`; `dnf`/`yum` → `rpm`). |
+
+Walking `$PATH` would be wrong: on Linux `/bin` is just a symlink to
+`/usr/bin`, which holds both OS-baseline binaries AND apt-installed
+software. Skipping `/usr/bin` loses real signal; not skipping it floods
+the response with `ls` / `cat` / `grep` noise. Treating package
+managers as the source of truth dodges the problem — apt-installed
+`ffmpeg` shows up under `packages.apt` regardless of where it lives.
 
 The endpoint is hardened against random web origins via a custom auth
 header + zero CORS allow-headers (preflight fails, fetch never fires).

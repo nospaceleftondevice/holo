@@ -1,24 +1,43 @@
 """Cross-platform host-capabilities probe.
 
-Three probe layers:
+Three layers, all auto — no opt-in flags:
 
-  1. **Hardware** — always collected when the probe runs:
-     ``os``, ``os_version``, ``arch``, ``cpu_model``, ``cores``,
-     ``ram_gb``. Cheap to gather and the routing-by-chip use case
-     ("send transcription to the M4 host, not the M1") needs them.
+  1. **Hardware** — ``os``, ``os_version``, ``arch``, ``cpu_model``,
+     ``cores``, ``ram_gb``. Cheap to gather; the routing-by-chip use
+     case ("send transcription to the M4 host, not the M1") needs
+     this layer.
 
-  2. **Software** — names looked up via ``shutil.which``. On macOS
-     a small known-bundle map handles `.app` paths that don't ship a
-     binary on PATH (Chrome Canary etc).
+  2. **Applications** — platform-native catalog of GUI apps:
+       - macOS: walk ``/Applications``, ``/Applications/Utilities``,
+         ``/System/Applications``, ``~/Applications``, then merge in
+         results from ``mdfind 'kMDItemKind == "Application"'`` to
+         pick up ``.app`` bundles outside the standard dirs.
+       - Windows: query the ``HKLM`` and ``HKCU`` Uninstall registry
+         keys (canonical "installed programs" list).
+       - Linux: empty — desktop apps are delivered via the package
+         managers below, not as a separate catalog.
 
-  3. **Packages** — for each package manager the user opted into
-     (``--probe-pkg brew,apt,winget,...``), shell out to that
-     manager's "list installed" command and parse the output. If the
-     manager isn't on PATH the probe is silently skipped.
+  3. **Packages** — auto-run every supported package manager whose
+     binary is present on the host. Output is a per-manager array
+     of ``{name, version}`` records:
+       - macOS: ``brew``, ``port``
+       - Linux OS-supplied: ``apt``/``dpkg``, ``dnf``/``yum``/``rpm``,
+         ``pacman``
+       - Linux third-party: ``snap``, ``flatpak``, ``brew`` (linuxbrew)
+       - Windows: ``winget``, ``choco``, ``scoop``
+       - Cross-platform language-level: ``pip``, ``pipx``, ``cargo``,
+         ``npm`` (global), ``gem``, ``conda`` (base env)
 
-Results are cached for ``cache_ttl_s`` seconds — agents typically
-poll within seconds of each other and the package-manager probes
-(especially ``brew list``) are slow.
+Walking ``$PATH`` directly (the previous design) was wrong on Linux:
+``/usr/bin`` is where apt installs everything AND where the OS ships
+its baseline binaries. Filtering one would lose the other. Trusting
+the package managers as the source of truth solves this — apt-installed
+``ffmpeg`` shows up in ``packages.apt`` even though ``/usr/bin`` is
+no longer walked.
+
+Results are cached for ``cache_ttl_s`` seconds — the slow probes
+(brew list, pip list, winget list, conda list) take 1-5 s each and
+the capabilities endpoint is meant to be polled.
 
 The probe is read-only and never installs / modifies anything; it
 only inspects the host. The data is meant to be served over the
@@ -29,6 +48,7 @@ to decide where to route a task.
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import platform
@@ -42,58 +62,22 @@ _log = logging.getLogger(__name__)
 
 
 # Schema version of the JSON returned by `CapabilitiesProbe.collect()`.
-# Bump when fields move or change semantics; additive new fields are
-# safe under the same version.
-CAPABILITIES_SCHEMA_VERSION = 1
+# Bumped to 2 in 0.1.0a16 when the curated `software` field was removed
+# in favour of platform-native `applications` + auto-run `packages`.
+# Bump again only on incompatible structural changes; new optional
+# fields stay safe under the same version.
+CAPABILITIES_SCHEMA_VERSION = 2
 
 
-# Default `shutil.which` lookup names. Tuned for the agent-routing use
-# cases we know about today (browser pinning, transcription pipelines,
-# local LLM serving). Override with `--probe-software a,b,c`.
-DEFAULT_SOFTWARE_PROBES: tuple[str, ...] = (
-    "chrome",
-    "chrome-canary",
-    "chrome-beta",
-    "firefox",
-    "ffmpeg",
-    "whisper",
-    "ollama",
-    "docker",
-    "git",
-    "node",
-    "python3",
-)
-
-
-# macOS .app bundles that don't always drop a CLI launcher on PATH.
-# When `shutil.which("chrome-canary")` returns None we fall back to
-# checking if the bundle directory exists. The bundle path is what
-# we report — callers can use it with `open -a` or AppleScript.
-_MACOS_APP_BUNDLES: dict[str, str] = {
-    "chrome": "/Applications/Google Chrome.app",
-    "chrome-canary": "/Applications/Google Chrome Canary.app",
-    "chrome-beta": "/Applications/Google Chrome Beta.app",
-    "firefox": "/Applications/Firefox.app",
-    "safari": "/Applications/Safari.app",
-    "safari-tp": "/Applications/Safari Technology Preview.app",
-}
-
-
-# Names of package managers the probe knows how to query. Pass any
-# subset on the CLI with `--probe-pkg`. Unknown names are rejected at
-# CLI parse time so users get a clear error rather than a silent skip.
-SUPPORTED_PKG_MANAGERS: tuple[str, ...] = (
-    "brew",
-    "apt",
-    "dpkg",
-    "dnf",
-    "yum",
-    "rpm",
-    "port",
-    "pacman",
-    "winget",
-    "choco",
-)
+# ============================================================================
+# Package-manager probes
+#
+# Each `_probe_X` returns one of:
+#   - list[dict[name, version]]  on success (possibly empty)
+#   - None                       when the manager isn't installed or its
+#                                command failed; the result dict will
+#                                omit the key entirely
+# ============================================================================
 
 
 def _probe_brew() -> list[dict[str, str]] | None:
@@ -106,10 +90,9 @@ def _probe_brew() -> list[dict[str, str]] | None:
         if not line:
             continue
         parts = line.split()
-        # `brew list --versions` emits `name v1 v2 v3` when multiple
-        # versions are installed; we report the newest-listed as the
-        # canonical version and ignore the rest. Good enough for
-        # routing decisions.
+        # `brew list --versions` emits `name v1 v2 v3` for kegs with
+        # multiple installed versions; we canonicalize on the first
+        # (newest-listed). Good enough for routing decisions.
         if len(parts) >= 2:
             pkgs.append({"name": parts[0], "version": parts[1]})
         else:
@@ -164,9 +147,50 @@ def _probe_pacman() -> list[dict[str, str]] | None:
     return _parse_two_column(out)
 
 
+def _probe_snap() -> list[dict[str, str]] | None:
+    out = _run_pkg_command(["snap", "list"])
+    if out is None:
+        return None
+    pkgs: list[dict[str, str]] = []
+    # `snap list` first line is a header:
+    #   Name   Version   Rev   Tracking   Publisher   Notes
+    # Skip it.
+    for raw in out.splitlines()[1:]:
+        parts = raw.split()
+        if len(parts) >= 2:
+            pkgs.append({"name": parts[0], "version": parts[1]})
+    return pkgs
+
+
+def _probe_flatpak() -> list[dict[str, str]] | None:
+    # `--columns=application,version` makes the output deterministic
+    # and tab-separated, regardless of the user's locale.
+    out = _run_pkg_command(
+        ["flatpak", "list", "--columns=application,version"]
+    )
+    if out is None:
+        return None
+    pkgs: list[dict[str, str]] = []
+    for raw in out.splitlines():
+        if not raw.strip():
+            continue
+        # Tab-separated when --columns is used.
+        parts = raw.split("\t")
+        if len(parts) >= 2:
+            pkgs.append(
+                {"name": parts[0].strip(), "version": parts[1].strip()}
+            )
+        elif parts:
+            pkgs.append({"name": parts[0].strip(), "version": ""})
+    return pkgs
+
+
 def _probe_winget() -> list[dict[str, str]] | None:
     out = _run_pkg_command(
-        ["winget", "list", "--accept-source-agreements"]
+        ["winget", "list", "--accept-source-agreements"],
+        # winget's first invocation can be slow due to source agreement
+        # negotiation; give it longer than the default 30 s.
+        timeout=60.0,
     )
     if out is None:
         return None
@@ -182,8 +206,7 @@ def _probe_winget() -> list[dict[str, str]] | None:
         cells = raw.split()
         if not cells:
             continue
-        # Best-effort: first cell = name, second = id, third = version.
-        # Some entries lack a separate id — handle gracefully.
+        # Best-effort: first cell = name, third = version.
         name = cells[0]
         version = cells[2] if len(cells) >= 3 else ""
         pkgs.append({"name": name, "version": version})
@@ -206,22 +229,207 @@ def _probe_choco() -> list[dict[str, str]] | None:
     return pkgs
 
 
-# Dispatch table — defined after the probe functions so we can name
-# them directly. `apt` / `dpkg` are aliases (both produce dpkg output);
-# `dnf` / `yum` / `rpm` all share the rpm probe since they query the
-# same backing database.
+def _probe_scoop() -> list[dict[str, str]] | None:
+    out = _run_pkg_command(["scoop", "list"])
+    if out is None:
+        return None
+    pkgs: list[dict[str, str]] = []
+    seen_bar = False
+    for raw in out.splitlines():
+        if not seen_bar:
+            if raw.strip().startswith("---"):
+                seen_bar = True
+            continue
+        parts = raw.split()
+        if len(parts) >= 2:
+            pkgs.append({"name": parts[0], "version": parts[1]})
+    return pkgs
+
+
+def _probe_pip() -> list[dict[str, str]] | None:
+    # `pip` may not be on PATH (e.g. `pip3` only). Try `pip` first, then
+    # `pip3`, then `python3 -m pip` as last resort. Use `--format=freeze`
+    # for the simplest deterministic output (`name==version`) — JSON
+    # format requires `pkg_resources` which can be slow on cold caches.
+    for cmd in (
+        ["pip", "list", "--format=freeze", "--disable-pip-version-check"],
+        ["pip3", "list", "--format=freeze", "--disable-pip-version-check"],
+        [
+            "python3",
+            "-m",
+            "pip",
+            "list",
+            "--format=freeze",
+            "--disable-pip-version-check",
+        ],
+    ):
+        out = _run_pkg_command(cmd)
+        if out is not None:
+            return _parse_pip_freeze(out)
+    return None
+
+
+def _parse_pip_freeze(text: str) -> list[dict[str, str]]:
+    pkgs: list[dict[str, str]] = []
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        # `pip freeze` lines look like `name==1.2.3` or `name @ file:///`
+        # for editable installs. We only care about the name + version.
+        if "==" in line:
+            name, _, version = line.partition("==")
+            pkgs.append(
+                {"name": name.strip(), "version": version.strip()}
+            )
+        elif " @ " in line:
+            name = line.partition(" @ ")[0].strip()
+            pkgs.append({"name": name, "version": ""})
+    return pkgs
+
+
+def _probe_pipx() -> list[dict[str, str]] | None:
+    # `pipx list --short` outputs `name version` per line — the
+    # cleanest format pipx exposes.
+    out = _run_pkg_command(["pipx", "list", "--short"])
+    if out is None:
+        return None
+    return _parse_two_column(out)
+
+
+def _probe_cargo() -> list[dict[str, str]] | None:
+    out = _run_pkg_command(["cargo", "install", "--list"])
+    if out is None:
+        return None
+    pkgs: list[dict[str, str]] = []
+    # Output:
+    #   package vX.Y.Z:
+    #       binary1
+    #       binary2
+    # We only want the package lines (unindented, end with colon).
+    for raw in out.splitlines():
+        if raw.startswith(" "):
+            continue
+        line = raw.rstrip(":").strip()
+        if not line:
+            continue
+        parts = line.split()
+        if len(parts) >= 2:
+            name = parts[0]
+            # Strip the leading 'v' from "v1.2.3".
+            version = parts[1].lstrip("v")
+            pkgs.append({"name": name, "version": version})
+    return pkgs
+
+
+def _probe_npm() -> list[dict[str, str]] | None:
+    # `npm list -g --depth=0 --json` returns JSON; safer than parsing
+    # the human-formatted tree output.
+    out = _run_pkg_command(
+        ["npm", "list", "-g", "--depth=0", "--json"],
+        timeout=60.0,
+    )
+    if out is None:
+        return None
+    try:
+        data = json.loads(out)
+    except json.JSONDecodeError:
+        return None
+    deps = data.get("dependencies") or {}
+    pkgs: list[dict[str, str]] = []
+    for name, info in deps.items():
+        if not isinstance(info, dict):
+            continue
+        version = str(info.get("version", ""))
+        pkgs.append({"name": name, "version": version})
+    return pkgs
+
+
+def _probe_gem() -> list[dict[str, str]] | None:
+    out = _run_pkg_command(["gem", "list", "--local"])
+    if out is None:
+        return None
+    pkgs: list[dict[str, str]] = []
+    # `gem list` lines look like `rake (13.0.6, 13.0.3)`.
+    for raw in out.splitlines():
+        line = raw.strip()
+        if not line or " (" not in line:
+            continue
+        name, rest = line.split(" (", 1)
+        # First version listed is the highest installed; take that.
+        version = rest.rstrip(")").split(",", 1)[0].strip()
+        pkgs.append({"name": name.strip(), "version": version})
+    return pkgs
+
+
+def _probe_conda() -> list[dict[str, str]] | None:
+    # Probe only the `base` env. Per-env enumeration is out of scope —
+    # most users share a single env for tools they want discovered.
+    out = _run_pkg_command(
+        ["conda", "list", "-n", "base", "--json"], timeout=60.0
+    )
+    if out is None:
+        return None
+    try:
+        data = json.loads(out)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(data, list):
+        return None
+    pkgs: list[dict[str, str]] = []
+    for item in data:
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("name", "")).strip()
+        if not name:
+            continue
+        pkgs.append({"name": name, "version": str(item.get("version", ""))})
+    return pkgs
+
+
+# Dispatch table — every supported package manager. Auto-detected by
+# the binary's presence on PATH (`shutil.which` inside `_run_pkg_command`).
+# Aliases (`dpkg` → apt probe; `dnf`/`yum` → rpm probe) collapse onto
+# their backing query commands. The output dict uses the canonical
+# manager name as the key.
 _PKG_PROBES: dict[str, Any] = {
+    # macOS
     "brew": _probe_brew,
+    "port": _probe_port,
+    # Linux OS-supplied
     "apt": _probe_apt,
-    "dpkg": _probe_apt,
     "dnf": _probe_rpm,
     "yum": _probe_rpm,
     "rpm": _probe_rpm,
-    "port": _probe_port,
     "pacman": _probe_pacman,
+    # Linux third-party
+    "snap": _probe_snap,
+    "flatpak": _probe_flatpak,
+    # Windows
     "winget": _probe_winget,
     "choco": _probe_choco,
+    "scoop": _probe_scoop,
+    # Cross-platform / language-level
+    "pip": _probe_pip,
+    "pipx": _probe_pipx,
+    "cargo": _probe_cargo,
+    "npm": _probe_npm,
+    "gem": _probe_gem,
+    "conda": _probe_conda,
 }
+
+
+# Aliases that share an underlying probe; we don't want to emit them
+# twice in the response. e.g. `dpkg` resolves to the same dpkg-query
+# call as `apt` — only `apt` shows up.
+_PROBE_ALIASES: dict[str, str] = {
+    "dpkg": "apt",
+    "dnf": "rpm",
+    "yum": "rpm",
+}
+
+
+SUPPORTED_PKG_MANAGERS: tuple[str, ...] = tuple(_PKG_PROBES)
 
 
 def _parse_two_column(text: str) -> list[dict[str, str]]:
@@ -239,16 +447,12 @@ def _parse_two_column(text: str) -> list[dict[str, str]]:
 def _run_pkg_command(
     cmd: list[str], timeout: float = 30.0
 ) -> str | None:
-    """Run a package-manager probe command, return stdout or None.
+    """Run a probe command; return stdout, or None if unavailable.
 
-    Returns None if:
-      - the binary isn't on PATH (manager not installed),
-      - the command exits non-zero,
-      - the command times out or otherwise raises OSError.
-
-    A None return is the signal to omit the manager's entry from the
-    capabilities JSON entirely — distinct from "manager exists but has
-    zero packages installed", which yields an empty list.
+    None signals "manager not installed / probe failed" — the caller
+    omits the entry entirely. An empty stdout returns ``""`` and the
+    probe parser yields ``[]``, which DOES end up in the result dict
+    (distinct from None).
     """
     if shutil.which(cmd[0]) is None:
         return None
@@ -274,17 +478,13 @@ def _run_pkg_command(
     return result.stdout
 
 
-# ----------------------------------------------------------------- hardware
+# ============================================================================
+# Hardware
+# ============================================================================
 
 
 def probe_hardware() -> dict[str, Any]:
-    """Collect static host facts: OS, arch, CPU, RAM.
-
-    Cheap (a single sysctl/proc read) and the data rarely changes — but
-    we re-collect on every cache miss anyway because it costs almost
-    nothing and avoids surprising consumers if the kernel hot-swaps
-    something exotic underneath us.
-    """
+    """Collect static host facts: OS, arch, CPU, RAM."""
     return {
         "os": platform.system().lower(),  # darwin / linux / windows
         "os_version": _os_version(),
@@ -357,9 +557,6 @@ def _cpu_model() -> str:
                         return line.split(":", 1)[1].strip()
         except OSError:
             pass
-    # Windows / fallback: platform.processor() returns something
-    # useful on Windows (e.g. "Intel64 Family 6 Model 142...") and
-    # often empty on macOS — by which time we've returned above.
     return platform.processor() or ""
 
 
@@ -385,7 +582,6 @@ def _ram_gb() -> float:
             with open("/proc/meminfo") as f:
                 for line in f:
                     if line.startswith("MemTotal:"):
-                        # MemTotal is in kB
                         kb = int(line.split()[1])
                         return round(kb / 1024**2, 1)
         except (OSError, ValueError):
@@ -399,11 +595,7 @@ def _ram_gb() -> float:
 
 
 def _windows_ram_gb() -> float:
-    """Read total physical RAM via the Win32 API.
-
-    Isolated so the ctypes import doesn't run on macOS / Linux where
-    `ctypes.windll` doesn't exist.
-    """
+    """Read total physical RAM via the Win32 API."""
     import ctypes
 
     class MEMORYSTATUSEX(ctypes.Structure):
@@ -425,55 +617,219 @@ def _windows_ram_gb() -> float:
     return round(m.ullTotalPhys / 1024**3, 1)
 
 
-# ----------------------------------------------------------------- software
+# ============================================================================
+# Applications (platform-native catalog)
+# ============================================================================
 
 
-def probe_software(
-    names: list[str], *, system: str | None = None
-) -> dict[str, str]:
-    """Map each name to the first install path found.
+# macOS .app bundle directories. We walk these in order and dedupe by
+# bundle name. ~/Applications is an Apple-blessed per-user location for
+# drag-installed apps; included for completeness even though it's empty
+# on most Macs.
+_MACOS_APP_DIRS: tuple[str, ...] = (
+    "/Applications",
+    "/Applications/Utilities",
+    "/System/Applications",
+    "~/Applications",
+)
 
-    Lookup order:
-      1. ``shutil.which(name)`` (PATH binaries; cross-platform).
-      2. On macOS, the well-known ``/Applications/<Bundle>.app`` for
-         a few names that ship as bundles without a CLI launcher
-         (Chrome Canary, etc).
 
-    Names with no hit are omitted from the returned dict — the
-    consumer treats absence as "not installed."
+def probe_applications() -> dict[str, dict[str, str]]:
+    """Enumerate platform-native applications.
+
+    macOS: walk standard ``.app`` dirs + run ``mdfind`` to pick up
+    bundles outside those dirs (e.g. ~/Library/Application Support
+    helpers, custom install locations). Each entry is
+    ``"<DisplayName>": {"path": "/Applications/X.app"}``.
+
+    Windows: enumerate the Uninstall registry keys under HKLM and
+    HKCU. Each entry is ``"<DisplayName>": {"path", "version",
+    "publisher"}`` — richer metadata than macOS gives us for free.
+
+    Linux: empty — desktop apps are delivered via package managers
+    (snap/flatpak/apt/dnf), which the ``packages`` layer covers.
     """
-    sys_name = system if system is not None else platform.system()
-    out: dict[str, str] = {}
-    for name in names:
-        path = shutil.which(name)
-        if path:
-            out[name] = path
+    system = platform.system()
+    if system == "Darwin":
+        return _probe_applications_macos()
+    if system == "Windows":
+        return _probe_applications_windows()
+    return {}
+
+
+def _probe_applications_macos() -> dict[str, dict[str, str]]:
+    out: dict[str, dict[str, str]] = {}
+
+    for raw_dir in _MACOS_APP_DIRS:
+        d = os.path.expanduser(raw_dir)
+        try:
+            entries = os.scandir(d)
+        except OSError:
             continue
-        if sys_name == "Darwin":
-            bundle = _MACOS_APP_BUNDLES.get(name)
-            if bundle and os.path.isdir(bundle):
-                out[name] = bundle
+        try:
+            for entry in entries:
+                if not entry.name.endswith(".app"):
+                    continue
+                try:
+                    is_dir = entry.is_dir(follow_symlinks=True)
+                except OSError:
+                    continue
+                if not is_dir:
+                    continue
+                name = entry.name[: -len(".app")]
+                if name not in out:
+                    out[name] = {"path": entry.path}
+        finally:
+            entries.close()
+
+    # `mdfind` consults the Spotlight index; fast and covers .app
+    # bundles outside the standard dirs (browser-installed PWAs,
+    # development builds, helper apps that drop in oddball locations).
+    # Existing entries take precedence so the canonical /Applications
+    # path wins on duplicates.
+    #
+    # We aggressively skip paths under `/System/Library/` and
+    # `/Library/` — those are private OS agents (FaceTimeAgent.app,
+    # 50onPaletteServer.app, hundreds of others) that the user has
+    # never seen and never installed. Routing decisions don't care
+    # about them and the noise blows the response size up by 10x.
+    seen_paths = {info["path"] for info in out.values()}
+    md = _run_pkg_command(
+        ["mdfind", "kMDItemKind == \"Application\""], timeout=10.0
+    )
+    if md is not None:
+        for raw in md.splitlines():
+            path = raw.strip()
+            if not path or not path.endswith(".app"):
+                continue
+            if _is_system_app_bundle(path):
+                continue
+            if path in seen_paths:
+                continue
+            name = os.path.basename(path)[: -len(".app")]
+            if name in out:
+                continue
+            out[name] = {"path": path}
+            seen_paths.add(path)
     return out
 
 
-# ----------------------------------------------------------------- packages
+def _is_system_app_bundle(path: str) -> bool:
+    """True for `.app` paths that are private OS agents users never see.
+
+    macOS ships hundreds of these under `/System/Library/...`,
+    `/Library/...`, and `/usr/libexec/` — they're internal helper
+    apps (FaceTime agents, palette servers, accessibility shims) that
+    contribute massive noise to the applications dict and aren't
+    relevant to capability routing. The user-facing stock Apple apps
+    (Safari, Mail, Calendar, etc.) live under `/System/Applications/`
+    and are picked up by the directory walk above.
+    """
+    return (
+        path.startswith("/System/Library/")
+        or path.startswith("/Library/")
+        or path.startswith("/usr/libexec/")
+    )
 
 
-def probe_packages(
-    managers: list[str],
-) -> dict[str, list[dict[str, str]]]:
-    """Run each requested package manager's "list installed" probe.
+def _probe_applications_windows() -> dict[str, dict[str, str]]:
+    """Read the Uninstall registry keys.
 
-    Managers not in :data:`SUPPORTED_PKG_MANAGERS` are silently
-    skipped (CLI parsing rejects them up front, so this is a defensive
-    no-op). Managers that aren't installed on the host are also
-    skipped — the result dict only contains keys for managers we
-    successfully queried, even if the result list is empty.
+    Three roots cover most cases:
+      - HKLM\\…\\Uninstall — system-wide installers
+      - HKLM\\…\\WOW6432Node\\…\\Uninstall — 32-bit installers on 64-bit Windows
+      - HKCU\\…\\Uninstall — per-user installers
+
+    Per-key fields we care about: DisplayName, DisplayVersion,
+    Publisher, InstallLocation. Skip entries without DisplayName
+    (Windows updates etc).
+    """
+    try:
+        import winreg  # type: ignore[import-not-found]
+    except ImportError:
+        return {}
+
+    out: dict[str, dict[str, str]] = {}
+    roots = [
+        (
+            winreg.HKEY_LOCAL_MACHINE,
+            r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall",
+        ),
+        (
+            winreg.HKEY_LOCAL_MACHINE,
+            r"SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall",
+        ),
+        (
+            winreg.HKEY_CURRENT_USER,
+            r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall",
+        ),
+    ]
+    for hive, subkey in roots:
+        try:
+            root = winreg.OpenKey(hive, subkey)
+        except OSError:
+            continue
+        try:
+            i = 0
+            while True:
+                try:
+                    name = winreg.EnumKey(root, i)
+                except OSError:
+                    break
+                i += 1
+                try:
+                    sub = winreg.OpenKey(root, name)
+                except OSError:
+                    continue
+                try:
+                    entry: dict[str, str] = {}
+                    for src, dst in (
+                        ("DisplayName", "name"),
+                        ("DisplayVersion", "version"),
+                        ("Publisher", "publisher"),
+                        ("InstallLocation", "path"),
+                    ):
+                        try:
+                            value, _ = winreg.QueryValueEx(sub, src)
+                        except OSError:
+                            continue
+                        if value is None:
+                            continue
+                        entry[dst] = str(value)
+                finally:
+                    sub.Close()
+                if "name" not in entry:
+                    continue
+                display = entry.pop("name")
+                if display in out:
+                    continue
+                # Always include a `path` key so the response shape is
+                # uniform with macOS — fall back to install-location if
+                # set, else empty string.
+                entry.setdefault("path", "")
+                out[display] = entry
+        finally:
+            root.Close()
+    return out
+
+
+# ============================================================================
+# Packages (auto-run every supported probe whose binary is on PATH)
+# ============================================================================
+
+
+def probe_packages() -> dict[str, list[dict[str, str]]]:
+    """Run every supported probe; collect results from those installed.
+
+    Auto-detected — no opt-in. Probes whose binary isn't on PATH return
+    None and are omitted from the output dict. The result keys are the
+    canonical manager names (aliases collapse onto their backing probe).
     """
     out: dict[str, list[dict[str, str]]] = {}
-    for name in managers:
-        probe = _PKG_PROBES.get(name)
-        if probe is None:
+    for name, probe in _PKG_PROBES.items():
+        if name in _PROBE_ALIASES:
+            # Alias of another probe — already handled by the canonical
+            # entry. Skip to avoid emitting duplicate keys.
             continue
         try:
             result = probe()
@@ -487,41 +843,24 @@ def probe_packages(
     return out
 
 
-# ------------------------------------------------------------- aggregator
+# ============================================================================
+# Aggregator
+# ============================================================================
 
 
 class CapabilitiesProbe:
-    """Owns the list of probes and a small TTL cache.
+    """Owns a TTL cache around the full probe sweep.
 
-    The cache exists because package-manager probes are expensive
-    (`brew list` ≈ 1 s on a warm machine) and the capabilities
-    endpoint is meant to be polled. Hardware/software probes are
-    cheap but bundled into the same cache for simplicity — there's
-    no separate "fast probe / slow probe" distinction at the API.
+    The cache exists because the slow probes (brew, pip, npm, conda,
+    winget) can take several seconds each on cold caches. The
+    capabilities endpoint is meant to be polled, so amortizing the
+    cost across requests is what makes that workable.
     """
 
-    def __init__(
-        self,
-        *,
-        software: list[str] | None = None,
-        packages: list[str] | None = None,
-        cache_ttl_s: float = 60.0,
-    ) -> None:
-        self._software_names = (
-            list(software) if software is not None else list(DEFAULT_SOFTWARE_PROBES)
-        )
-        self._pkg_managers = list(packages) if packages else []
+    def __init__(self, *, cache_ttl_s: float = 60.0) -> None:
         self._cache_ttl_s = float(cache_ttl_s)
         self._lock = threading.Lock()
         self._cached: tuple[float, dict[str, Any]] | None = None
-
-    @property
-    def software_names(self) -> list[str]:
-        return list(self._software_names)
-
-    @property
-    def package_managers(self) -> list[str]:
-        return list(self._pkg_managers)
 
     def collect(self, *, force: bool = False) -> dict[str, Any]:
         """Return the cached capability snapshot, refreshing if stale."""
@@ -536,61 +875,23 @@ class CapabilitiesProbe:
             return data
 
     def _collect_locked(self) -> dict[str, Any]:
-        # Hold the lock through subprocess.run calls. They're slow but
-        # the alternative — releasing and re-acquiring — would let two
-        # concurrent callers double-probe, defeating the cache.
+        # Hold the lock through the full sweep. They're slow but the
+        # alternative — release-and-reacquire — would let two concurrent
+        # callers double-probe, defeating the cache.
         return {
             "schema": CAPABILITIES_SCHEMA_VERSION,
             "host": probe_hardware(),
-            "software": probe_software(self._software_names),
-            "packages": probe_packages(self._pkg_managers),
+            "applications": probe_applications(),
+            "packages": probe_packages(),
             "generated_at": int(time.time()),
         }
 
 
-def parse_pkg_managers(value: str) -> tuple[list[str], list[str]]:
-    """Split a CLI ``--probe-pkg`` value into (accepted, unknown).
-
-    The CLI rejects unknown names rather than silently dropping them —
-    a typo like ``--probe-pkg pacmen`` should fail loudly. Returning
-    both lists lets the caller print a useful error.
-    """
-    accepted: list[str] = []
-    unknown: list[str] = []
-    seen: set[str] = set()
-    for raw in value.split(","):
-        name = raw.strip().lower()
-        if not name or name in seen:
-            continue
-        seen.add(name)
-        if name in _PKG_PROBES:
-            accepted.append(name)
-        else:
-            unknown.append(name)
-    return accepted, unknown
-
-
-def parse_software_list(value: str) -> list[str]:
-    """Split a CLI ``--probe-software`` value into a deduped list."""
-    out: list[str] = []
-    seen: set[str] = set()
-    for raw in value.split(","):
-        name = raw.strip()
-        if not name or name in seen:
-            continue
-        seen.add(name)
-        out.append(name)
-    return out
-
-
 __all__ = [
     "CAPABILITIES_SCHEMA_VERSION",
-    "DEFAULT_SOFTWARE_PROBES",
     "SUPPORTED_PKG_MANAGERS",
     "CapabilitiesProbe",
-    "parse_pkg_managers",
-    "parse_software_list",
+    "probe_applications",
     "probe_hardware",
     "probe_packages",
-    "probe_software",
 ]
