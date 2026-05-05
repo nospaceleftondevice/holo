@@ -53,6 +53,15 @@ FIELD_CWD = "cwd"
 FIELD_IPS = "ips"
 FIELD_TMUX_SESSION = "tmux_session"
 FIELD_TMUX_WINDOW = "tmux_window"
+# Optional capabilities-endpoint advertisement. When the daemon was
+# launched with `--announce-capabilities`, these fields point at the
+# in-process HTTP server (`holo.capabilities_server`). Discoverers
+# fetch `http://<ip>:<caps_port>/capabilities` with the
+# `X-Holo-Caps-Token: <caps_token>` header to read the host's hardware
+# / software / package inventory. Both fields are optional and either
+# both present or both absent.
+FIELD_CAPS_PORT = "caps_port"
+FIELD_CAPS_TOKEN = "caps_token"
 
 # Required even when other fields are missing. A TXT missing any of these
 # is malformed and should be dropped.
@@ -68,7 +77,9 @@ REQUIRED_FIELDS: tuple[str, ...] = (
 
 # Fields parsed/emitted as integers in the JSON contract. TXT carries them
 # as UTF-8 strings; discover.py converts.
-INT_FIELDS: frozenset[str] = frozenset({FIELD_HOLO_PID, FIELD_STARTED})
+INT_FIELDS: frozenset[str] = frozenset(
+    {FIELD_HOLO_PID, FIELD_STARTED, FIELD_CAPS_PORT}
+)
 
 _log = logging.getLogger(__name__)
 
@@ -90,12 +101,25 @@ class HoloAnnouncer:
         ssh_user: str | None = None,
         port: int = 0,
         ips: list[str] | None = None,
+        caps_port: int | None = None,
+        caps_token: str | None = None,
     ) -> None:
         self.session = session
         self.user = user or getpass.getuser()
         self.ssh_user = ssh_user
         self.port = port
         self.ips_override = ips
+        # Both must be set together to be advertised — TXT carries them
+        # only when the capabilities HTTP server is up. Validating the
+        # pairing here keeps callers from publishing a port with no
+        # token (which would let any LAN client read /capabilities).
+        if (caps_port is None) != (caps_token is None):
+            raise ValueError(
+                "caps_port and caps_token must be set together (both "
+                "present or both omitted)"
+            )
+        self.caps_port = caps_port
+        self.caps_token = caps_token
         self._zeroconf: Zeroconf | None = None
         self._service_info: ServiceInfo | None = None
 
@@ -133,6 +157,10 @@ class HoloAnnouncer:
         if os.environ.get("TMUX"):
             put(FIELD_TMUX_SESSION, _tmux_field("#S"))
             put(FIELD_TMUX_WINDOW, _tmux_field("#W"))
+
+        if self.caps_port is not None and self.caps_token is not None:
+            put(FIELD_CAPS_PORT, str(self.caps_port))
+            put(FIELD_CAPS_TOKEN, self.caps_token)
 
         return props
 
@@ -299,6 +327,8 @@ def _enumerate_local_ipv4() -> list[str]:
 
 
 __all__ = [
+    "FIELD_CAPS_PORT",
+    "FIELD_CAPS_TOKEN",
     "FIELD_CWD",
     "FIELD_HOLO_PID",
     "FIELD_HOLO_VERSION",

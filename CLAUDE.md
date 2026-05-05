@@ -82,8 +82,9 @@ Two flags tailor the surface:
 - `--screen` (kwarg `enable_screen`) — registers SikuliX-backed tools (`screen_*`, `app_activate`, `ui_template_*`). Off by default; opt-in keeps the JVM cost off the table for browser-only agents.
 - `--no-bookmarklet` (kwarg `no_bookmarklet`) — skips the WSServer entirely and drops the seven channel-dependent tool registrations (`calibrate`, `list_channels`, `drop_channel`, `ping`, `read_global`, `send_command`, `bookmarklet_query`). Suits agents that never touch the bookmarklet (Slack-only orchestrator, AppleScript-only nav). `Daemon.calibrate()` raises in this mode; channel methods on `HoloMCPServer` still exist defensively but the tools aren't exposed.
 
-Plus a separate orthogonal capability:
+Plus separate orthogonal capabilities:
 - `--announce` (kwargs `announce`, `announce_session`, `announce_user`, `announce_ssh_user`) — broadcasts an mDNS service record (`_holo-session._tcp.local.`) so a companion desktop app on the same LAN can discover live sessions. See **Session announcement** below.
+- `--announce-capabilities` (kwargs `announce_capabilities`, `probe_software`, `probe_packages`) — requires `--announce`. Stands up a token-auth HTTP endpoint (`GET /capabilities`) carrying hardware/software/package inventory; advertises `caps_port` + `caps_token` in the TXT record so an agent can route tasks by host capability. See **Capabilities endpoint** below.
 
 Internal naming kept as-is: `BridgeClient`, `daemon.bridge`, `_require_bridge` describe the JVM bridge implementation accurately. Only the user-facing flag (`--bridge` → `--screen`), the matching kwarg (`use_bridge` → `enable_screen`), and two CLI subcommands (`holo bridge` → `holo screen`, `holo install-bridge` → `holo install-screen`) were renamed.
 
@@ -157,6 +158,39 @@ The R2D2 desktop SPA on the user's laptop hits `--serve 7082`. The HTTP layer is
 **Goodbye vs. stale sweep:** if the announcer exits cleanly (SIGINT / SIGTERM), zeroconf delivers a `Rmv` event ~100 ms later → `remove` event downstream. If the host crashes / SIGKILL'd, no Goodbye fires; the stale sweep drops the entry after `--stale-after` seconds (default 150 = 2× zeroconf's 75 s TTL).
 
 **`/healthz`** returns `{status, interfaces, zt_present}`. `zt_present` is a heuristic — checks for any interface name starting with `zt`. ZeroTier on macOS/Linux uses that prefix. Windows ZT names interfaces by description, not prefix; the heuristic returns false there but doesn't break anything.
+
+## Capabilities endpoint (`--announce-capabilities`)
+
+`src/holo/capabilities.py` + `src/holo/capabilities_server.py` together stand up an opt-in HTTP endpoint that exposes the host's hardware/software/package inventory so an agent can route tasks to the most-capable host (M4 vs M1 transcription, Chrome-Canary-only flows, etc.).
+
+Wiring: `HoloMCPServer.__init__` constructs `CapabilitiesProbe` + `CapabilitiesServer` *before* `HoloAnnouncer` so the bound port + auth token make it into the TXT record. Server runs uvicorn on a daemon thread bound to `0.0.0.0:<random>`. `_caps_server.actual_port` blocks until the listener is up (5 s timeout). On shutdown the announcer stops first (Goodbye), then the caps server, then the daemon — minimizes the window where a discoverer sees the broadcast but hits connection-refused on the URL.
+
+**Endpoints:**
+| Path | Auth | Notes |
+|---|---|---|
+| `GET /capabilities` | `X-Holo-Caps-Token: <hex>` (constant-time compare) | JSON snapshot — see spec §3a for shape. Probe results cached 60 s. |
+| `GET /healthz` | none | Returns `{"status": "ok"}` — intentionally minimal so unauthenticated LAN scanners can't fingerprint holo hosts. |
+
+**Browser-block defenses (two-layer):**
+1. Custom required header `X-Holo-Caps-Token`. Not on the [CORS-safelisted request-headers list](https://developer.mozilla.org/en-US/docs/Glossary/CORS-safelisted_request_header) so any cross-origin `fetch()` with it triggers a CORS preflight.
+2. No `Access-Control-Allow-*` headers in any response. Preflight fails → browser never fires the actual request.
+
+This stops random web origins from fingerprinting the host. It does **not** stop a same-LAN attacker who can read the mDNS broadcast — they get the token. Threat model: web origins, not local LAN.
+
+**Probes:**
+- Hardware (always when capabilities is on): `os`, `os_version` (`sw_vers -productVersion` on macOS to dodge the libSystem 10.16 lie under Anaconda Python), `arch`, `cpu_model`, `cores`, `ram_gb`. Cross-platform (macOS sysctl, Linux /proc, Windows ctypes).
+- Software (`--probe-software a,b,c`): `shutil.which` lookups + macOS `.app` bundle fallback for `chrome*`, `firefox`, `safari*`. Default list documented in `DEFAULT_SOFTWARE_PROBES`.
+- Packages (`--probe-pkg brew,apt,dnf,yum,rpm,port,pacman,winget,choco`): shells out to each manager's "list installed" command; missing manager binary → silently skipped (key omitted from response). `dpkg` aliases to `apt`; `dnf`/`yum` alias to `rpm`.
+
+Token: `secrets.token_urlsafe(32)`, generated per-process. Don't reuse across runs.
+
+Smoke verification:
+```bash
+holo mcp --announce --announce-capabilities --probe-pkg brew --no-bookmarklet &
+dns-sd -L <instance> _holo-session._tcp local | grep caps_
+# then:
+curl -H "X-Holo-Caps-Token: <token from above>" http://127.0.0.1:<caps_port>/capabilities | jq .
+```
 
 ## UI template cache (desktop DOM analog)
 
