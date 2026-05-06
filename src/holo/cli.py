@@ -715,6 +715,18 @@ holo cloudcity announce
   --instance NAME     Override the auto-generated mDNS instance label
                       (default: cloudcity-<hostname>-<random6>).
 
+holo cloudcity discover [--json | --tail] [--wait SECS] [--stale-after SECS]
+
+  Subscribes to `_cloudcity._tcp.local.` and emits records.
+
+  --json              one-shot: browse for SECS, print JSON array, exit
+  --tail              long-running JSONL event stream (add/update/remove)
+  --wait SECS         --json buffer time (default: 3.0)
+  --stale-after SECS  drop entries last_seen older than this (default: 150)
+
+  HTTP/WS surface lives inside `holo discover --serve PORT` —
+  this same daemon also exposes `GET /cloudcities`.
+
   Spec:
     https://github.com/bradclarkalexander/desktop/blob/develop/docs/holo-cloudcity-tunnel-spec.md
 """
@@ -733,10 +745,67 @@ def _cmd_cloudcity(rest: list[str]) -> int:
         return 0
     if sub == "announce":
         return _cmd_cloudcity_announce(sub_rest)
+    if sub == "discover":
+        return _cmd_cloudcity_discover(sub_rest)
     sys.stderr.write(
         f"holo cloudcity: unknown subcommand {sub!r}\n" + _CLOUDCITY_USAGE
     )
     return 2
+
+
+def _cmd_cloudcity_discover(rest: list[str]) -> int:
+    """Run `holo cloudcity discover` in --json or --tail mode."""
+    from holo import cloudcity_discover
+
+    json_mode = "--json" in rest
+    tail_mode = "--tail" in rest
+
+    selected = sum([json_mode, tail_mode])
+    if selected == 0:
+        sys.stderr.write(
+            "holo cloudcity discover: pick exactly one mode (--json | --tail)\n"
+        )
+        return 2
+    if selected > 1:
+        sys.stderr.write(
+            "holo cloudcity discover: --json / --tail are mutually exclusive\n"
+        )
+        return 2
+
+    wait_raw = _value_flag(rest, "--wait")
+    if wait_raw is _MISSING_ARG:
+        sys.stderr.write("holo cloudcity discover: --wait requires a value\n")
+        return 2
+    wait_s = cloudcity_discover.DEFAULT_JSON_WAIT_S
+    if isinstance(wait_raw, str):
+        try:
+            wait_s = float(wait_raw)
+        except ValueError:
+            sys.stderr.write(
+                f"holo cloudcity discover: invalid --wait value {wait_raw!r}\n"
+            )
+            return 2
+
+    stale_raw = _value_flag(rest, "--stale-after")
+    if stale_raw is _MISSING_ARG:
+        sys.stderr.write(
+            "holo cloudcity discover: --stale-after requires a value\n"
+        )
+        return 2
+    stale_after_s = cloudcity_discover.DEFAULT_STALE_AFTER_S
+    if isinstance(stale_raw, str):
+        try:
+            stale_after_s = float(stale_raw)
+        except ValueError:
+            sys.stderr.write(
+                f"holo cloudcity discover: invalid --stale-after value "
+                f"{stale_raw!r}\n"
+            )
+            return 2
+
+    if json_mode:
+        return cloudcity_discover.run_oneshot(wait_s=wait_s)
+    return cloudcity_discover.run_tail(stale_after_s=stale_after_s)
 
 
 def _cmd_cloudcity_announce(rest: list[str]) -> int:
@@ -902,6 +971,11 @@ Commands:
                           for the c2w-net Docker container's exposed sshd,
                           so holo daemons can reverse-tunnel into it (run on
                           the machine hosting c2w-net)
+  cloudcity discover [--json | --tail] [--wait SECS] [--stale-after SECS]
+                          subscribe to `_cloudcity._tcp.local.` broadcasts
+                          and emit records (CLI mode only — HTTP/WS surface
+                          lives inside `holo discover --serve PORT` as
+                          `GET /cloudcities`)
   windows                 print visible windows (smoke for windows reader)
   screen <verb>           smoke-test the SikuliX-backed screen tools directly
   install-screen          pre-download the SikuliX jar into the user cache
