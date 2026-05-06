@@ -16,6 +16,7 @@ Subcommands:
 
 from __future__ import annotations
 
+import subprocess
 import sys
 from typing import Any
 
@@ -920,6 +921,135 @@ def _cmd_cloudcity_announce(rest: list[str]) -> int:
     return 0
 
 
+_CERT_USAGE = """\
+holo cert show    [--key-path PATH]
+holo cert get     [--backend URL] [--key-path PATH]
+holo cert refresh [--backend URL] [--key-path PATH]
+
+  Manage this holo daemon's outbound-SSH cert. Used by `holo tunnel up`
+  (Phase 4) to authenticate to a CloudCity host's sshd as `lando`,
+  which c2w-net's TrustedUserCAKeys accepts based on a CA the backend
+  controls — no per-c2w-net pubkey enrollment required.
+
+  show        Print on-disk state (key fingerprint, cert validity,
+              CA pubkey, last refresh time). No network access.
+  get         Generate the keypair if missing, then fetch a cert from
+              <backend>/v1/ssh/sign. Idempotent — re-uses an existing
+              fresh cert.
+  refresh     Same as `get` but always re-fetches, even if the current
+              cert is still within its validity window.
+
+  --backend URL    Backend cert-signing endpoint. Precedence:
+                     1. --backend URL (this flag)
+                     2. HOLO_BACKEND env var
+                     3. https://api-dev.tai.sh (default)
+                   For local-dev against `make backend-local`, pass
+                   `--backend http://localhost:8081`.
+
+  --key-path PATH  Override the daemon's keypair location. Default:
+                   ~/.holo/host-key. Companion files live alongside:
+                     <key>      private key
+                     <key>.pub  public key
+                     <key>-cert.pub   signed cert (presented by ssh)
+                     <key>-cert.json  metadata sidecar (validity, etc.)
+
+  In LOCAL_DEV_MODE the backend's /v1/ssh/sign endpoint accepts
+  unauthenticated requests; cert principal is hardcoded to `lando`.
+  Production (api-dev / api) auth is on the deferred list.
+
+  Spec: §4.3 of
+    https://github.com/bradclarkalexander/desktop/blob/develop/docs/holo-cloudcity-tunnel-spec.md
+"""
+
+
+def _cmd_cert(rest: list[str]) -> int:
+    if not rest:
+        sys.stderr.write("holo cert: missing subcommand\n" + _CERT_USAGE)
+        return 2
+    sub = rest[0]
+    sub_rest = rest[1:]
+    if sub in {"-h", "--help", "help"}:
+        print(_CERT_USAGE)
+        return 0
+    if sub == "show":
+        return _cmd_cert_show(sub_rest)
+    if sub in {"get", "refresh"}:
+        return _cmd_cert_fetch(sub_rest, force=(sub == "refresh"))
+    sys.stderr.write(
+        f"holo cert: unknown subcommand {sub!r}\n" + _CERT_USAGE
+    )
+    return 2
+
+
+def _cert_key_path_from_flag(rest: list[str]) -> Any:
+    """Parse --key-path; returns None on absence, _MISSING_ARG on empty,
+    or a str on success."""
+    return _value_flag(rest, "--key-path")
+
+
+def _cmd_cert_show(rest: list[str]) -> int:
+    """Read-only inspection of the on-disk cert state."""
+    import json as _json
+    from pathlib import Path
+
+    from holo import cert as cert_mod
+
+    key_path_raw = _cert_key_path_from_flag(rest)
+    if key_path_raw is _MISSING_ARG:
+        sys.stderr.write("holo cert show: --key-path requires a value\n")
+        return 2
+    key_path = (
+        Path(key_path_raw).expanduser()
+        if isinstance(key_path_raw, str)
+        else cert_mod.DEFAULT_KEY_PATH
+    )
+    status = cert_mod.cert_status(key_path)
+    print(_json.dumps(status, indent=2, default=str))
+    return 0
+
+
+def _cmd_cert_fetch(rest: list[str], *, force: bool) -> int:
+    """Generate keypair (if missing) + fetch cert from backend."""
+    import json as _json
+    from pathlib import Path
+
+    from holo import cert as cert_mod
+
+    backend_raw = _value_flag(rest, "--backend")
+    if backend_raw is _MISSING_ARG:
+        sys.stderr.write("holo cert: --backend requires a value\n")
+        return 2
+
+    key_path_raw = _cert_key_path_from_flag(rest)
+    if key_path_raw is _MISSING_ARG:
+        sys.stderr.write("holo cert: --key-path requires a value\n")
+        return 2
+    key_path = (
+        Path(key_path_raw).expanduser()
+        if isinstance(key_path_raw, str)
+        else cert_mod.DEFAULT_KEY_PATH
+    )
+
+    backend = backend_raw if isinstance(backend_raw, str) else None
+    try:
+        status = cert_mod.get_or_refresh(
+            backend=backend, key_path=key_path, force=force
+        )
+    except cert_mod.CertFetchError as e:
+        sys.stderr.write(f"holo cert: {e}\n")
+        return 1
+    except subprocess.CalledProcessError as e:
+        # ssh-keygen failure
+        stderr_excerpt = (e.stderr or b"").decode("utf-8", errors="replace")
+        sys.stderr.write(
+            f"holo cert: ssh-keygen failed (exit {e.returncode}): "
+            f"{stderr_excerpt}\n"
+        )
+        return 1
+    print(_json.dumps(status, indent=2, default=str))
+    return 0
+
+
 COMMANDS = {
     "windows": _cmd_windows,
     "doctor": _cmd_doctor,
@@ -976,6 +1106,10 @@ Commands:
                           and emit records (CLI mode only — HTTP/WS surface
                           lives inside `holo discover --serve PORT` as
                           `GET /cloudcities`)
+  cert <show|get|refresh> [--backend URL] [--key-path PATH]
+                          manage this holo daemon's outbound-SSH cert
+                          (used by `holo tunnel up` to reach a CloudCity
+                          host's sshd as `lando`); see `holo cert --help`
   windows                 print visible windows (smoke for windows reader)
   screen <verb>           smoke-test the SikuliX-backed screen tools directly
   install-screen          pre-download the SikuliX jar into the user cache
@@ -1130,6 +1264,8 @@ def main(argv: list[str] | None = None) -> int:
         return _cmd_discover(rest)
     if cmd == "cloudcity":
         return _cmd_cloudcity(rest)
+    if cmd == "cert":
+        return _cmd_cert(rest)
     if cmd in COMMANDS:
         return COMMANDS[cmd]()
     print(
