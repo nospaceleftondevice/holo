@@ -9,25 +9,19 @@ against a live `holo cloudcity announce`).
 
 from __future__ import annotations
 
-import io
 import json
 from typing import Any
 from unittest.mock import MagicMock, patch
 
-import pytest
-
 from holo.cloudcity_announce import (
-    DEFAULT_PORT,
     FIELD_BACKEND,
     FIELD_CA_FPS,
-    FIELD_HOST,
     FIELD_IPS,
     FIELD_PORT,
     FIELD_USER,
     FIELD_V,
     FIELD_VERSION,
     REQUIRED_FIELDS,
-    SERVICE_TYPE,
     TXT_SCHEMA_VERSION,
     CloudCityAnnouncer,
     ssh_pubkey_fingerprint,
