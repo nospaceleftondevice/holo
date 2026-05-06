@@ -691,6 +691,166 @@ def _cmd_discover(rest: list[str]) -> int:
     )
 
 
+_CLOUDCITY_USAGE = """\
+holo cloudcity announce
+        [--port PORT] [--ips A,B,...] [--backend URL]
+        [--ca-fps FP[,FP...]] [--instance NAME]
+
+  Broadcasts a `_cloudcity._tcp.local.` mDNS service so holo daemons
+  on the LAN can discover this CloudCity host (i.e. the c2w-net
+  Docker container's exposed sshd) and set up reverse SSH tunnels
+  into it. Foreground process; Ctrl-C unregisters cleanly.
+
+  --port PORT         c2w-net's exposed sshd port (default: 2222).
+  --ips A,B,...       IPv4 override; each entry is a literal IP or a
+                      trailing-dot prefix (e.g. `192.168.1.`) used to
+                      filter enumerated interfaces. Default: auto.
+  --backend URL       Where holo daemons can fetch certs that c2w-net
+                      will accept. Default: omit. Use
+                      `http://localhost:8081` for `make backend-local`.
+  --ca-fps FP[,FP...] Comma-separated SHA256 fingerprints of CA
+                      pubkeys c2w-net trusts. Default: auto-fetch
+                      from --backend's /v1/ssh/ca endpoint when
+                      --backend is set.
+  --instance NAME     Override the auto-generated mDNS instance label
+                      (default: cloudcity-<hostname>-<random6>).
+
+  Spec:
+    https://github.com/bradclarkalexander/desktop/blob/develop/docs/holo-cloudcity-tunnel-spec.md
+"""
+
+
+def _cmd_cloudcity(rest: list[str]) -> int:
+    if not rest:
+        sys.stderr.write(
+            "holo cloudcity: missing subcommand\n" + _CLOUDCITY_USAGE
+        )
+        return 2
+    sub = rest[0]
+    sub_rest = rest[1:]
+    if sub in {"-h", "--help", "help"}:
+        print(_CLOUDCITY_USAGE)
+        return 0
+    if sub == "announce":
+        return _cmd_cloudcity_announce(sub_rest)
+    sys.stderr.write(
+        f"holo cloudcity: unknown subcommand {sub!r}\n" + _CLOUDCITY_USAGE
+    )
+    return 2
+
+
+def _cmd_cloudcity_announce(rest: list[str]) -> int:
+    """Run `holo cloudcity announce` until interrupted."""
+    from holo import cloudcity_announce
+
+    port_raw = _value_flag(rest, "--port")
+    ips_raw = _value_flag(rest, "--ips")
+    backend_raw = _value_flag(rest, "--backend")
+    ca_fps_raw = _value_flag(rest, "--ca-fps")
+    instance_raw = _value_flag(rest, "--instance")
+
+    if port_raw is _MISSING_ARG:
+        sys.stderr.write("holo cloudcity announce: --port requires a value\n")
+        return 2
+    if ips_raw is _MISSING_ARG:
+        sys.stderr.write("holo cloudcity announce: --ips requires a value\n")
+        return 2
+    if backend_raw is _MISSING_ARG:
+        sys.stderr.write("holo cloudcity announce: --backend requires a value\n")
+        return 2
+    if ca_fps_raw is _MISSING_ARG:
+        sys.stderr.write("holo cloudcity announce: --ca-fps requires a value\n")
+        return 2
+    if instance_raw is _MISSING_ARG:
+        sys.stderr.write("holo cloudcity announce: --instance requires a value\n")
+        return 2
+
+    port = cloudcity_announce.DEFAULT_PORT
+    if isinstance(port_raw, str):
+        try:
+            port = int(port_raw)
+        except ValueError:
+            sys.stderr.write(
+                f"holo cloudcity announce: invalid --port {port_raw!r}\n"
+            )
+            return 2
+        if not (0 < port < 65536):
+            sys.stderr.write(
+                f"holo cloudcity announce: --port {port} out of range\n"
+            )
+            return 2
+
+    ips: list[str] | None = None
+    if isinstance(ips_raw, str):
+        ips = [s.strip() for s in ips_raw.split(",") if s.strip()]
+        if not ips:
+            sys.stderr.write(
+                "holo cloudcity announce: --ips requires at least one entry\n"
+            )
+            return 2
+
+    backend: str | None = None
+    if isinstance(backend_raw, str):
+        backend = backend_raw
+
+    ca_fps: list[str] | None = None
+    if isinstance(ca_fps_raw, str):
+        ca_fps = [s.strip() for s in ca_fps_raw.split(",") if s.strip()]
+        if not ca_fps:
+            sys.stderr.write(
+                "holo cloudcity announce: --ca-fps requires at least one entry\n"
+            )
+            return 2
+
+    instance: str | None = None
+    if isinstance(instance_raw, str):
+        instance = instance_raw
+
+    announcer = cloudcity_announce.CloudCityAnnouncer(
+        port=port,
+        ips=ips,
+        backend=backend,
+        ca_fps=ca_fps,
+        instance=instance,
+    )
+
+    try:
+        announcer.start()
+    except Exception as e:  # noqa: BLE001 - surface any zeroconf failure to user
+        sys.stderr.write(
+            f"holo cloudcity announce: failed to start: {e}\n"
+        )
+        return 1
+
+    info = announcer._service_info
+    label = info.name.removesuffix("." + cloudcity_announce.SERVICE_TYPE) if info else "?"
+    print(f"CloudCity announce: {label} on port {port}")
+    if backend:
+        print(f"  backend: {backend}")
+    advertised_ips = announcer._collect_ips()
+    if advertised_ips:
+        print(f"  ips: {','.join(advertised_ips)}")
+    print("  (Ctrl-C to stop)")
+
+    # Wait for SIGINT/SIGTERM. signal.pause() is POSIX-only — holo is
+    # macOS-first so this is fine, and Linux is OK too. Windows isn't
+    # supported for this subcommand.
+    import signal
+
+    def _on_term(_signum: int, _frame: object) -> None:
+        # SIGTERM should exit cleanly. KeyboardInterrupt covers SIGINT.
+        raise KeyboardInterrupt
+
+    signal.signal(signal.SIGTERM, _on_term)
+    try:
+        signal.pause()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        announcer.stop()
+    return 0
+
+
 COMMANDS = {
     "windows": _cmd_windows,
     "doctor": _cmd_doctor,
@@ -736,6 +896,12 @@ Commands:
            [--stale-after SECS] [--cors-origin O,O,...]
                           discover live `_holo-session._tcp.local.` broadcasts
                           (reference consumer for docs/companion-spec.md)
+  cloudcity announce [--port PORT] [--ips A,B,...] [--backend URL]
+                     [--ca-fps FP[,FP...]] [--instance NAME]
+                          broadcast a `_cloudcity._tcp.local.` mDNS service
+                          for the c2w-net Docker container's exposed sshd,
+                          so holo daemons can reverse-tunnel into it (run on
+                          the machine hosting c2w-net)
   windows                 print visible windows (smoke for windows reader)
   screen <verb>           smoke-test the SikuliX-backed screen tools directly
   install-screen          pre-download the SikuliX jar into the user cache
@@ -888,6 +1054,8 @@ def main(argv: list[str] | None = None) -> int:
         return _cmd_install_bookmarklet(rest)
     if cmd == "discover":
         return _cmd_discover(rest)
+    if cmd == "cloudcity":
+        return _cmd_cloudcity(rest)
     if cmd in COMMANDS:
         return COMMANDS[cmd]()
     print(
