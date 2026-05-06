@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import subprocess
 import sys
+import time
 from typing import Any
 
 from holo import __version__
@@ -1050,6 +1051,180 @@ def _cmd_cert_fetch(rest: list[str], *, force: bool) -> int:
     return 0
 
 
+_TUNNEL_USAGE = """\
+holo tunnel up <cloudcity-instance>
+        [--backend URL] [--key-path PATH] [--principal NAME]
+        [--discover-wait SECS]
+
+  Establishes a reverse SSH tunnel from this holo daemon to the named
+  CloudCity host. After the tunnel is up the daemon's local sshd
+  (port 22) is reachable inside the CloudCity's c2w-net loopback at
+  the announced `tunnel_port`. Foreground process; Ctrl-C tears down
+  cleanly.
+
+  <cloudcity-instance>  mDNS instance label (e.g. cloudcity-MacBook-3-abc)
+                        OR hostname (matched against the `host` TXT
+                        field). Use `holo cloudcity discover --json`
+                        to list candidates.
+
+  --backend URL         Cert-signing backend. Falls back to
+                        HOLO_BACKEND env var, then https://api-dev.tai.sh.
+                        For local-dev: http://localhost:8081.
+  --key-path PATH       Override the daemon keypair path (default:
+                        ~/.holo/host-key).
+  --principal NAME      Override the cert principal (default: lando,
+                        which c2w-net's TrustedUserCAKeys accepts).
+                        Also overrideable via HOLO_TUNNEL_PRINCIPAL.
+  --discover-wait SECS  How long to wait for the CloudCity record to
+                        show up in mDNS before giving up (default: 1.5).
+
+  Spec: §4.4 of
+    https://github.com/bradclarkalexander/desktop/blob/develop/docs/holo-cloudcity-tunnel-spec.md
+"""
+
+
+def _cmd_tunnel(rest: list[str]) -> int:
+    if not rest:
+        sys.stderr.write("holo tunnel: missing subcommand\n" + _TUNNEL_USAGE)
+        return 2
+    sub = rest[0]
+    sub_rest = rest[1:]
+    if sub in {"-h", "--help", "help"}:
+        print(_TUNNEL_USAGE)
+        return 0
+    if sub == "up":
+        return _cmd_tunnel_up(sub_rest)
+    sys.stderr.write(
+        f"holo tunnel: unknown subcommand {sub!r}\n" + _TUNNEL_USAGE
+    )
+    return 2
+
+
+def _cmd_tunnel_up(rest: list[str]) -> int:
+    """Bring up a reverse tunnel to the named CloudCity. Foreground process."""
+    import json as _json
+    import signal
+    from pathlib import Path
+
+    from holo import cert as cert_mod
+    from holo import tunnel as tunnel_mod
+
+    # First positional, before any flags, is the CloudCity instance.
+    positional: list[str] = []
+    i = 0
+    while i < len(rest):
+        tok = rest[i]
+        if tok.startswith("--"):
+            break
+        positional.append(tok)
+        i += 1
+    if len(positional) != 1:
+        sys.stderr.write(
+            "holo tunnel up: expected exactly one positional argument "
+            "(<cloudcity-instance>)\n"
+        )
+        return 2
+    instance = positional[0]
+    flag_rest = rest[i:]
+
+    backend_raw = _value_flag(flag_rest, "--backend")
+    if backend_raw is _MISSING_ARG:
+        sys.stderr.write("holo tunnel up: --backend requires a value\n")
+        return 2
+    key_path_raw = _value_flag(flag_rest, "--key-path")
+    if key_path_raw is _MISSING_ARG:
+        sys.stderr.write("holo tunnel up: --key-path requires a value\n")
+        return 2
+    principal_raw = _value_flag(flag_rest, "--principal")
+    if principal_raw is _MISSING_ARG:
+        sys.stderr.write("holo tunnel up: --principal requires a value\n")
+        return 2
+    discover_wait_raw = _value_flag(flag_rest, "--discover-wait")
+    if discover_wait_raw is _MISSING_ARG:
+        sys.stderr.write(
+            "holo tunnel up: --discover-wait requires a value\n"
+        )
+        return 2
+
+    backend = backend_raw if isinstance(backend_raw, str) else None
+    key_path = (
+        Path(key_path_raw).expanduser()
+        if isinstance(key_path_raw, str)
+        else cert_mod.DEFAULT_KEY_PATH
+    )
+    principal = (
+        principal_raw
+        if isinstance(principal_raw, str)
+        else tunnel_mod.parse_principal_from_env()
+    )
+    discover_wait_s = 1.5
+    if isinstance(discover_wait_raw, str):
+        try:
+            discover_wait_s = float(discover_wait_raw)
+        except ValueError:
+            sys.stderr.write(
+                f"holo tunnel up: invalid --discover-wait value "
+                f"{discover_wait_raw!r}\n"
+            )
+            return 2
+
+    record = tunnel_mod.find_cloudcity(instance, wait_s=discover_wait_s)
+    if record is None:
+        sys.stderr.write(
+            f"holo tunnel up: no CloudCity matching {instance!r} found "
+            f"on the LAN within {discover_wait_s}s. "
+            f"Is `holo cloudcity announce` running on the host?\n"
+        )
+        return 1
+
+    try:
+        tunnel = tunnel_mod.open_to_cloudcity(
+            record,
+            backend=backend,
+            key_path=key_path,
+            principal=principal,
+        )
+    except cert_mod.CertFetchError as e:
+        sys.stderr.write(f"holo tunnel up: cert fetch failed: {e}\n")
+        return 1
+    except tunnel_mod.TunnelError as e:
+        sys.stderr.write(f"holo tunnel up: {e}\n")
+        return 1
+    except subprocess.CalledProcessError as e:
+        stderr_excerpt = (e.stderr or b"").decode("utf-8", errors="replace")
+        sys.stderr.write(
+            f"holo tunnel up: ssh-keygen failed (exit {e.returncode}): "
+            f"{stderr_excerpt}\n"
+        )
+        return 1
+
+    target = tunnel.target
+    info = {
+        "tunnel_port": tunnel.port,
+        "cloudcity_instance": record.get("instance"),
+        "cloudcity_host": record.get("host"),
+        "cloudcity_target": f"{target[0]}:{target[1]}" if target else None,
+    }
+    print(_json.dumps(info, indent=2))
+    print("(Ctrl-C to tear down)", file=sys.stderr, flush=True)
+
+    def _on_term(_signum: int, _frame: object) -> None:
+        raise KeyboardInterrupt
+
+    signal.signal(signal.SIGTERM, _on_term)
+    try:
+        # Block on the ssh subprocess. If it dies on its own (e.g.
+        # the CloudCity went away), we exit too — Phase 4b's reconnect
+        # logic isn't in this PR.
+        while tunnel.is_running:
+            time.sleep(0.5)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        tunnel.stop()
+    return 0
+
+
 COMMANDS = {
     "windows": _cmd_windows,
     "doctor": _cmd_doctor,
@@ -1110,6 +1285,10 @@ Commands:
                           manage this holo daemon's outbound-SSH cert
                           (used by `holo tunnel up` to reach a CloudCity
                           host's sshd as `lando`); see `holo cert --help`
+  tunnel up <cloudcity-instance> [--backend URL] [--key-path PATH]
+            [--principal NAME] [--discover-wait SECS]
+                          establish a reverse SSH tunnel to a CloudCity
+                          host; see `holo tunnel --help`
   windows                 print visible windows (smoke for windows reader)
   screen <verb>           smoke-test the SikuliX-backed screen tools directly
   install-screen          pre-download the SikuliX jar into the user cache
@@ -1266,6 +1445,8 @@ def main(argv: list[str] | None = None) -> int:
         return _cmd_cloudcity(rest)
     if cmd == "cert":
         return _cmd_cert(rest)
+    if cmd == "tunnel":
+        return _cmd_tunnel(rest)
     if cmd in COMMANDS:
         return COMMANDS[cmd]()
     print(
