@@ -454,7 +454,7 @@ def run_serve(
     server = uvicorn.Server(config)
     print(
         f"holo discover: serving on http://{host}:{port} "
-        f"(routes: /sessions /healthz /events)",
+        f"(routes: /sessions /cloudcities /healthz /events)",
         file=sys.stderr,
         flush=True,
     )
@@ -494,13 +494,20 @@ def _start_stale_sweeper(
 def build_app(
     *,
     store: SessionStore | None = None,
+    cloudcity_store: Any = None,
     cors_origins: list[str] | None = None,
     stale_after_s: float = DEFAULT_STALE_AFTER_S,
 ) -> Any:
     """Construct the Starlette ASGI app for `--serve`.
 
-    `store` may be passed in for tests; production callers leave it None
-    so the app spins up its own zeroconf browser at startup.
+    Hosts both the holo-session discoverer and the CloudCity
+    discoverer in a single process — one Starlette app, two zeroconf
+    browsers, two stale-sweep threads. The CloudCity surface is the
+    Phase-2 addition from the reverse-tunnel spec
+    (docs/holo-cloudcity-tunnel-spec.md §4.2).
+
+    Stores may be passed in for tests; production callers leave them
+    None so the app spins up its own browsers at startup.
     """
     from contextlib import asynccontextmanager
 
@@ -510,6 +517,11 @@ def build_app(
     from starlette.responses import JSONResponse
     from starlette.routing import Route, WebSocketRoute
 
+    # Lazy-import so test paths that pass an explicit `cloudcity_store`
+    # don't pay the import cost — and so test_discover.py tests that
+    # touch only the session paths don't need cloudcity_discover loaded.
+    from holo import cloudcity_discover
+
     origins = list(cors_origins) if cors_origins else list(DEFAULT_CORS_ORIGINS)
 
     state: dict[str, Any] = {
@@ -518,11 +530,20 @@ def build_app(
         "browser": None,
         "stop_event": threading.Event(),
         "sweeper": None,
+        "cc_store": cloudcity_store,
+        "cc_zc": None,
+        "cc_browser": None,
+        "cc_stop_event": threading.Event(),
+        "cc_sweeper": None,
     }
 
     async def sessions_endpoint(request: Any) -> Any:
         del request
         return JSONResponse(state["store"].snapshot())
+
+    async def cloudcities_endpoint(request: Any) -> Any:
+        del request
+        return JSONResponse(state["cc_store"].snapshot())
 
     async def healthz_endpoint(request: Any) -> Any:
         del request
@@ -572,19 +593,33 @@ def build_app(
             state["sweeper"] = _start_stale_sweeper(
                 store_, stale_after_s, state["stop_event"]
             )
+        if state["cc_store"] is None:
+            cc_zc, cc_browser, cc_store_ = cloudcity_discover._start_browser()
+            state["cc_store"] = cc_store_
+            state["cc_zc"] = cc_zc
+            state["cc_browser"] = cc_browser
+            state["cc_sweeper"] = cloudcity_discover.start_stale_sweeper(
+                cc_store_, stale_after_s, state["cc_stop_event"]
+            )
         try:
             yield
         finally:
             state["stop_event"].set()
+            state["cc_stop_event"].set()
             if state["sweeper"] is not None:
                 state["sweeper"].join(timeout=2.0)
+            if state["cc_sweeper"] is not None:
+                state["cc_sweeper"].join(timeout=2.0)
             if state["zc"] is not None:
                 state["zc"].close()
+            if state["cc_zc"] is not None:
+                state["cc_zc"].close()
 
     return Starlette(
         debug=False,
         routes=[
             Route("/sessions", sessions_endpoint, methods=["GET"]),
+            Route("/cloudcities", cloudcities_endpoint, methods=["GET"]),
             Route("/healthz", healthz_endpoint, methods=["GET"]),
             WebSocketRoute("/events", events_ws),
         ],

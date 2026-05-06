@@ -32,6 +32,7 @@ from holo.announce import (
     FIELD_USER,
     FIELD_V,
 )
+from holo.cloudcity_discover import CloudCityStore
 from holo.discover import (
     DEFAULT_CORS_ORIGINS,
     DEFAULT_JSON_WAIT_S,
@@ -448,7 +449,7 @@ class TestHTTPApp:
         s = parse_txt(_txt(session="claude-1"), "holo-x")
         assert s is not None
         store.upsert(s)
-        app = build_app(store=store)
+        app = build_app(store=store, cloudcity_store=CloudCityStore())
         with TestClient(app) as client:
             resp = client.get("/sessions")
             assert resp.status_code == 200
@@ -461,7 +462,7 @@ class TestHTTPApp:
         from starlette.testclient import TestClient
 
         store = SessionStore()
-        app = build_app(store=store)
+        app = build_app(store=store, cloudcity_store=CloudCityStore())
         with TestClient(app) as client:
             resp = client.get("/healthz")
             assert resp.status_code == 200
@@ -478,7 +479,7 @@ class TestHTTPApp:
         assert s is not None
         store.upsert(s)
 
-        app = build_app(store=store)
+        app = build_app(store=store, cloudcity_store=CloudCityStore())
         with TestClient(app) as client:
             with client.websocket_connect("/events") as ws:
                 event = ws.receive_json()
@@ -489,7 +490,7 @@ class TestHTTPApp:
         from starlette.testclient import TestClient
 
         store = SessionStore()
-        app = build_app(store=store)
+        app = build_app(store=store, cloudcity_store=CloudCityStore())
         with TestClient(app) as client:
             resp = client.get(
                 "/sessions",
@@ -505,6 +506,7 @@ class TestHTTPApp:
         store = SessionStore()
         app = build_app(
             store=store,
+            cloudcity_store=CloudCityStore(),
             cors_origins=["https://only-this.test"],
         )
         with TestClient(app) as client:
