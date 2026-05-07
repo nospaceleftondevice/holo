@@ -324,6 +324,113 @@ def test_cloudcities_endpoint_returns_snapshot(
         assert data[0][FIELD_PORT] == 2222
 
 
+def test_local_cloudcity_endpoint_matches_local_ip(
+    _starlette_test_client_or_skip: Any,
+) -> None:
+    """`/local-cloudcity` returns the announcement whose IPs overlap
+    with one of the local interface IPs."""
+    from unittest.mock import patch
+
+    from holo.discover import SessionStore, build_app
+
+    sess_store = SessionStore()
+    cc_store = CloudCityStore()
+    cc_store.upsert(
+        {
+            "instance": "cloudcity-thishost-abc",
+            FIELD_V: TXT_SCHEMA_VERSION,
+            FIELD_HOST: "thishost.local",
+            FIELD_IPS: ["192.168.1.5"],
+            FIELD_PORT: 2222,
+            "last_seen": int(time.time()),
+        }
+    )
+    cc_store.upsert(
+        {
+            "instance": "cloudcity-otherhost-def",
+            FIELD_V: TXT_SCHEMA_VERSION,
+            FIELD_HOST: "otherhost.local",
+            FIELD_IPS: ["192.168.1.99"],
+            FIELD_PORT: 2222,
+            "last_seen": int(time.time()),
+        }
+    )
+
+    app = build_app(store=sess_store, cloudcity_store=cc_store)
+
+    TestClient = _starlette_test_client_or_skip
+    # Pretend "this machine" has 192.168.1.5 on its en0; that's the
+    # IP the upstairs CloudCity is announcing, so /local-cloudcity
+    # should return that one and ignore the office one.
+    with patch(
+        "holo.discover._local_ipv4_set",
+        return_value=[{"127.0.0.1", "192.168.1.5"}],
+    ):
+        with TestClient(app) as client:
+            resp = client.get("/local-cloudcity")
+            assert resp.status_code == 200
+            data = resp.json()
+            assert data is not None
+            assert data["instance"] == "cloudcity-thishost-abc"
+
+
+def test_local_cloudcity_endpoint_returns_null_on_no_match(
+    _starlette_test_client_or_skip: Any,
+) -> None:
+    """When no announced CloudCity matches a local IP, returns null
+    (so the SPA can decide what to do — show an error, fall back, etc.)."""
+    from unittest.mock import patch
+
+    from holo.discover import SessionStore, build_app
+
+    sess_store = SessionStore()
+    cc_store = CloudCityStore()
+    cc_store.upsert(
+        {
+            "instance": "cloudcity-otherhost-def",
+            FIELD_V: TXT_SCHEMA_VERSION,
+            FIELD_HOST: "otherhost.local",
+            FIELD_IPS: ["192.168.1.99"],
+            FIELD_PORT: 2222,
+            "last_seen": int(time.time()),
+        }
+    )
+
+    app = build_app(store=sess_store, cloudcity_store=cc_store)
+
+    TestClient = _starlette_test_client_or_skip
+    with patch(
+        "holo.discover._local_ipv4_set",
+        return_value=[{"127.0.0.1", "192.168.1.5"}],
+    ):
+        with TestClient(app) as client:
+            resp = client.get("/local-cloudcity")
+            assert resp.status_code == 200
+            assert resp.json() is None
+
+
+def test_local_cloudcity_endpoint_empty_when_no_announcements(
+    _starlette_test_client_or_skip: Any,
+) -> None:
+    from unittest.mock import patch
+
+    from holo.discover import SessionStore, build_app
+
+    sess_store = SessionStore()
+    cc_store = CloudCityStore()  # empty
+    app = build_app(store=sess_store, cloudcity_store=cc_store)
+
+    TestClient = _starlette_test_client_or_skip
+    with patch(
+        "holo.discover._local_ipv4_set",
+        return_value=[{"192.168.1.5"}],
+    ):
+        with TestClient(app) as client:
+            resp = client.get("/local-cloudcity")
+            assert resp.status_code == 200
+            assert resp.json() is None
+
+
 def test_sessions_endpoint_still_works_with_cloudcity_extension(
     _starlette_test_client_or_skip: Any,
 ) -> None:
