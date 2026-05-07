@@ -141,6 +141,14 @@ class HoloMCPServer:
             )
             self._discover = None
 
+        # CloudCity reverse-tunnel state (Phase 4 of the spec). Owned
+        # at server scope so multiple `holo_tunnel_up` calls coexist
+        # cleanly, and so the tunnel survives across MCP requests.
+        # The lock guards against two concurrent tool invocations
+        # racing each other into start/stop.
+        self._tunnel: Any | None = None
+        self._tunnel_lock = threading.Lock()
+
     @property
     def daemon(self) -> Daemon:
         with self._daemon_lock:
@@ -153,6 +161,17 @@ class HoloMCPServer:
             return self._daemon
 
     def shutdown(self) -> None:
+        # Tear down the reverse-tunnel before the announcer so listening
+        # companions get the Goodbye after the tunnel is already gone —
+        # otherwise they could briefly see `tunnel_port` advertised
+        # against a dead ssh process.
+        with self._tunnel_lock:
+            if self._tunnel is not None:
+                try:
+                    self._tunnel.stop()
+                except Exception:  # noqa: BLE001 — shutdown must not raise
+                    pass
+                self._tunnel = None
         # Stop the announcer first so the LAN sees a Goodbye while the
         # capabilities server is still up — minimizes the window where
         # a discoverer could see the broadcast but get a connection
@@ -729,6 +748,139 @@ class HoloMCPServer:
             f"{target.get('instance')!r}; tried: {attempts!r}"
         )
 
+    # ---- CloudCity reverse-tunnel ------------------------------------
+    #
+    # Phase 4 of the CloudCity tunnel spec. The desktop SPA invokes
+    # `holo_tunnel_up` to bring up a reverse SSH forward into one of
+    # the LAN's CloudCity hosts. Once the tunnel is up, this daemon's
+    # mDNS announcement (the existing `_holo-session._tcp.local.`
+    # record) gains a `tunnel_port=<N>` field so SPAs that key off
+    # discovery rather than off the MCP response also see the new
+    # routing. `holo_tunnel_down` tears the tunnel down explicitly.
+
+    def holo_tunnel_up(
+        self,
+        cloudcity_instance: str,
+        backend: str | None = None,
+        force_cert_refresh: bool = False,
+    ) -> dict[str, Any]:
+        """Open a reverse SSH tunnel to a CloudCity host.
+
+        Picks the named CloudCity from the LAN discovery cache,
+        ensures the daemon's outbound-SSH cert is fresh, then runs
+        ``ssh -A -N -R 0:localhost:22 lando@<cc-ip>:<cc-port>`` so
+        c2w-net's loopback gains a port that forwards back to this
+        daemon's :22. Returns the allocated tunnel port plus the
+        target metadata.
+
+        Idempotent at the server level: a second call replaces any
+        existing tunnel (the previous ssh subprocess is stopped before
+        the new one starts) — the desktop SPA can call this on every
+        click without bookkeeping.
+
+        ``cloudcity_instance`` matches against (in order) the mDNS
+        instance label, then ``host``. Use ``holo cloudcity discover
+        --json`` (or read the future `/cloudcities` endpoint) to list
+        candidates.
+
+        ``backend`` selects where the cert refresh hits:
+            1. explicit value → wins
+            2. otherwise: ``HOLO_BACKEND`` env var, then the build-time
+               default. See ``holo.cert.resolve_backend``.
+
+        ``force_cert_refresh=True`` re-fetches the cert even if the
+        on-disk one is still valid — useful when rotating CAs.
+
+        After the tunnel is up, the existing ``_holo-session._tcp.``
+        announce is updated to carry ``tunnel_port=<N>``.
+        """
+        from holo import cloudcity_announce as cc_announce
+        from holo import tunnel as tunnel_mod
+
+        with self._tunnel_lock:
+            # Replace any existing tunnel first so the second call
+            # doesn't leak the prior ssh subprocess.
+            if self._tunnel is not None:
+                try:
+                    self._tunnel.stop()
+                except Exception:  # noqa: BLE001 — log + keep going
+                    pass
+                self._tunnel = None
+                if self._announcer is not None:
+                    try:
+                        self._announcer.set_tunnel_port(None)
+                    except Exception:  # noqa: BLE001
+                        pass
+
+            if self._discover is None:
+                raise RuntimeError(
+                    "discover cache unavailable — mDNS browser failed "
+                    "to start; cannot resolve CloudCity by instance"
+                )
+            # Phase 4b doesn't consume the CloudCity browser through
+            # the running DiscoverHandle (that's session-only). Spin
+            # up a short-lived browse via tunnel.find_cloudcity and
+            # surface a clear error if nothing matches.
+            record = tunnel_mod.find_cloudcity(
+                cloudcity_instance, wait_s=1.5
+            )
+            if record is None:
+                raise RuntimeError(
+                    f"no CloudCity matching {cloudcity_instance!r} on "
+                    f"the LAN. Is `holo cloudcity announce` running on "
+                    f"the host?"
+                )
+
+            tunnel = tunnel_mod.open_to_cloudcity(
+                record,
+                backend=backend,
+                cert_force_refresh=force_cert_refresh,
+            )
+            self._tunnel = tunnel
+
+            # Mirror the new port onto the session announcement so
+            # SPAs that key off discovery (rather than off this MCP
+            # response) see the change. No-op when the announcer is
+            # disabled (`holo mcp` without `--announce`).
+            if self._announcer is not None:
+                try:
+                    self._announcer.set_tunnel_port(tunnel.port)
+                except Exception:  # noqa: BLE001 — log + keep going
+                    pass
+
+            target = tunnel.target
+            return {
+                "tunnel_port": tunnel.port,
+                "cloudcity_instance": record.get("instance"),
+                "cloudcity_host": record.get(cc_announce.FIELD_HOST),
+                "cloudcity_target": (
+                    f"{target[0]}:{target[1]}" if target else None
+                ),
+                "cert_refreshed": force_cert_refresh,
+            }
+
+    def holo_tunnel_down(self) -> dict[str, Any]:
+        """Tear down the active reverse tunnel, if any.
+
+        Always returns successfully — calling this when no tunnel is
+        up is a no-op (returns ``{"closed": False}``). Also clears
+        ``tunnel_port`` from the session announcement.
+        """
+        with self._tunnel_lock:
+            if self._tunnel is None:
+                return {"closed": False}
+            try:
+                self._tunnel.stop()
+            except Exception:  # noqa: BLE001 — surface once we're stable
+                pass
+            self._tunnel = None
+            if self._announcer is not None:
+                try:
+                    self._announcer.set_tunnel_port(None)
+                except Exception:  # noqa: BLE001
+                    pass
+            return {"closed": True}
+
 
 def _match_session(
     sessions: list[dict[str, Any]], identifier: str
@@ -1157,6 +1309,47 @@ def build_server(
         return holo.holo_fetch_capabilities(
             instance, timeout_s=timeout_s
         )
+
+    @mcp.tool(
+        description=(
+            "Open a reverse SSH tunnel from this holo daemon to a "
+            "CloudCity host on the LAN. The daemon picks the named "
+            "CloudCity from its mDNS discovery cache, refreshes its "
+            "SSH cert against the configured s3r9 backend, then runs "
+            "`ssh -A -N -R 0:localhost:22 lando@<cc-ip>:<cc-port>`. "
+            "Returns the allocated `tunnel_port`, plus the resolved "
+            "`cloudcity_instance` / `cloudcity_host` / `cloudcity_target`. "
+            "The desktop SPA's c2w VM should connect to "
+            "`localhost:<tunnel_port>` from inside c2w-net to reach "
+            "this daemon's tmux session — that's why the architecture "
+            "exists. Idempotent at server scope: a second call replaces "
+            "any existing tunnel cleanly. Pair with `holo_tunnel_down` "
+            "for explicit teardown; the tunnel is also torn down on "
+            "MCP server shutdown."
+        )
+    )
+    def holo_tunnel_up(
+        cloudcity_instance: str,
+        backend: str | None = None,
+        force_cert_refresh: bool = False,
+    ) -> dict[str, Any]:
+        return holo.holo_tunnel_up(
+            cloudcity_instance,
+            backend=backend,
+            force_cert_refresh=force_cert_refresh,
+        )
+
+    @mcp.tool(
+        description=(
+            "Tear down the active reverse tunnel, if any. Idempotent — "
+            "calling when no tunnel is up returns `{closed: false}`. "
+            "Also clears the `tunnel_port` field from the daemon's "
+            "`_holo-session._tcp.local.` mDNS announcement so "
+            "discoverers see the routing change immediately."
+        )
+    )
+    def holo_tunnel_down() -> dict[str, Any]:
+        return holo.holo_tunnel_down()
 
     return mcp, holo
 

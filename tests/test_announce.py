@@ -448,6 +448,94 @@ class TestLifecycle:
         assert instance.register_service.call_count == 1
 
 
+class TestTunnelPort:
+    """Phase 4 tunnel_port wiring on HoloAnnouncer."""
+
+    def test_tunnel_port_omitted_by_default(self) -> None:
+        from holo.announce import FIELD_TUNNEL_PORT
+
+        a = HoloAnnouncer()
+        props = a.build_properties()
+        assert FIELD_TUNNEL_PORT.encode() not in props
+
+    def test_tunnel_port_appears_in_txt_when_set(self) -> None:
+        from holo.announce import FIELD_TUNNEL_PORT
+
+        a = HoloAnnouncer()
+        a.set_tunnel_port(54321)
+        props = a.build_properties()
+        assert props[FIELD_TUNNEL_PORT.encode()] == b"54321"
+
+    def test_set_tunnel_port_before_start_persists_into_first_publish(
+        self,
+    ) -> None:
+        from holo.announce import FIELD_TUNNEL_PORT
+
+        a = HoloAnnouncer()
+        a.set_tunnel_port(9001)  # before start — pure config update
+
+        with patch("zeroconf.Zeroconf") as zc_cls:
+            instance = zc_cls.return_value
+            a.start()
+
+        info = instance.register_service.call_args[0][0]
+        assert info.properties[FIELD_TUNNEL_PORT.encode()] == b"9001"
+
+    def test_set_tunnel_port_after_start_calls_update_service(self) -> None:
+        from holo.announce import FIELD_TUNNEL_PORT
+
+        with patch("zeroconf.Zeroconf") as zc_cls, patch(
+            "zeroconf.ServiceInfo"
+        ) as si_cls:
+            instance = zc_cls.return_value
+            a = HoloAnnouncer()
+            a.start()
+            si_cls.reset_mock()
+            instance.update_service.reset_mock()
+            a.set_tunnel_port(12345)
+
+        assert instance.update_service.called
+        new_info = instance.update_service.call_args[0][0]
+        # The new ServiceInfo got the tunnel_port field via build_properties.
+        properties_call = si_cls.call_args.kwargs["properties"]
+        assert properties_call[FIELD_TUNNEL_PORT.encode()] == b"12345"
+        assert new_info is si_cls.return_value
+
+    def test_set_tunnel_port_clear_after_publish(self) -> None:
+        from holo.announce import FIELD_TUNNEL_PORT
+
+        with patch("zeroconf.Zeroconf") as zc_cls, patch(
+            "zeroconf.ServiceInfo"
+        ) as si_cls:
+            instance = zc_cls.return_value
+            a = HoloAnnouncer()
+            a.start()
+            a.set_tunnel_port(12345)
+            si_cls.reset_mock()
+            instance.update_service.reset_mock()
+            a.set_tunnel_port(None)  # clear
+
+        properties_call = si_cls.call_args.kwargs["properties"]
+        assert FIELD_TUNNEL_PORT.encode() not in properties_call
+        assert instance.update_service.called
+
+    def test_set_tunnel_port_idempotent(self) -> None:
+        with patch("zeroconf.Zeroconf") as zc_cls:
+            instance = zc_cls.return_value
+            a = HoloAnnouncer()
+            a.start()
+            a.set_tunnel_port(9001)
+            instance.update_service.reset_mock()
+            a.set_tunnel_port(9001)  # same value — no-op
+        assert not instance.update_service.called
+
+    def test_int_fields_includes_tunnel_port(self) -> None:
+        """parse_txt-style consumers must coerce tunnel_port to int."""
+        from holo.announce import FIELD_TUNNEL_PORT, INT_FIELDS
+
+        assert FIELD_TUNNEL_PORT in INT_FIELDS
+
+
 class TestCLIFlagParsing:
     """Validate the announce flag plumbing in `holo mcp`."""
 

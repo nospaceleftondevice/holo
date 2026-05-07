@@ -62,6 +62,14 @@ FIELD_TMUX_WINDOW = "tmux_window"
 # both present or both absent.
 FIELD_CAPS_PORT = "caps_port"
 FIELD_CAPS_TOKEN = "caps_token"
+# Phase 4 (CloudCity reverse-tunnel): published when this daemon has
+# an active reverse-tunnel into a CloudCity host. The desktop SPA
+# reads `tunnel_port` and re-routes its c2w VM's SSH command from
+# `<announced_ip>:22` to `<cloudcity_loopback>:<tunnel_port>` so the
+# c2w-net container — which on macOS Docker Desktop can't reach LAN
+# peers directly — finds the tmux host via the tunnel instead.
+# Cleared (TXT field omitted) when no tunnel is active.
+FIELD_TUNNEL_PORT = "tunnel_port"
 
 # Required even when other fields are missing. A TXT missing any of these
 # is malformed and should be dropped.
@@ -78,7 +86,7 @@ REQUIRED_FIELDS: tuple[str, ...] = (
 # Fields parsed/emitted as integers in the JSON contract. TXT carries them
 # as UTF-8 strings; discover.py converts.
 INT_FIELDS: frozenset[str] = frozenset(
-    {FIELD_HOLO_PID, FIELD_STARTED, FIELD_CAPS_PORT}
+    {FIELD_HOLO_PID, FIELD_STARTED, FIELD_CAPS_PORT, FIELD_TUNNEL_PORT}
 )
 
 _log = logging.getLogger(__name__)
@@ -120,6 +128,10 @@ class HoloAnnouncer:
             )
         self.caps_port = caps_port
         self.caps_token = caps_token
+        # Tunnel port (Phase 4) starts unset; ``set_tunnel_port`` flips
+        # it on/off. When set, included in the broadcast TXT record so
+        # the desktop SPA can route through it.
+        self._tunnel_port: int | None = None
         self._zeroconf: Zeroconf | None = None
         self._service_info: ServiceInfo | None = None
 
@@ -161,6 +173,9 @@ class HoloAnnouncer:
         if self.caps_port is not None and self.caps_token is not None:
             put(FIELD_CAPS_PORT, str(self.caps_port))
             put(FIELD_CAPS_TOKEN, self.caps_token)
+
+        if self._tunnel_port is not None:
+            put(FIELD_TUNNEL_PORT, str(self._tunnel_port))
 
         return props
 
@@ -240,6 +255,45 @@ class HoloAnnouncer:
         finally:
             self._zeroconf = None
             self._service_info = None
+
+    def set_tunnel_port(self, port: int | None) -> None:
+        """Add / clear ``tunnel_port`` on the published TXT record.
+
+        Pass an integer to advertise an active reverse-tunnel; pass
+        ``None`` to clear the field. When the announcer hasn't been
+        started yet this is a pure config update — the new value will
+        appear on the first ``start()``. When already started, the
+        record is rebuilt and re-broadcast via ``Zeroconf.update_service``
+        so listening companions see the change without needing to wait
+        for a TTL refresh.
+
+        Idempotent: setting to the current value is a no-op.
+        """
+        if self._tunnel_port == port:
+            return
+        self._tunnel_port = port
+        if self._zeroconf is None or self._service_info is None:
+            return
+        # Build a fresh ServiceInfo with the updated TXT and ask
+        # zeroconf to push it. We reuse the existing instance name +
+        # addresses so listeners see this as an `update_service`, not
+        # a `remove + add`.
+        from zeroconf import ServiceInfo
+
+        new_info = ServiceInfo(
+            type_=self._service_info.type,
+            name=self._service_info.name,
+            addresses=list(self._service_info.addresses),
+            port=self._service_info.port,
+            properties=self.build_properties(),
+            server=self._service_info.server,
+        )
+        try:
+            self._zeroconf.update_service(new_info)
+        except Exception:  # noqa: BLE001 — log + keep state in sync
+            _log.exception("zeroconf update_service failed")
+            return
+        self._service_info = new_info
 
     def _instance_name(self) -> str:
         # DNS label cap is 63 bytes (RFC 1035); GitHub Actions runner
@@ -382,6 +436,7 @@ __all__ = [
     "FIELD_STARTED",
     "FIELD_TMUX_SESSION",
     "FIELD_TMUX_WINDOW",
+    "FIELD_TUNNEL_PORT",
     "FIELD_USER",
     "FIELD_V",
     "HoloAnnouncer",

@@ -453,3 +453,161 @@ def test_find_cloudcity_returns_none_when_missing() -> None:
         record = tunnel_mod.find_cloudcity("does-not-exist", wait_s=0.2)
     assert record is None
     fake_zc.close.assert_called_once()
+
+
+# ============================================================================
+# HoloMCPServer.holo_tunnel_up / holo_tunnel_down — Phase 4b integration
+# ============================================================================
+#
+# Skipped automatically when the `mcp` package isn't installed (the
+# entire mcp_server module fails to import). CI installs it; the local
+# dev env intentionally doesn't to keep iteration on non-MCP code fast.
+
+
+@pytest.fixture
+def _holo_mcp_server_or_skip() -> Any:
+    """Import HoloMCPServer or skip the test if mcp isn't available."""
+    try:
+        from holo.mcp_server import HoloMCPServer
+    except ImportError:
+        pytest.skip("mcp package not installed in this env")
+    return HoloMCPServer
+
+
+def _make_fake_tunnel(port: int = 51492) -> MagicMock:
+    """Tunnel double for the MCP integration tests."""
+    t = MagicMock()
+    t.port = port
+    t.target = ("192.168.1.5", 2222)
+    return t
+
+
+def test_holo_tunnel_up_returns_port_and_metadata(
+    _holo_mcp_server_or_skip: Any,
+) -> None:
+    HoloMCPServer = _holo_mcp_server_or_skip
+
+    record = {
+        "instance": "cc-test",
+        cc_announce.FIELD_HOST: "MacBook.local",
+        cc_announce.FIELD_IPS: ["192.168.1.5"],
+        cc_announce.FIELD_PORT: 2222,
+    }
+    fake_tunnel = _make_fake_tunnel(port=51492)
+    with patch(
+        "holo.tunnel.find_cloudcity", return_value=record
+    ), patch(
+        "holo.tunnel.open_to_cloudcity", return_value=fake_tunnel
+    ):
+        server = HoloMCPServer(no_bookmarklet=True)
+        try:
+            result = server.holo_tunnel_up("cc-test")
+        finally:
+            server.shutdown()
+
+    assert result["tunnel_port"] == 51492
+    assert result["cloudcity_instance"] == "cc-test"
+    assert result["cloudcity_host"] == "MacBook.local"
+    assert result["cloudcity_target"] == "192.168.1.5:2222"
+
+
+def test_holo_tunnel_up_unknown_instance_raises(
+    _holo_mcp_server_or_skip: Any,
+) -> None:
+    HoloMCPServer = _holo_mcp_server_or_skip
+    with patch("holo.tunnel.find_cloudcity", return_value=None):
+        server = HoloMCPServer(no_bookmarklet=True)
+        try:
+            with pytest.raises(RuntimeError, match="no CloudCity matching"):
+                server.holo_tunnel_up("does-not-exist")
+        finally:
+            server.shutdown()
+
+
+def test_holo_tunnel_up_replaces_existing_tunnel(
+    _holo_mcp_server_or_skip: Any,
+) -> None:
+    """A second up() stops the prior tunnel before opening a new one."""
+    HoloMCPServer = _holo_mcp_server_or_skip
+    record = {
+        "instance": "cc-test",
+        cc_announce.FIELD_HOST: "MacBook.local",
+        cc_announce.FIELD_IPS: ["192.168.1.5"],
+        cc_announce.FIELD_PORT: 2222,
+    }
+    first = _make_fake_tunnel(port=51000)
+    second = _make_fake_tunnel(port=51001)
+    with patch(
+        "holo.tunnel.find_cloudcity", return_value=record
+    ), patch(
+        "holo.tunnel.open_to_cloudcity", side_effect=[first, second]
+    ):
+        server = HoloMCPServer(no_bookmarklet=True)
+        try:
+            server.holo_tunnel_up("cc-test")
+            server.holo_tunnel_up("cc-test")
+        finally:
+            server.shutdown()
+
+    first.stop.assert_called_once()
+
+
+def test_holo_tunnel_up_updates_announcer_tunnel_port(
+    _holo_mcp_server_or_skip: Any,
+) -> None:
+    """When --announce is on, the tunnel_port flows into the mDNS record."""
+    HoloMCPServer = _holo_mcp_server_or_skip
+    record = {
+        "instance": "cc-test",
+        cc_announce.FIELD_HOST: "MacBook.local",
+        cc_announce.FIELD_IPS: ["192.168.1.5"],
+        cc_announce.FIELD_PORT: 2222,
+    }
+    fake_tunnel = _make_fake_tunnel(port=42424)
+    with patch("holo.tunnel.find_cloudcity", return_value=record), patch(
+        "holo.tunnel.open_to_cloudcity", return_value=fake_tunnel
+    ), patch("holo.announce.HoloAnnouncer") as ann_cls:
+        server = HoloMCPServer(no_bookmarklet=True, announce=True)
+        try:
+            server.holo_tunnel_up("cc-test")
+        finally:
+            server.shutdown()
+    ann_cls.return_value.set_tunnel_port.assert_any_call(42424)
+
+
+def test_holo_tunnel_down_stops_tunnel_and_clears_announce(
+    _holo_mcp_server_or_skip: Any,
+) -> None:
+    HoloMCPServer = _holo_mcp_server_or_skip
+    record = {
+        "instance": "cc-test",
+        cc_announce.FIELD_HOST: "MacBook.local",
+        cc_announce.FIELD_IPS: ["192.168.1.5"],
+        cc_announce.FIELD_PORT: 2222,
+    }
+    fake_tunnel = _make_fake_tunnel(port=42424)
+    with patch("holo.tunnel.find_cloudcity", return_value=record), patch(
+        "holo.tunnel.open_to_cloudcity", return_value=fake_tunnel
+    ), patch("holo.announce.HoloAnnouncer") as ann_cls:
+        server = HoloMCPServer(no_bookmarklet=True, announce=True)
+        try:
+            server.holo_tunnel_up("cc-test")
+            result = server.holo_tunnel_down()
+        finally:
+            server.shutdown()
+
+    assert result == {"closed": True}
+    fake_tunnel.stop.assert_called()
+    ann_cls.return_value.set_tunnel_port.assert_any_call(None)
+
+
+def test_holo_tunnel_down_with_no_active_tunnel_returns_closed_false(
+    _holo_mcp_server_or_skip: Any,
+) -> None:
+    HoloMCPServer = _holo_mcp_server_or_skip
+    server = HoloMCPServer(no_bookmarklet=True)
+    try:
+        result = server.holo_tunnel_down()
+    finally:
+        server.shutdown()
+    assert result == {"closed": False}

@@ -405,6 +405,8 @@ class TestShutdownAndBuild:
                 "ui_template_delete",
                 "holo_discover_sessions",
                 "holo_fetch_capabilities",
+                "holo_tunnel_up",
+                "holo_tunnel_down",
             }
         finally:
             holo.shutdown()
