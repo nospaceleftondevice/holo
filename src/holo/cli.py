@@ -293,6 +293,8 @@ def _cmd_mcp(
     announce_ssh_user: str | None = None,
     announce_ips: list[str] | None = None,
     announce_capabilities: bool = False,
+    auto_tunnel: bool = False,
+    auto_tunnel_backend: str | None = None,
 ) -> int:
     """Run the MCP server.
 
@@ -348,6 +350,15 @@ def _cmd_mcp(
                 "Capabilities endpoint: enabled "
                 "(applications + packages auto-discovered per platform)"
             )
+        if auto_tunnel:
+            backend_label = (
+                auto_tunnel_backend
+                or "$HOLO_BACKEND or default"
+            )
+            lines.append(
+                f"Auto-tunnel: enabled — opens reverse SSH forwards into "
+                f"every discovered CloudCity. Cert backend: {backend_label}"
+            )
         return lines
 
     announce_kwargs: dict[str, Any] = {
@@ -357,6 +368,8 @@ def _cmd_mcp(
         "announce_ssh_user": announce_ssh_user,
         "announce_ips": announce_ips,
         "announce_capabilities": announce_capabilities,
+        "auto_tunnel": auto_tunnel,
+        "auto_tunnel_backend": auto_tunnel_backend,
     }
 
     if listen_port is not None:
@@ -1248,6 +1261,7 @@ Commands:
       [--announce] [--announce-session NAME] [--announce-user NAME]
       [--announce-ssh-user NAME] [--announce-ip A,B,C]
       [--announce-capabilities]
+      [--auto-tunnel] [--auto-tunnel-backend URL]
                           run the MCP server over stdio (or TCP with --listen)
                           --screen          enable screen / template / app_activate tools
                           --no-bookmarklet  drop channel tools; no WS server
@@ -1264,6 +1278,17 @@ Commands:
                                                      token-auth HTTP endpoint
                                                      (everything auto-discovered;
                                                      no per-probe flags)
+                          --auto-tunnel              open reverse SSH forwards into
+                                                     every discovered CloudCity
+                                                     (one tunnel per CC); the
+                                                     session announce gains a
+                                                     tunnel_ports map (cc to
+                                                     port) SPAs use to route
+                          --auto-tunnel-backend URL  cert-signing backend for the
+                                                     auto-tunnel cert refresh.
+                                                     Defaults to per-CC announced
+                                                     backend, then HOLO_BACKEND,
+                                                     then https://api-dev.tai.sh
   connect HOST:PORT       stdio↔TCP bridge to a listening `holo mcp`
   mcp-remote -- CMD ...   spawn-per-connection stdio proxy
   discover [--json | --tail | --serve PORT] [--wait SECS]
@@ -1369,6 +1394,8 @@ def main(argv: list[str] | None = None) -> int:
         announce_ip_raw = _value_flag(rest, "--announce-ip")
         announce = "--announce" in rest
         announce_capabilities = "--announce-capabilities" in rest
+        auto_tunnel = "--auto-tunnel" in rest
+        auto_tunnel_backend_raw = _value_flag(rest, "--auto-tunnel-backend")
 
         # `--probe-software` and `--probe-pkg` were removed when
         # capabilities went auto. Catch old commands so users see a
@@ -1388,11 +1415,13 @@ def main(argv: list[str] | None = None) -> int:
             or announce_ssh_user is not None
             or announce_ip_raw is not None
             or announce_capabilities
+            or auto_tunnel
+            or auto_tunnel_backend_raw is not None
         ):
             sys.stderr.write(
                 "holo mcp: --announce-session/--announce-user/"
-                "--announce-ssh-user/--announce-ip/--announce-capabilities "
-                "require --announce\n"
+                "--announce-ssh-user/--announce-ip/--announce-capabilities/"
+                "--auto-tunnel/--auto-tunnel-backend require --announce\n"
             )
             return 2
         if announce_session is _MISSING_ARG:
@@ -1407,6 +1436,11 @@ def main(argv: list[str] | None = None) -> int:
         if announce_ip_raw is _MISSING_ARG:
             sys.stderr.write("holo mcp: --announce-ip requires a value\n")
             return 2
+        if auto_tunnel_backend_raw is _MISSING_ARG:
+            sys.stderr.write(
+                "holo mcp: --auto-tunnel-backend requires a value\n"
+            )
+            return 2
 
         announce_ips: list[str] | None = None
         if isinstance(announce_ip_raw, str):
@@ -1419,6 +1453,12 @@ def main(argv: list[str] | None = None) -> int:
                 )
                 return 2
 
+        auto_tunnel_backend = (
+            auto_tunnel_backend_raw
+            if isinstance(auto_tunnel_backend_raw, str)
+            else None
+        )
+
         return _cmd_mcp(
             hide_qr="--hide-qr" in rest,
             enable_screen="--screen" in rest,
@@ -1430,6 +1470,8 @@ def main(argv: list[str] | None = None) -> int:
             announce_ssh_user=announce_ssh_user,
             announce_ips=announce_ips,
             announce_capabilities=announce_capabilities,
+            auto_tunnel=auto_tunnel,
+            auto_tunnel_backend=auto_tunnel_backend,
         )
     if cmd == "connect":
         return _cmd_connect(rest)
