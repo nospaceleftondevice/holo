@@ -536,6 +536,128 @@ class TestTunnelPort:
         assert FIELD_TUNNEL_PORT in INT_FIELDS
 
 
+class TestTunnelPortsMap:
+    """Phase 5b: multi-CloudCity tunnel_ports map."""
+
+    def test_tunnel_ports_omitted_by_default(self) -> None:
+        from holo.announce import FIELD_TUNNEL_PORTS
+
+        a = HoloAnnouncer()
+        props = a.build_properties()
+        assert FIELD_TUNNEL_PORTS.encode() not in props
+
+    def test_tunnel_ports_in_txt_when_set(self) -> None:
+        from holo.announce import FIELD_TUNNEL_PORTS
+
+        a = HoloAnnouncer()
+        a.set_tunnel_ports({"cc-upstairs": 51492, "cc-office": 51493})
+        props = a.build_properties()
+        # Stable key order (sorted) — important for diff stability
+        # across rebuilds.
+        assert (
+            props[FIELD_TUNNEL_PORTS.encode()]
+            == b"cc-office:51493,cc-upstairs:51492"
+        )
+
+    def test_tunnel_ports_empty_dict_clears_field(self) -> None:
+        from holo.announce import FIELD_TUNNEL_PORTS
+
+        a = HoloAnnouncer()
+        a.set_tunnel_ports({"cc-upstairs": 51492})
+        a.set_tunnel_ports({})
+        props = a.build_properties()
+        assert FIELD_TUNNEL_PORTS.encode() not in props
+
+    def test_tunnel_ports_none_clears_field(self) -> None:
+        from holo.announce import FIELD_TUNNEL_PORTS
+
+        a = HoloAnnouncer()
+        a.set_tunnel_ports({"cc-upstairs": 51492})
+        a.set_tunnel_ports(None)
+        props = a.build_properties()
+        assert FIELD_TUNNEL_PORTS.encode() not in props
+
+    def test_tunnel_ports_idempotent(self) -> None:
+        with patch("zeroconf.Zeroconf") as zc_cls:
+            instance = zc_cls.return_value
+            a = HoloAnnouncer()
+            a.start()
+            a.set_tunnel_ports({"cc-x": 51492})
+            instance.update_service.reset_mock()
+            a.set_tunnel_ports({"cc-x": 51492})  # same value — no-op
+        assert not instance.update_service.called
+
+    def test_tunnel_ports_after_start_calls_update_service(self) -> None:
+        from holo.announce import FIELD_TUNNEL_PORTS
+
+        with patch("zeroconf.Zeroconf") as zc_cls, patch(
+            "zeroconf.ServiceInfo"
+        ) as si_cls:
+            instance = zc_cls.return_value
+            a = HoloAnnouncer()
+            a.start()
+            si_cls.reset_mock()
+            instance.update_service.reset_mock()
+            a.set_tunnel_ports({"cc-x": 12345})
+
+        assert instance.update_service.called
+        properties_call = si_cls.call_args.kwargs["properties"]
+        assert properties_call[FIELD_TUNNEL_PORTS.encode()] == b"cc-x:12345"
+
+    def test_singular_and_map_can_coexist(self) -> None:
+        """Mid-rollout: both fields present so old + new SPAs both route."""
+        from holo.announce import FIELD_TUNNEL_PORT, FIELD_TUNNEL_PORTS
+
+        a = HoloAnnouncer()
+        a.set_tunnel_port(51492)
+        a.set_tunnel_ports({"cc-x": 51492})
+        props = a.build_properties()
+        assert props[FIELD_TUNNEL_PORT.encode()] == b"51492"
+        assert props[FIELD_TUNNEL_PORTS.encode()] == b"cc-x:51492"
+
+
+class TestParseTunnelPorts:
+    """The decode side that discoverers use."""
+
+    def test_basic_parse(self) -> None:
+        from holo.announce import parse_tunnel_ports
+
+        assert parse_tunnel_ports("cc-A:51492,cc-B:51493") == {
+            "cc-A": 51492,
+            "cc-B": 51493,
+        }
+
+    def test_empty_returns_empty_dict(self) -> None:
+        from holo.announce import parse_tunnel_ports
+
+        assert parse_tunnel_ports("") == {}
+
+    def test_strips_whitespace(self) -> None:
+        from holo.announce import parse_tunnel_ports
+
+        assert parse_tunnel_ports("  cc-A : 51492 , cc-B :51493 ") == {
+            "cc-A": 51492,
+            "cc-B": 51493,
+        }
+
+    def test_drops_malformed_entries(self) -> None:
+        """Bad entries (no colon, non-int port, empty instance) drop;
+        valid entries survive."""
+        from holo.announce import parse_tunnel_ports
+
+        result = parse_tunnel_ports(
+            "cc-A:51492,no-colon,cc-B:not-an-int,:99,cc-C:51494"
+        )
+        assert result == {"cc-A": 51492, "cc-C": 51494}
+
+    def test_preserves_instance_with_dashes_and_dots(self) -> None:
+        from holo.announce import parse_tunnel_ports
+
+        assert parse_tunnel_ports(
+            "cloudcity-MacBook-Air-3-abc.local:51492"
+        ) == {"cloudcity-MacBook-Air-3-abc.local": 51492}
+
+
 class TestCLIFlagParsing:
     """Validate the announce flag plumbing in `holo mcp`."""
 

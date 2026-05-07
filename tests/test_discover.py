@@ -135,6 +135,27 @@ class TestParseTxt:
         assert isinstance(s[FIELD_HOLO_PID], int)
         assert isinstance(s[FIELD_STARTED], int)
 
+    def test_tunnel_ports_decoded_as_dict(self) -> None:
+        """Phase 5b: `tunnel_ports=A:N,B:M` parses to {A: N, B: M}."""
+        from holo.announce import FIELD_TUNNEL_PORTS
+
+        s = parse_txt(
+            _txt(tunnel_ports="cc-upstairs:51492,cc-office:51493"),
+            "holo-x",
+        )
+        assert s is not None
+        assert s[FIELD_TUNNEL_PORTS] == {
+            "cc-upstairs": 51492,
+            "cc-office": 51493,
+        }
+
+    def test_tunnel_ports_absent_omitted_from_record(self) -> None:
+        from holo.announce import FIELD_TUNNEL_PORTS
+
+        s = parse_txt(_txt(), "holo-x")
+        assert s is not None
+        assert FIELD_TUNNEL_PORTS not in s
+
     def test_non_integer_in_int_field_drops(
         self, caplog: pytest.LogCaptureFixture
     ) -> None:

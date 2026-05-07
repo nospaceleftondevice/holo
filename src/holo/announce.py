@@ -69,7 +69,22 @@ FIELD_CAPS_TOKEN = "caps_token"
 # c2w-net container — which on macOS Docker Desktop can't reach LAN
 # peers directly — finds the tmux host via the tunnel instead.
 # Cleared (TXT field omitted) when no tunnel is active.
+#
+# `tunnel_port` (singular) was the Phase 4b shape — one tunnel per
+# daemon. With Phase 5b auto-tunnel a single daemon can be tunneled
+# into multiple CloudCity hosts at once (e.g. one upstairs, one in
+# the office). `tunnel_ports` (map) carries the full set; the SPA at
+# each desktop picks the entry whose key matches its local CloudCity
+# instance label.
+#
+# Both fields can be present together — a mid-rollout daemon may
+# write `tunnel_port` to keep older SPAs working AND `tunnel_ports`
+# for new ones. Discoverers prefer `tunnel_ports` and fall back to
+# `tunnel_port` on the singular path. Format of `tunnel_ports`:
+# comma-separated `<cc-instance>:<port>` pairs, e.g.
+# `tunnel_ports=cloudcity-upstairs-abc:51492,cloudcity-office-def:51493`.
 FIELD_TUNNEL_PORT = "tunnel_port"
+FIELD_TUNNEL_PORTS = "tunnel_ports"
 
 # Required even when other fields are missing. A TXT missing any of these
 # is malformed and should be dropped.
@@ -128,10 +143,14 @@ class HoloAnnouncer:
             )
         self.caps_port = caps_port
         self.caps_token = caps_token
-        # Tunnel port (Phase 4) starts unset; ``set_tunnel_port`` flips
+        # Tunnel port (Phase 4b) starts unset; ``set_tunnel_port`` flips
         # it on/off. When set, included in the broadcast TXT record so
         # the desktop SPA can route through it.
         self._tunnel_port: int | None = None
+        # Multi-CloudCity tunnel map (Phase 5b). Cleared = no entry in
+        # the TXT record. ``set_tunnel_ports`` updates this and
+        # re-publishes.
+        self._tunnel_ports: dict[str, int] | None = None
         self._zeroconf: Zeroconf | None = None
         self._service_info: ServiceInfo | None = None
 
@@ -176,6 +195,9 @@ class HoloAnnouncer:
 
         if self._tunnel_port is not None:
             put(FIELD_TUNNEL_PORT, str(self._tunnel_port))
+
+        if self._tunnel_ports:
+            put(FIELD_TUNNEL_PORTS, _encode_tunnel_ports(self._tunnel_ports))
 
         return props
 
@@ -272,12 +294,32 @@ class HoloAnnouncer:
         if self._tunnel_port == port:
             return
         self._tunnel_port = port
+        self._republish_if_running()
+
+    def set_tunnel_ports(self, mapping: dict[str, int] | None) -> None:
+        """Add / clear ``tunnel_ports`` on the published TXT record.
+
+        ``mapping`` is a ``{cloudcity_instance: port}`` dict. Each
+        entry tells the SPA at the matching CloudCity which loopback
+        port lands at this daemon's :22. Pass ``None`` (or an empty
+        dict) to clear.
+
+        Same lifecycle / republish semantics as ``set_tunnel_port``.
+        Idempotent on no-change; entries added/removed/changed all
+        trigger a single ``Zeroconf.update_service`` per call.
+        """
+        normalized = dict(mapping) if mapping else None
+        if normalized is not None and not normalized:
+            normalized = None
+        if self._tunnel_ports == normalized:
+            return
+        self._tunnel_ports = normalized
+        self._republish_if_running()
+
+    def _republish_if_running(self) -> None:
+        """Rebuild ``ServiceInfo`` from current state and push it."""
         if self._zeroconf is None or self._service_info is None:
             return
-        # Build a fresh ServiceInfo with the updated TXT and ask
-        # zeroconf to push it. We reuse the existing instance name +
-        # addresses so listeners see this as an `update_service`, not
-        # a `remove + add`.
         from zeroconf import ServiceInfo
 
         new_info = ServiceInfo(
@@ -423,6 +465,60 @@ def _enumerate_local_ipv4() -> list[str]:
     return out
 
 
+def _encode_tunnel_ports(mapping: dict[str, int]) -> str:
+    """Serialize ``{instance: port}`` to TXT-record value form.
+
+    Format: ``"<inst>:<port>,<inst>:<port>"`` with stable iteration
+    order (sorted by key). Skips entries with empty / None instance
+    or non-int port — those should never reach this helper, but be
+    defensive: bad records pollute the broadcast.
+    """
+    parts = []
+    for instance in sorted(mapping):
+        port = mapping[instance]
+        if not instance or not isinstance(port, int):
+            continue
+        parts.append(f"{instance}:{port}")
+    return ",".join(parts)
+
+
+def parse_tunnel_ports(raw: str) -> dict[str, int]:
+    """Decode the TXT ``tunnel_ports`` value into a ``{instance: port}`` dict.
+
+    Discoverers call this when they see the field. Malformed entries
+    are dropped with a WARNING log — the rest of the map is preserved
+    so a single bad record doesn't stop the SPA from finding its
+    matching tunnel.
+
+    Empty input or all-malformed input returns ``{}``.
+    """
+    out: dict[str, int] = {}
+    if not raw:
+        return out
+    for entry in raw.split(","):
+        entry = entry.strip()
+        if not entry:
+            continue
+        parts = entry.split(":", 1)
+        if len(parts) != 2:
+            _log.warning(
+                "tunnel_ports: malformed entry %r (no `:` separator)", entry
+            )
+            continue
+        instance = parts[0].strip()
+        try:
+            port = int(parts[1].strip())
+        except ValueError:
+            _log.warning(
+                "tunnel_ports: non-integer port in entry %r", entry
+            )
+            continue
+        if not instance:
+            continue
+        out[instance] = port
+    return out
+
+
 __all__ = [
     "FIELD_CAPS_PORT",
     "FIELD_CAPS_TOKEN",
@@ -437,6 +533,7 @@ __all__ = [
     "FIELD_TMUX_SESSION",
     "FIELD_TMUX_WINDOW",
     "FIELD_TUNNEL_PORT",
+    "FIELD_TUNNEL_PORTS",
     "FIELD_USER",
     "FIELD_V",
     "HoloAnnouncer",
@@ -444,4 +541,5 @@ __all__ = [
     "REQUIRED_FIELDS",
     "SERVICE_TYPE",
     "TXT_SCHEMA_VERSION",
+    "parse_tunnel_ports",
 ]

@@ -48,11 +48,13 @@ from typing import Any
 from holo.announce import (
     FIELD_IPS,
     FIELD_STARTED,
+    FIELD_TUNNEL_PORTS,
     FIELD_V,
     INT_FIELDS,
     REQUIRED_FIELDS,
     SERVICE_TYPE,
     TXT_SCHEMA_VERSION,
+    parse_tunnel_ports,
 )
 
 _log = logging.getLogger(__name__)
@@ -140,6 +142,11 @@ def parse_txt(
         elif k == FIELD_IPS:
             # Comma-separated → list[str]. Empty entries are dropped.
             session[k] = [x.strip() for x in v.split(",") if x.strip()]
+        elif k == FIELD_TUNNEL_PORTS:
+            # `<instance>:<port>,...` → {instance: port}. Malformed
+            # entries are dropped with a WARNING but the rest of the
+            # map is preserved (see ``announce.parse_tunnel_ports``).
+            session[k] = parse_tunnel_ports(v)
         else:
             session[k] = v
 
@@ -454,7 +461,7 @@ def run_serve(
     server = uvicorn.Server(config)
     print(
         f"holo discover: serving on http://{host}:{port} "
-        f"(routes: /sessions /cloudcities /healthz /events)",
+        f"(routes: /sessions /cloudcities /local-cloudcity /healthz /events)",
         file=sys.stderr,
         flush=True,
     )
@@ -545,6 +552,39 @@ def build_app(
         del request
         return JSONResponse(state["cc_store"].snapshot())
 
+    async def local_cloudcity_endpoint(request: Any) -> Any:
+        """Identify which discovered CloudCity is on this machine.
+
+        Phase 5b: when a Host B daemon tunnels into multiple
+        CloudCities (one per workstation), the session announce
+        carries a `tunnel_ports={instance: port, ...}` map. Each SPA
+        needs to look up the entry whose key is *its own* CloudCity.
+        That lookup needs an instance label; this endpoint returns it
+        (along with the full record) by matching announced IPs
+        against the local interface IPs.
+
+        Returns the matching record, or `null` when:
+          - no CloudCity is announced from this machine yet
+          - no `_cloudcity._tcp.local.` records have been observed
+          - all matching candidates are stale (sweeper hasn't run yet)
+
+        The match is "any announced IP overlaps with any local
+        interface IPv4". Picks the first hit in snapshot order; in
+        practice there's only one CloudCity per machine, so the
+        ambiguity rarely matters.
+        """
+        del request
+        local_ips = {
+            ip
+            for adapter in _local_ipv4_set()
+            for ip in adapter
+        }
+        for record in state["cc_store"].snapshot():
+            announced = record.get("ips") or []
+            if any(ip in local_ips for ip in announced):
+                return JSONResponse(record)
+        return JSONResponse(None)
+
     async def healthz_endpoint(request: Any) -> Any:
         del request
         return JSONResponse(
@@ -620,6 +660,11 @@ def build_app(
         routes=[
             Route("/sessions", sessions_endpoint, methods=["GET"]),
             Route("/cloudcities", cloudcities_endpoint, methods=["GET"]),
+            Route(
+                "/local-cloudcity",
+                local_cloudcity_endpoint,
+                methods=["GET"],
+            ),
             Route("/healthz", healthz_endpoint, methods=["GET"]),
             WebSocketRoute("/events", events_ws),
         ],
@@ -651,6 +696,28 @@ def _list_interfaces() -> list[dict[str, Any]]:
             if isinstance(ip.ip, str):
                 ipv4.append(ip.ip)
         out.append({"name": adapter.name, "ipv4": ipv4})
+    return out
+
+
+def _local_ipv4_set() -> list[set[str]]:
+    """Return per-adapter sets of local IPv4 addresses.
+
+    Used by /local-cloudcity to match announced CloudCity IPs against
+    interfaces this machine actually owns. Per-adapter grouping lets
+    us short-circuit on a partial match without flattening the whole
+    interface table into a single set (which we then have to flatten
+    in the consumer anyway, but the per-adapter shape leaves room
+    for "match against this specific interface only" later).
+    """
+    try:
+        import ifaddr
+    except ImportError:
+        return []
+    out: list[set[str]] = []
+    for adapter in ifaddr.get_adapters():
+        ips = {ip.ip for ip in adapter.ips if isinstance(ip.ip, str)}
+        if ips:
+            out.append(ips)
     return out
 
 
