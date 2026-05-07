@@ -58,6 +58,8 @@ class HoloMCPServer:
         announce_ips: list[str] | None = None,
         announce_port: int = 0,
         announce_capabilities: bool = False,
+        auto_tunnel: bool = False,
+        auto_tunnel_backend: str | None = None,
     ) -> None:
         self.hide_qr = hide_qr
         self.enable_screen = enable_screen
@@ -149,6 +151,36 @@ class HoloMCPServer:
         self._tunnel: Any | None = None
         self._tunnel_lock = threading.Lock()
 
+        # Auto-tunnel watcher (Phase 5b). When enabled, opens one
+        # reverse tunnel per discovered CloudCity and keeps the
+        # session announce's tunnel_ports map in sync. Skipped
+        # without --announce because there's no announcer to update.
+        self._auto_tunnel: Any | None = None
+        if auto_tunnel and self._announcer is not None:
+            try:
+                from holo.auto_tunnel import AutoTunnel
+
+                self._auto_tunnel = AutoTunnel(
+                    announcer=self._announcer,
+                    backend=auto_tunnel_backend,
+                )
+                self._auto_tunnel.start()
+            except Exception as e:  # noqa: BLE001 — surface and continue
+                print(
+                    f"holo mcp: --auto-tunnel watcher failed ({e}); "
+                    "continuing without auto-tunnel — manual "
+                    "holo_tunnel_up still works",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                self._auto_tunnel = None
+        elif auto_tunnel and self._announcer is None:
+            print(
+                "holo mcp: --auto-tunnel requires --announce; ignoring",
+                file=sys.stderr,
+                flush=True,
+            )
+
     @property
     def daemon(self) -> Daemon:
         with self._daemon_lock:
@@ -165,6 +197,12 @@ class HoloMCPServer:
         # companions get the Goodbye after the tunnel is already gone —
         # otherwise they could briefly see `tunnel_port` advertised
         # against a dead ssh process.
+        if self._auto_tunnel is not None:
+            try:
+                self._auto_tunnel.stop()
+            except Exception:  # noqa: BLE001 — shutdown must not raise
+                pass
+            self._auto_tunnel = None
         with self._tunnel_lock:
             if self._tunnel is not None:
                 try:
