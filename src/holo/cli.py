@@ -293,6 +293,7 @@ def _cmd_mcp(
     announce_ssh_user: str | None = None,
     announce_ips: list[str] | None = None,
     announce_capabilities: bool = False,
+    announce_command: str | None = None,
     auto_tunnel: bool = False,
     auto_tunnel_backend: str | None = None,
 ) -> int:
@@ -368,6 +369,7 @@ def _cmd_mcp(
         "announce_ssh_user": announce_ssh_user,
         "announce_ips": announce_ips,
         "announce_capabilities": announce_capabilities,
+        "announce_command": announce_command,
         "auto_tunnel": auto_tunnel,
         "auto_tunnel_backend": auto_tunnel_backend,
     }
@@ -1260,7 +1262,7 @@ Commands:
   mcp [--listen PORT] [--hide-qr] [--screen] [--no-bookmarklet]
       [--announce] [--announce-session NAME] [--announce-user NAME]
       [--announce-ssh-user NAME] [--announce-ip A,B,C]
-      [--announce-capabilities]
+      [--announce-capabilities] [--announce-command "CMD"]
       [--auto-tunnel] [--auto-tunnel-backend URL]
                           run the MCP server over stdio (or TCP with --listen)
                           --screen          enable screen / template / app_activate tools
@@ -1278,6 +1280,18 @@ Commands:
                                                      token-auth HTTP endpoint
                                                      (everything auto-discovered;
                                                      no per-probe flags)
+                          --announce-command "CMD"   shell command the desktop SPA
+                                                     should run on the remote
+                                                     after SSH connects.
+                                                     Auto-defaults to the right
+                                                     attach command when running
+                                                     inside tmux ($TMUX) or
+                                                     screen ($STY); override
+                                                     with this flag for custom
+                                                     multiplexers, login-shell
+                                                     wrappers (e.g. for Homebrew
+                                                     PATH), or REPLs. Published
+                                                     verbatim in the announce.
                           --auto-tunnel              open reverse SSH forwards into
                                                      every discovered CloudCity
                                                      (one tunnel per CC); the
@@ -1392,6 +1406,7 @@ def main(argv: list[str] | None = None) -> int:
         announce_user = _value_flag(rest, "--announce-user")
         announce_ssh_user = _value_flag(rest, "--announce-ssh-user")
         announce_ip_raw = _value_flag(rest, "--announce-ip")
+        announce_command_raw = _value_flag(rest, "--announce-command")
         announce = "--announce" in rest
         announce_capabilities = "--announce-capabilities" in rest
         auto_tunnel = "--auto-tunnel" in rest
@@ -1415,13 +1430,15 @@ def main(argv: list[str] | None = None) -> int:
             or announce_ssh_user is not None
             or announce_ip_raw is not None
             or announce_capabilities
+            or announce_command_raw is not None
             or auto_tunnel
             or auto_tunnel_backend_raw is not None
         ):
             sys.stderr.write(
                 "holo mcp: --announce-session/--announce-user/"
                 "--announce-ssh-user/--announce-ip/--announce-capabilities/"
-                "--auto-tunnel/--auto-tunnel-backend require --announce\n"
+                "--announce-command/--auto-tunnel/--auto-tunnel-backend "
+                "require --announce\n"
             )
             return 2
         if announce_session is _MISSING_ARG:
@@ -1435,6 +1452,11 @@ def main(argv: list[str] | None = None) -> int:
             return 2
         if announce_ip_raw is _MISSING_ARG:
             sys.stderr.write("holo mcp: --announce-ip requires a value\n")
+            return 2
+        if announce_command_raw is _MISSING_ARG:
+            sys.stderr.write(
+                "holo mcp: --announce-command requires a value\n"
+            )
             return 2
         if auto_tunnel_backend_raw is _MISSING_ARG:
             sys.stderr.write(
@@ -1458,6 +1480,11 @@ def main(argv: list[str] | None = None) -> int:
             if isinstance(auto_tunnel_backend_raw, str)
             else None
         )
+        announce_command = (
+            announce_command_raw
+            if isinstance(announce_command_raw, str)
+            else None
+        )
 
         return _cmd_mcp(
             hide_qr="--hide-qr" in rest,
@@ -1470,6 +1497,7 @@ def main(argv: list[str] | None = None) -> int:
             announce_ssh_user=announce_ssh_user,
             announce_ips=announce_ips,
             announce_capabilities=announce_capabilities,
+            announce_command=announce_command,
             auto_tunnel=auto_tunnel,
             auto_tunnel_backend=auto_tunnel_backend,
         )

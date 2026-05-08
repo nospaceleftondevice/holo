@@ -658,6 +658,130 @@ class TestParseTunnelPorts:
         ) == {"cloudcity-MacBook-Air-3-abc.local": 51492}
 
 
+class TestRemoteCommand:
+    """Phase 5b+: `remote_command` TXT field with $TMUX / $STY auto-detect."""
+
+    def test_omitted_when_no_override_and_no_env(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from holo.announce import FIELD_REMOTE_COMMAND
+
+        monkeypatch.delenv("TMUX", raising=False)
+        monkeypatch.delenv("STY", raising=False)
+        a = HoloAnnouncer()
+        props = a.build_properties()
+        assert FIELD_REMOTE_COMMAND.encode() not in props
+
+    def test_explicit_override_wins_over_env(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from holo.announce import FIELD_REMOTE_COMMAND
+
+        monkeypatch.setenv("TMUX", "/tmp/tmux-1000/default,1234,0")
+        a = HoloAnnouncer(remote_command="screen -x my-shared")
+        props = a.build_properties()
+        assert (
+            props[FIELD_REMOTE_COMMAND.encode()] == b"screen -x my-shared"
+        )
+
+    def test_empty_override_treated_as_unset(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from holo.announce import FIELD_REMOTE_COMMAND
+
+        monkeypatch.delenv("TMUX", raising=False)
+        monkeypatch.delenv("STY", raising=False)
+        a = HoloAnnouncer(remote_command="")
+        assert a.remote_command is None
+        props = a.build_properties()
+        assert FIELD_REMOTE_COMMAND.encode() not in props
+
+    def test_tmux_env_auto_detect(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """When $TMUX is set, default `remote_command` is
+        `tmux attach -t '<tmux #S>'`."""
+        from holo.announce import FIELD_REMOTE_COMMAND
+
+        monkeypatch.setenv("TMUX", "/tmp/tmux-1000/default,1234,0")
+        monkeypatch.delenv("STY", raising=False)
+        with patch("holo.announce._tmux_field", return_value="my-sess"):
+            a = HoloAnnouncer()
+            props = a.build_properties()
+        assert (
+            props[FIELD_REMOTE_COMMAND.encode()]
+            == b"tmux attach -t 'my-sess'"
+        )
+
+    def test_screen_env_auto_detect(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """When $STY is set (and not $TMUX), default is `screen -r <name>`."""
+        from holo.announce import FIELD_REMOTE_COMMAND
+
+        monkeypatch.delenv("TMUX", raising=False)
+        # GNU screen sets STY to "<pid>.<ttyname>.<hostname>".
+        monkeypatch.setenv("STY", "12345.pts-0.host")
+        a = HoloAnnouncer()
+        props = a.build_properties()
+        assert (
+            props[FIELD_REMOTE_COMMAND.encode()]
+            == b"screen -r pts-0.host"
+        )
+
+    def test_screen_env_without_dot_uses_whole_value(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Defensive: unusual screen setups may leave STY without a dot.
+        Fall through with the literal value rather than emitting bogus."""
+        from holo.announce import FIELD_REMOTE_COMMAND
+
+        monkeypatch.delenv("TMUX", raising=False)
+        monkeypatch.setenv("STY", "raw-session-name")
+        a = HoloAnnouncer()
+        props = a.build_properties()
+        assert (
+            props[FIELD_REMOTE_COMMAND.encode()]
+            == b"screen -r raw-session-name"
+        )
+
+    def test_tmux_wins_when_both_envs_set(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Edge: $TMUX *and* $STY simultaneously (someone nested screen
+        inside tmux or vice versa). tmux wins; matches the existing
+        `tmux_session` field's environment priority."""
+        from holo.announce import FIELD_REMOTE_COMMAND
+
+        monkeypatch.setenv("TMUX", "/tmp/tmux/default,1,0")
+        monkeypatch.setenv("STY", "12345.pts-0.host")
+        with patch("holo.announce._tmux_field", return_value="from-tmux"):
+            a = HoloAnnouncer()
+            props = a.build_properties()
+        assert (
+            props[FIELD_REMOTE_COMMAND.encode()]
+            == b"tmux attach -t 'from-tmux'"
+        )
+
+    def test_tmux_session_with_special_chars_single_quoted(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Default tmux command single-quotes the session name so spaces
+        / wildcards survive the trip through the SPA + remote shell."""
+        from holo.announce import FIELD_REMOTE_COMMAND
+
+        monkeypatch.setenv("TMUX", "/tmp/tmux/default,1,0")
+        with patch(
+            "holo.announce._tmux_field", return_value="claude session"
+        ):
+            a = HoloAnnouncer()
+            props = a.build_properties()
+        assert (
+            props[FIELD_REMOTE_COMMAND.encode()]
+            == b"tmux attach -t 'claude session'"
+        )
+
+
 class TestCLIFlagParsing:
     """Validate the announce flag plumbing in `holo mcp`."""
 

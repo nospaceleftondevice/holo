@@ -85,6 +85,25 @@ FIELD_CAPS_TOKEN = "caps_token"
 # `tunnel_ports=cloudcity-upstairs-abc:51492,cloudcity-office-def:51493`.
 FIELD_TUNNEL_PORT = "tunnel_port"
 FIELD_TUNNEL_PORTS = "tunnel_ports"
+# The shell command the desktop SPA should run on the remote after SSH
+# connects. Verbatim — the SPA does not parse, escape, or wrap it.
+#
+# Auto-populated when the daemon detects a known multiplexer:
+#   - $TMUX set →   `tmux attach -t '<#S>'`
+#   - $STY set →    `screen -r <session>`  (session label parsed from $STY)
+# Operators with non-default needs (different multiplexer flags, vim,
+# REPLs, login-shell wrappers for missing PATH) override via the CLI
+# `--announce-command "..."` flag, which sets this field verbatim.
+#
+# Holo does NOT auto-wrap with `bash -lc` / `$SHELL -lc` — that's the
+# operator's call. Common reason to want it: tmux is on the Homebrew
+# PATH which non-login non-interactive ssh shells don't pick up. Pass:
+#   --announce-command 'bash -lc "tmux attach -t my-sess"'
+# (or whatever shell sources the relevant rc/profile).
+#
+# Absent → SPA falls back to legacy tmux_session-based construction;
+# absent + no tmux_session → SPA opens a plain interactive shell.
+FIELD_REMOTE_COMMAND = "remote_command"
 
 # Required even when other fields are missing. A TXT missing any of these
 # is malformed and should be dropped.
@@ -126,12 +145,18 @@ class HoloAnnouncer:
         ips: list[str] | None = None,
         caps_port: int | None = None,
         caps_token: str | None = None,
+        remote_command: str | None = None,
     ) -> None:
         self.session = session
         self.user = user or getpass.getuser()
         self.ssh_user = ssh_user
         self.port = port
         self.ips_override = ips
+        # Explicit override from `--announce-command "..."`. When None,
+        # build_properties() auto-populates from $TMUX / $STY env. The
+        # override is published verbatim — no shell wrapping, no
+        # quoting massage. Empty string is treated as None.
+        self.remote_command = remote_command or None
         # Both must be set together to be advertised — TXT carries them
         # only when the capabilities HTTP server is up. Validating the
         # pairing here keeps callers from publishing a port with no
@@ -198,6 +223,14 @@ class HoloAnnouncer:
 
         if self._tunnel_ports:
             put(FIELD_TUNNEL_PORTS, _encode_tunnel_ports(self._tunnel_ports))
+
+        # `remote_command` precedence:
+        #   1. explicit override from constructor / --announce-command
+        #   2. auto-detect from $TMUX / $STY (a multiplexer holo is
+        #      currently running inside)
+        #   3. omit the field; SPA falls back to legacy paths
+        cmd = self.remote_command or _default_remote_command()
+        put(FIELD_REMOTE_COMMAND, cmd)
 
         return props
 
@@ -375,6 +408,52 @@ def _tmux_field(spec: str) -> str | None:
     return out or None
 
 
+def _screen_session() -> str | None:
+    """Parse the screen session label out of $STY.
+
+    GNU screen sets ``STY`` to ``<pid>.<ttyname>.<hostname>`` for
+    children of an attached/detached screen. The conventional "session
+    name" the user types into ``screen -r`` is the part after the dot
+    (or the whole thing in older / unusual setups). Returns None when
+    not running inside screen.
+    """
+    sty = os.environ.get("STY")
+    if not sty:
+        return None
+    # `<pid>.<ttyname>.<hostname>` — `screen -r` matches by suffix or
+    # by the whole `<pid>.<rest>` form, so emit the whole post-dot tail.
+    if "." in sty:
+        return sty.split(".", 1)[1]
+    return sty
+
+
+def _default_remote_command() -> str | None:
+    """Build the auto-populated ``remote_command`` from environment.
+
+    Order: $TMUX wins (matches the existing ``tmux_session`` field),
+    then $STY, then None. Held to a "common case" floor — operators
+    with non-default needs (other multiplexers, login-shell wrappers,
+    custom REPLs) override via ``--announce-command "..."`` and we
+    publish their value verbatim.
+
+    Output:
+      - $TMUX set + tmux server reachable: ``tmux attach -t '<#S>'``
+        (single-quoted so session names with spaces survive)
+      - $STY set:                          ``screen -r <session>``
+      - else:                              None (field omitted)
+    """
+    if os.environ.get("TMUX"):
+        session = _tmux_field("#S")
+        if session:
+            # Single-quote the session name so spaces / wildcards in
+            # the name don't get re-interpreted by the remote shell.
+            return f"tmux attach -t '{session}'"
+    sty_session = _screen_session()
+    if sty_session:
+        return f"screen -r {sty_session}"
+    return None
+
+
 def _resolve_ip_overrides(entries: list[str]) -> list[str]:
     """Resolve a mixed override list of literal IPs and prefix filters.
 
@@ -534,6 +613,7 @@ __all__ = [
     "FIELD_TMUX_WINDOW",
     "FIELD_TUNNEL_PORT",
     "FIELD_TUNNEL_PORTS",
+    "FIELD_REMOTE_COMMAND",
     "FIELD_USER",
     "FIELD_V",
     "HoloAnnouncer",
