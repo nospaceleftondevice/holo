@@ -58,6 +58,7 @@ class HoloMCPServer:
         announce_ips: list[str] | None = None,
         announce_port: int = 0,
         announce_capabilities: bool = False,
+        announce_command: str | None = None,
         auto_tunnel: bool = False,
         auto_tunnel_backend: str | None = None,
     ) -> None:
@@ -110,6 +111,7 @@ class HoloMCPServer:
                     ips=announce_ips,
                     caps_port=caps_port,
                     caps_token=caps_token,
+                    remote_command=announce_command,
                 )
                 self._announcer.start()
             except Exception as e:  # noqa: BLE001 — surface and continue
@@ -967,6 +969,7 @@ def build_server(
     announce_ips: list[str] | None = None,
     announce_port: int = 0,
     announce_capabilities: bool = False,
+    announce_command: str | None = None,
     auto_tunnel: bool = False,
     auto_tunnel_backend: str | None = None,
 ) -> tuple[FastMCP, HoloMCPServer]:
@@ -997,6 +1000,7 @@ def build_server(
         announce_ips=announce_ips,
         announce_port=announce_port,
         announce_capabilities=announce_capabilities,
+        announce_command=announce_command,
         auto_tunnel=auto_tunnel,
         auto_tunnel_backend=auto_tunnel_backend,
     )
@@ -1440,6 +1444,7 @@ def run(
     announce_ssh_user: str | None = None,
     announce_ips: list[str] | None = None,
     announce_capabilities: bool = False,
+    announce_command: str | None = None,
     auto_tunnel: bool = False,
     auto_tunnel_backend: str | None = None,
 ) -> None:
@@ -1454,6 +1459,7 @@ def run(
         announce_ssh_user=announce_ssh_user,
         announce_ips=announce_ips,
         announce_capabilities=announce_capabilities,
+        announce_command=announce_command,
         auto_tunnel=auto_tunnel,
         auto_tunnel_backend=auto_tunnel_backend,
     )
@@ -1479,6 +1485,7 @@ def run_tcp(
     announce_ssh_user: str | None = None,
     announce_ips: list[str] | None = None,
     announce_capabilities: bool = False,
+    announce_command: str | None = None,
     auto_tunnel: bool = False,
     auto_tunnel_backend: str | None = None,
     stop_event: threading.Event | None = None,
@@ -1506,6 +1513,7 @@ def run_tcp(
         announce_ips=announce_ips,
         announce_port=port,
         announce_capabilities=announce_capabilities,
+        announce_command=announce_command,
         auto_tunnel=auto_tunnel,
         auto_tunnel_backend=auto_tunnel_backend,
     )
