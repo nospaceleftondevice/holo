@@ -227,7 +227,10 @@ class BlockRegistry:
     def _evict_expired(self) -> None:
         now = time.time()
         for k, e in list(self._table.items()):
-            if now - e.last_used > self._ttl_s:
+            # `>=' so a `ttl_s=0' (or near-zero) registry behaves
+            # as "always evict on access" deterministically across
+            # platforms with coarse-grained time.time().
+            if now - e.last_used >= self._ttl_s:
                 del self._table[k]
 
 
