@@ -10,7 +10,6 @@ matching test plan in docs/dispatch-protocol.md (tai repo).
 from __future__ import annotations
 
 import asyncio
-import json
 
 import pytest
 

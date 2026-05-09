@@ -475,7 +475,7 @@ def make_dispatch_endpoint(state: DispatchState, sessions_snapshot):
             result = await asyncio.wait_for(
                 fut, timeout=(timeout_ms / 1000.0) + 5.0
             )
-        except asyncio.TimeoutError:
+        except TimeoutError:
             return JSONResponse(
                 {"v": 1, "ok": False, "error": "timeout",
                  "agent_instance": agent_instance,
