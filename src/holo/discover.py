@@ -461,7 +461,8 @@ def run_serve(
     server = uvicorn.Server(config)
     print(
         f"holo discover: serving on http://{host}:{port} "
-        f"(routes: /sessions /cloudcities /local-cloudcity /healthz /events)",
+        f"(routes: /sessions /cloudcities /local-cloudcity /healthz "
+        f"/dispatch /dispatch/release /events /control)",
         file=sys.stderr,
         flush=True,
     )
@@ -528,6 +529,7 @@ def build_app(
     # don't pay the import cost — and so test_discover.py tests that
     # touch only the session paths don't need cloudcity_discover loaded.
     from holo import cloudcity_discover
+    from holo import dispatch as _dispatch
 
     origins = list(cors_origins) if cors_origins else list(DEFAULT_CORS_ORIGINS)
 
@@ -542,6 +544,7 @@ def build_app(
         "cc_browser": None,
         "cc_stop_event": threading.Event(),
         "cc_sweeper": None,
+        "dispatch": _dispatch.DispatchState(),
     }
 
     async def sessions_endpoint(request: Any) -> Any:
@@ -655,6 +658,18 @@ def build_app(
             if state["cc_zc"] is not None:
                 state["cc_zc"].close()
 
+    # tai dispatch routes — see docs/dispatch-protocol.md in the
+    # tai-shell/tai repo. Selector matching needs read-only access to
+    # the announce store; we pass a snapshot fn so dispatch.py never
+    # imports the discover internals.
+    dispatch_state = state["dispatch"]
+    sessions_snapshot = lambda: state["store"].snapshot()  # noqa: E731
+    control_ws = _dispatch.make_control_ws(dispatch_state, sessions_snapshot)
+    dispatch_endpoint = _dispatch.make_dispatch_endpoint(
+        dispatch_state, sessions_snapshot
+    )
+    release_endpoint = _dispatch.make_release_endpoint(dispatch_state)
+
     return Starlette(
         debug=False,
         routes=[
@@ -666,13 +681,20 @@ def build_app(
                 methods=["GET"],
             ),
             Route("/healthz", healthz_endpoint, methods=["GET"]),
+            Route("/dispatch", dispatch_endpoint, methods=["POST"]),
+            Route(
+                "/dispatch/release",
+                release_endpoint,
+                methods=["POST"],
+            ),
             WebSocketRoute("/events", events_ws),
+            WebSocketRoute("/control", control_ws),
         ],
         middleware=[
             Middleware(
                 CORSMiddleware,
                 allow_origins=origins,
-                allow_methods=["GET"],
+                allow_methods=["GET", "POST"],
                 allow_headers=["*"],
             ),
         ],
