@@ -61,7 +61,11 @@ _log = logging.getLogger(__name__)
 
 
 DEFAULT_SERVE_PORT = 7082
-DEFAULT_CORS_ORIGINS = ("http://localhost:8888", "https://app-dev.tai.sh")
+DEFAULT_CORS_ORIGINS = (
+    "http://localhost:8888",
+    "https://app-dev.tai.sh",
+    "https://tai.sh",
+)
 # Spec §2.5: drop sessions whose last_seen is older than 2× cache TTL.
 # zeroconf's default service TTL is ~75s, so 150s is the natural floor.
 DEFAULT_STALE_AFTER_S = 150.0
