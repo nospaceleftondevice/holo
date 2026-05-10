@@ -455,6 +455,7 @@ class TestCLIDiscover:
         # Sanity check: keep the dev-time defaults aligned with the brief.
         assert "http://localhost:8888" in DEFAULT_CORS_ORIGINS
         assert "https://app-dev.tai.sh" in DEFAULT_CORS_ORIGINS
+        assert "https://tai.sh" in DEFAULT_CORS_ORIGINS
 
 
 # ------------------------------------------------------------------ HTTP + WS
