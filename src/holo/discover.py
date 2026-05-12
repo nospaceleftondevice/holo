@@ -73,6 +73,18 @@ DEFAULT_STALE_AFTER_S = 150.0
 _STALE_SWEEP_INTERVAL_S = 15.0
 # How long --json waits for the browser to populate before printing.
 DEFAULT_JSON_WAIT_S = 3.0
+# How often --serve and DiscoverHandle tear down + recreate the
+# Zeroconf instance + ServiceBrowser to defend against silent browse
+# stalls (python-zeroconf has been observed to stop delivering
+# callbacks after long uptimes / interface flaps). The SessionStore
+# is preserved across the swap so /sessions stays continuous. Set to
+# 0 to disable.
+DEFAULT_REBROWSE_INTERVAL_S = 300.0
+# When /sessions or /cloudcities sees an empty store, kick a fresh
+# rebrowse and wait this long for callbacks to populate before
+# snapshotting. Sized to one zeroconf response round-trip on a
+# typical LAN; longer makes the first poll slow without much benefit.
+_EMPTY_CACHE_BROWSE_WAIT_S = 1.0
 
 
 # --------------------------------------------------------------------- parser
@@ -300,15 +312,19 @@ class HoloListener:
         self._store.upsert(session)
 
 
-def _start_browser() -> tuple[Any, Any, SessionStore]:
-    """Spin up a Zeroconf instance + ServiceBrowser bound to a fresh store.
+def _start_browser(
+    store: SessionStore | None = None,
+) -> tuple[Any, Any, SessionStore]:
+    """Spin up a Zeroconf instance + ServiceBrowser bound to a store.
 
-    Returns (zeroconf, browser, store). Callers are responsible for
-    calling `zeroconf.close()` to tear it all down.
+    Pass an existing ``store`` to preserve session state across a
+    rebrowse swap; omit it to allocate a fresh store. Callers are
+    responsible for calling ``zeroconf.close()`` to tear it all down.
     """
     from zeroconf import ServiceBrowser, Zeroconf
 
-    store = SessionStore()
+    if store is None:
+        store = SessionStore()
     zc = Zeroconf()
     listener = HoloListener(zc, store)
     browser = ServiceBrowser(zc, SERVICE_TYPE, listener=listener)
@@ -333,14 +349,19 @@ class DiscoverHandle:
     """
 
     def __init__(
-        self, *, stale_after_s: float = DEFAULT_STALE_AFTER_S
+        self,
+        *,
+        stale_after_s: float = DEFAULT_STALE_AFTER_S,
+        rebrowse_interval_s: float = DEFAULT_REBROWSE_INTERVAL_S,
     ) -> None:
         self._stale_after_s = stale_after_s
+        self._rebrowse_interval_s = rebrowse_interval_s
         self._zc: Any = None
         self._browser: Any = None
         self._store: SessionStore | None = None
         self._stop_event: threading.Event | None = None
         self._sweeper: threading.Thread | None = None
+        self._rebrowser: threading.Thread | None = None
         self._lock = threading.Lock()
 
     def start(self) -> None:
@@ -352,6 +373,10 @@ class DiscoverHandle:
             self._sweeper = _start_stale_sweeper(
                 self._store, self._stale_after_s, self._stop_event
             )
+            if self._rebrowse_interval_s > 0:
+                self._rebrowser = _start_rebrowse_thread(
+                    self, self._rebrowse_interval_s, self._stop_event
+                )
 
     def stop(self) -> None:
         # Snapshot under the lock so concurrent stop() calls don't
@@ -360,9 +385,11 @@ class DiscoverHandle:
         with self._lock:
             stop_event = self._stop_event
             sweeper = self._sweeper
+            rebrowser = self._rebrowser
             zc = self._zc
             self._stop_event = None
             self._sweeper = None
+            self._rebrowser = None
             self._zc = None
             self._browser = None
             self._store = None
@@ -370,11 +397,32 @@ class DiscoverHandle:
             stop_event.set()
         if sweeper is not None:
             sweeper.join(timeout=2.0)
+        if rebrowser is not None:
+            rebrowser.join(timeout=2.0)
         if zc is not None:
             try:
                 zc.close()
             except Exception:  # noqa: BLE001 — shutdown must not raise
                 _log.exception("DiscoverHandle: zeroconf close failed")
+
+    def _swap_browser(self) -> None:
+        """Swap to a fresh Zeroconf+ServiceBrowser, preserving the store.
+
+        Called by the periodic rebrowse thread. Caller is responsible
+        for serialization — we take ``self._lock`` here so a concurrent
+        ``stop()`` can't yank the store out from under us.
+        """
+        with self._lock:
+            if self._zc is None or self._store is None:
+                return  # stop() already torn us down
+            new_zc, new_browser, _ = _start_browser(store=self._store)
+            old_zc = self._zc
+            self._zc = new_zc
+            self._browser = new_browser
+        try:
+            old_zc.close()
+        except Exception:  # noqa: BLE001 — best-effort
+            _log.exception("DiscoverHandle: rebrowse close failed")
 
     @property
     def is_running(self) -> bool:
@@ -450,11 +498,16 @@ def run_serve(
     cors_origins: list[str] | None = None,
     stale_after_s: float = DEFAULT_STALE_AFTER_S,
     host: str = "127.0.0.1",
+    rebrowse_interval_s: float = DEFAULT_REBROWSE_INTERVAL_S,
 ) -> int:
     """`--serve` mode: localhost HTTP+WS service on `port`."""
     import uvicorn
 
-    app = build_app(cors_origins=cors_origins, stale_after_s=stale_after_s)
+    app = build_app(
+        cors_origins=cors_origins,
+        stale_after_s=stale_after_s,
+        rebrowse_interval_s=rebrowse_interval_s,
+    )
     config = uvicorn.Config(
         app,
         host=host,
@@ -475,6 +528,119 @@ def run_serve(
     except KeyboardInterrupt:
         pass
     return 0
+
+
+# -------------------------------------------------- rebrowse self-healing
+
+
+def _swap_browser_sync(
+    state: dict[str, Any],
+    *,
+    store_key: str,
+    zc_key: str,
+    browser_key: str,
+    start_fn: Callable[..., tuple[Any, Any, Any]],
+) -> None:
+    """Tear down the old Zeroconf+ServiceBrowser and start a fresh pair.
+
+    The existing store at ``state[store_key]`` is preserved across
+    the swap, so ``/sessions`` (or any other consumer) sees no gap.
+    Synchronous because python-zeroconf I/O is synchronous; callers
+    in async contexts must run this in a thread pool.
+    """
+    new_zc, new_browser, _ = start_fn(store=state[store_key])
+    old_zc = state[zc_key]
+    state[zc_key] = new_zc
+    state[browser_key] = new_browser
+    if old_zc is not None:
+        try:
+            old_zc.close()
+        except Exception:  # noqa: BLE001 — best-effort cleanup
+            _log.exception("rebrowse swap: failed to close old zeroconf")
+
+
+async def _rebrowse_loop(
+    state: dict[str, Any],
+    *,
+    interval_s: float,
+    stop_event: asyncio.Event,
+    store_key: str,
+    zc_key: str,
+    browser_key: str,
+    start_fn: Callable[..., tuple[Any, Any, Any]],
+) -> None:
+    """Periodically swap the Zeroconf browser bound to ``state[store_key]``.
+
+    No-op when ``interval_s <= 0``. Returns when ``stop_event`` is
+    set. Swap exceptions are logged and the loop continues — a
+    single bad swap shouldn't kill self-healing forever.
+    """
+    if interval_s <= 0:
+        await stop_event.wait()
+        return
+    loop = asyncio.get_running_loop()
+    while not stop_event.is_set():
+        try:
+            await asyncio.wait_for(stop_event.wait(), timeout=interval_s)
+            return  # stop fired during the wait
+        except asyncio.TimeoutError:
+            pass
+        try:
+            await loop.run_in_executor(
+                None,
+                lambda: _swap_browser_sync(
+                    state,
+                    store_key=store_key,
+                    zc_key=zc_key,
+                    browser_key=browser_key,
+                    start_fn=start_fn,
+                ),
+            )
+        except Exception:  # noqa: BLE001 — keep the loop alive
+            _log.exception("rebrowse loop: swap failed (continuing)")
+
+
+async def _ensure_populated(
+    state: dict[str, Any],
+    lock: asyncio.Lock,
+    *,
+    store_key: str,
+    zc_key: str,
+    browser_key: str,
+    start_fn: Callable[..., tuple[Any, Any, Any]],
+    wait_s: float = _EMPTY_CACHE_BROWSE_WAIT_S,
+) -> None:
+    """Empty-cache safety net: kick a rebrowse + brief wait when empty.
+
+    If ``state[store_key]`` is non-empty this returns immediately —
+    the periodic rebrowse keeps the store fresh on the happy path.
+    When the store is empty (e.g. between startup and the first
+    arriving announce, or after a silent browse stall the periodic
+    rebrowse hasn't reached yet) we swap to a fresh Zeroconf+browser
+    and wait ``wait_s`` for callbacks to populate before returning.
+    A single lock serializes concurrent callers so they share one
+    rebrowse rather than stampeding the zeroconf socket.
+    """
+    if state[store_key].snapshot():
+        return
+    async with lock:
+        if state[store_key].snapshot():
+            return  # another caller raced ahead and refreshed
+        loop = asyncio.get_running_loop()
+        try:
+            await loop.run_in_executor(
+                None,
+                lambda: _swap_browser_sync(
+                    state,
+                    store_key=store_key,
+                    zc_key=zc_key,
+                    browser_key=browser_key,
+                    start_fn=start_fn,
+                ),
+            )
+            await asyncio.sleep(wait_s)
+        except Exception:  # noqa: BLE001 — best-effort
+            _log.exception("empty-cache fallback: refresh failed")
 
 
 # ----------------------------------------------------------------- stale sweep
@@ -500,6 +666,36 @@ def _start_stale_sweeper(
     return t
 
 
+def _start_rebrowse_thread(
+    handle: DiscoverHandle,
+    interval_s: float,
+    stop_event: threading.Event,
+) -> threading.Thread:
+    """Launch a daemon thread that periodically rebrowses on a handle.
+
+    Sync analog of ``_rebrowse_loop`` for ``DiscoverHandle``. Same
+    rationale: python-zeroconf has been seen to silently stop
+    delivering callbacks after long uptimes, so we swap the browser
+    on a timer and keep the existing store.
+    """
+
+    def loop() -> None:
+        while not stop_event.is_set():
+            stop_event.wait(timeout=interval_s)
+            if stop_event.is_set():
+                return
+            try:
+                handle._swap_browser()
+            except Exception:  # noqa: BLE001 — keep the loop alive
+                _log.exception("DiscoverHandle rebrowse: swap failed")
+
+    t = threading.Thread(
+        target=loop, name="holo-discover-rebrowser", daemon=True
+    )
+    t.start()
+    return t
+
+
 # ------------------------------------------------------------------ HTTP+WS app
 
 
@@ -509,6 +705,7 @@ def build_app(
     cloudcity_store: Any = None,
     cors_origins: list[str] | None = None,
     stale_after_s: float = DEFAULT_STALE_AFTER_S,
+    rebrowse_interval_s: float = DEFAULT_REBROWSE_INTERVAL_S,
 ) -> Any:
     """Construct the Starlette ASGI app for `--serve`.
 
@@ -543,20 +740,42 @@ def build_app(
         "browser": None,
         "stop_event": threading.Event(),
         "sweeper": None,
+        "rebrowse_stop": None,  # asyncio.Event (created in lifespan)
+        "rebrowse_task": None,  # asyncio.Task
+        "rebrowse_lock": None,  # asyncio.Lock (created in lifespan)
         "cc_store": cloudcity_store,
         "cc_zc": None,
         "cc_browser": None,
         "cc_stop_event": threading.Event(),
         "cc_sweeper": None,
+        "cc_rebrowse_stop": None,
+        "cc_rebrowse_task": None,
+        "cc_rebrowse_lock": None,
         "dispatch": _dispatch.DispatchState(),
     }
 
     async def sessions_endpoint(request: Any) -> Any:
         del request
+        await _ensure_populated(
+            state,
+            state["rebrowse_lock"],
+            store_key="store",
+            zc_key="zc",
+            browser_key="browser",
+            start_fn=_start_browser,
+        )
         return JSONResponse(state["store"].snapshot())
 
     async def cloudcities_endpoint(request: Any) -> Any:
         del request
+        await _ensure_populated(
+            state,
+            state["cc_rebrowse_lock"],
+            store_key="cc_store",
+            zc_key="cc_zc",
+            browser_key="cc_browser",
+            start_fn=cloudcity_discover._start_browser,
+        )
         return JSONResponse(state["cc_store"].snapshot())
 
     async def local_cloudcity_endpoint(request: Any) -> Any:
@@ -648,9 +867,58 @@ def build_app(
             state["cc_sweeper"] = cloudcity_discover.start_stale_sweeper(
                 cc_store_, stale_after_s, state["cc_stop_event"]
             )
+
+        # Self-healing rebrowse: periodically swap each Zeroconf
+        # browser bound to a stable store. asyncio.Event/Lock must be
+        # created inside the running loop, not at module import time.
+        state["rebrowse_lock"] = asyncio.Lock()
+        state["cc_rebrowse_lock"] = asyncio.Lock()
+        state["rebrowse_stop"] = asyncio.Event()
+        state["cc_rebrowse_stop"] = asyncio.Event()
+        state["rebrowse_task"] = asyncio.create_task(
+            _rebrowse_loop(
+                state,
+                interval_s=rebrowse_interval_s,
+                stop_event=state["rebrowse_stop"],
+                store_key="store",
+                zc_key="zc",
+                browser_key="browser",
+                start_fn=_start_browser,
+            ),
+            name="holo-discover-rebrowse",
+        )
+        state["cc_rebrowse_task"] = asyncio.create_task(
+            _rebrowse_loop(
+                state,
+                interval_s=rebrowse_interval_s,
+                stop_event=state["cc_rebrowse_stop"],
+                store_key="cc_store",
+                zc_key="cc_zc",
+                browser_key="cc_browser",
+                start_fn=cloudcity_discover._start_browser,
+            ),
+            name="holo-discover-cc-rebrowse",
+        )
+
         try:
             yield
         finally:
+            # Stop async rebrowse tasks first (they may be inside a
+            # run_in_executor swap; let them finish before we close
+            # zc handles out from under them).
+            for stop_key, task_key in (
+                ("rebrowse_stop", "rebrowse_task"),
+                ("cc_rebrowse_stop", "cc_rebrowse_task"),
+            ):
+                stop = state.get(stop_key)
+                task = state.get(task_key)
+                if stop is not None:
+                    stop.set()
+                if task is not None:
+                    try:
+                        await asyncio.wait_for(task, timeout=3.0)
+                    except (asyncio.TimeoutError, Exception):  # noqa: BLE001
+                        task.cancel()
             state["stop_event"].set()
             state["cc_stop_event"].set()
             if state["sweeper"] is not None:
