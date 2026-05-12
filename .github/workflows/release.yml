@@ -267,6 +267,20 @@ jobs:
           HOLO_TARGET_ARCH: ${{ matrix.python == 'universal2' && 'universal2' || '' }}
         run: pyinstaller --clean holo.spec
 
+      # PyInstaller emits an adhoc-signed Mach-O on macOS, but the
+      # signature embedded during the universal2 fuse occasionally
+      # passes `codesign --verify` while still being rejected by the
+      # kernel at load time on user machines (`load code signature
+      # error 2` / EBADEXEC, process SIGKILL'd before any code runs).
+      # Restamping with a fresh adhoc signature here rewrites the
+      # LC_CODE_SIGNATURE load command with correct offsets and dodges
+      # the issue without requiring a Developer ID cert.
+      - name: Re-sign binary (macOS adhoc)
+        if: runner.os == 'macOS'
+        run: |
+          codesign --force --deep --sign - dist/holo
+          codesign --verify --deep --strict --verbose=2 dist/holo
+
       - name: Stage artifact (Unix)
         if: runner.os != 'Windows'
         run: |

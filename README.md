@@ -55,6 +55,17 @@ ASSET=holo-macos-universal2   # or holo-linux-x86_64
 curl -L -o /usr/local/bin/holo \
   "https://github.com/nospaceleftondevice/holo/releases/download/${TAG}/${ASSET}"
 chmod +x /usr/local/bin/holo
+
+# macOS only: re-sign locally. The release artifact is adhoc-signed by
+# PyInstaller, but the kernel sometimes rejects the embedded signature
+# at load time with `load code signature error 2` (EBADEXEC) — the
+# process is SIGKILL'd before any of holo's code runs (`zsh: killed
+# holo …`, exit 137). Re-stamping the binary with a fresh local adhoc
+# signature is the documented workaround. No-op on Linux.
+if [ "$(uname)" = "Darwin" ]; then
+  codesign --force --deep --sign - /usr/local/bin/holo
+fi
+
 holo --version
 ```
 
