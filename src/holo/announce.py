@@ -437,8 +437,11 @@ def _default_remote_command() -> str | None:
     publish their value verbatim.
 
     Output:
-      - $TMUX set + tmux server reachable: ``tmux attach -t '<#S>'``
-        (single-quoted so session names with spaces survive)
+      - $TMUX set + tmux server reachable: ``tmux -u attach -t '<#S>'``
+        (single-quoted so session names with spaces survive; ``-u``
+        forces tmux's UTF-8 mode for the attaching client so droids
+        opened from a browser xterm render chevrons + block art
+        correctly instead of falling back to ``__`` ASCII downgrades)
       - $STY set:                          ``screen -r <session>``
       - else:                              None (field omitted)
     """
@@ -447,7 +450,9 @@ def _default_remote_command() -> str | None:
         if session:
             # Single-quote the session name so spaces / wildcards in
             # the name don't get re-interpreted by the remote shell.
-            return f"tmux attach -t '{session}'"
+            # `-u' forces UTF-8 mode regardless of the attaching
+            # client's locale detection — see docstring above.
+            return f"tmux -u attach -t '{session}'"
     sty_session = _screen_session()
     if sty_session:
         return f"screen -r {sty_session}"
