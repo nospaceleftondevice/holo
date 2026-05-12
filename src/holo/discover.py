@@ -583,7 +583,7 @@ async def _rebrowse_loop(
         try:
             await asyncio.wait_for(stop_event.wait(), timeout=interval_s)
             return  # stop fired during the wait
-        except asyncio.TimeoutError:
+        except TimeoutError:
             pass
         try:
             await loop.run_in_executor(
@@ -917,7 +917,7 @@ def build_app(
                 if task is not None:
                     try:
                         await asyncio.wait_for(task, timeout=3.0)
-                    except (asyncio.TimeoutError, Exception):  # noqa: BLE001
+                    except Exception:  # noqa: BLE001 — timeout or task error, cancel either way
                         task.cancel()
             state["stop_event"].set()
             state["cc_stop_event"].set()
