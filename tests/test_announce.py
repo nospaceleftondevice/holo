@@ -700,7 +700,10 @@ class TestRemoteCommand:
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """When $TMUX is set, default `remote_command` is
-        `tmux attach -t '<tmux #S>'`."""
+        `tmux -u attach -t '<tmux #S>'`. ``-u`` forces UTF-8 mode for
+        the attaching client (browser xterms can't always advertise
+        UTF-8 via locale detection, and without it tmux downgrades
+        chevrons / Unicode block art to ``__`` ASCII fallbacks)."""
         from holo.announce import FIELD_REMOTE_COMMAND
 
         monkeypatch.setenv("TMUX", "/tmp/tmux-1000/default,1234,0")
@@ -710,7 +713,7 @@ class TestRemoteCommand:
             props = a.build_properties()
         assert (
             props[FIELD_REMOTE_COMMAND.encode()]
-            == b"tmux attach -t 'my-sess'"
+            == b"tmux -u attach -t 'my-sess'"
         )
 
     def test_screen_env_auto_detect(
@@ -760,7 +763,7 @@ class TestRemoteCommand:
             props = a.build_properties()
         assert (
             props[FIELD_REMOTE_COMMAND.encode()]
-            == b"tmux attach -t 'from-tmux'"
+            == b"tmux -u attach -t 'from-tmux'"
         )
 
     def test_tmux_session_with_special_chars_single_quoted(
@@ -778,7 +781,7 @@ class TestRemoteCommand:
             props = a.build_properties()
         assert (
             props[FIELD_REMOTE_COMMAND.encode()]
-            == b"tmux attach -t 'claude session'"
+            == b"tmux -u attach -t 'claude session'"
         )
 
 
