@@ -272,14 +272,19 @@ class CloudCityListener:
         self._store.upsert(record)
 
 
-def _start_browser() -> tuple[Any, Any, CloudCityStore]:
-    """Spin up a Zeroconf browser bound to a fresh CloudCityStore.
+def _start_browser(
+    store: CloudCityStore | None = None,
+) -> tuple[Any, Any, CloudCityStore]:
+    """Spin up a Zeroconf browser bound to a CloudCityStore.
 
-    Caller owns ``zc.close()``.
+    Pass an existing ``store`` to preserve state across a rebrowse
+    swap (see ``holo.discover`` for the swap pattern); omit to
+    allocate a fresh store. Caller owns ``zc.close()``.
     """
     from zeroconf import ServiceBrowser, Zeroconf
 
-    store = CloudCityStore()
+    if store is None:
+        store = CloudCityStore()
     zc = Zeroconf()
     listener = CloudCityListener(zc, store)
     browser = ServiceBrowser(zc, SERVICE_TYPE, listener=listener)

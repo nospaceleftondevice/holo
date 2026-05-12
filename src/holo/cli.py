@@ -603,12 +603,17 @@ def _cmd_install_bookmarklet(rest: list[str]) -> int:
 
 _DISCOVER_USAGE = (
     "usage: holo discover [--json | --tail | --serve PORT] [options]\n"
-    "  --json              one-shot snapshot, JSON array, exit\n"
-    "  --tail              long-running JSONL event stream\n"
-    "  --serve PORT        HTTP+WebSocket server (default 7082)\n"
-    "  --wait SECS         --json browse window (default 3.0)\n"
-    "  --stale-after SECS  drop sessions older than this (default 150)\n"
-    "  --cors-origin O     comma-separated CORS allow-list "
+    "  --json                  one-shot snapshot, JSON array, exit\n"
+    "  --tail                  long-running JSONL event stream\n"
+    "  --serve PORT            HTTP+WebSocket server (default 7082)\n"
+    "  --wait SECS             --json browse window (default 3.0)\n"
+    "  --stale-after SECS      drop sessions older than this (default 150)\n"
+    "  --rebrowse-interval S   --serve: rebuild the zeroconf browser every\n"
+    "                          S seconds (default 300, 0 disables). Store\n"
+    "                          is preserved across the swap so /sessions\n"
+    "                          stays continuous; defends against silent\n"
+    "                          browse stalls.\n"
+    "  --cors-origin O         comma-separated CORS allow-list "
     "(default: http://localhost:8888,https://app-dev.tai.sh)"
 )
 
@@ -685,6 +690,29 @@ def _cmd_discover(rest: list[str]) -> int:
             )
             return 2
 
+    rebrowse_raw = _value_flag(rest, "--rebrowse-interval")
+    if rebrowse_raw is _MISSING_ARG:
+        sys.stderr.write(
+            "holo discover: --rebrowse-interval requires a value\n"
+        )
+        return 2
+    rebrowse_interval_s = discover.DEFAULT_REBROWSE_INTERVAL_S
+    if isinstance(rebrowse_raw, str):
+        try:
+            rebrowse_interval_s = float(rebrowse_raw)
+        except ValueError:
+            sys.stderr.write(
+                f"holo discover: invalid --rebrowse-interval value "
+                f"{rebrowse_raw!r}\n"
+            )
+            return 2
+        if rebrowse_interval_s < 0:
+            sys.stderr.write(
+                "holo discover: --rebrowse-interval must be >= 0 "
+                "(0 disables)\n"
+            )
+            return 2
+
     if json_mode:
         return discover.run_oneshot(wait_s=wait_s)
     if tail_mode:
@@ -705,6 +733,7 @@ def _cmd_discover(rest: list[str]) -> int:
         port=port,
         cors_origins=cors_origins,
         stale_after_s=stale_after_s,
+        rebrowse_interval_s=rebrowse_interval_s,
     )
 
 

@@ -36,6 +36,7 @@ from holo.cloudcity_discover import CloudCityStore
 from holo.discover import (
     DEFAULT_CORS_ORIGINS,
     DEFAULT_JSON_WAIT_S,
+    DEFAULT_REBROWSE_INTERVAL_S,
     DEFAULT_SERVE_PORT,
     DEFAULT_STALE_AFTER_S,
     HoloListener,
@@ -445,6 +446,7 @@ class TestCLIDiscover:
             port=9000,
             cors_origins=["https://a.test", "https://b.test"],
             stale_after_s=DEFAULT_STALE_AFTER_S,
+            rebrowse_interval_s=DEFAULT_REBROWSE_INTERVAL_S,
         )
 
     def test_default_serve_port_is_7082(self) -> None:
@@ -678,3 +680,301 @@ class TestDiscoverHandle:
 
         assert zc.close_called is True
         assert captured["stop_event"].is_set()
+
+
+# ============================================================================
+# Self-healing rebrowse — periodic swap + empty-cache fallback
+# ============================================================================
+
+
+class TestSwapBrowserSync:
+    """The sync swap helper: tear down the old zc, install a fresh one,
+    keep the existing store across the swap so /sessions stays continuous."""
+
+    def _stub_zc(self) -> object:
+        class _Z:
+            def __init__(self) -> None:
+                self.close_called = False
+                self.close_should_raise = False
+
+            def close(self) -> None:
+                self.close_called = True
+                if self.close_should_raise:
+                    raise RuntimeError("simulated close failure")
+
+        return _Z()
+
+    def test_preserves_store_across_swap(self) -> None:
+        from holo.discover import SessionStore, _swap_browser_sync
+
+        store = SessionStore()
+        old_zc = self._stub_zc()
+        new_zc = self._stub_zc()
+        captured_store: dict[str, Any] = {}
+
+        def fake_start(store=None):  # noqa: ANN001
+            captured_store["arg"] = store
+            return (new_zc, "new-browser", store)
+
+        state: dict[str, Any] = {
+            "store": store,
+            "zc": old_zc,
+            "browser": "old-browser",
+        }
+        _swap_browser_sync(
+            state,
+            store_key="store",
+            zc_key="zc",
+            browser_key="browser",
+            start_fn=fake_start,
+        )
+
+        # The same store instance went into the new browser.
+        assert captured_store["arg"] is store
+        # State holds the new pair, old zc was closed.
+        assert state["zc"] is new_zc
+        assert state["browser"] == "new-browser"
+        assert old_zc.close_called is True
+
+    def test_close_failure_does_not_raise(self) -> None:
+        # If the old zc throws on close, the swap must still complete
+        # — otherwise a single bad close kills self-healing forever.
+        from holo.discover import SessionStore, _swap_browser_sync
+
+        store = SessionStore()
+        old_zc = self._stub_zc()
+        old_zc.close_should_raise = True
+        new_zc = self._stub_zc()
+
+        def fake_start(store=None):  # noqa: ANN001
+            return (new_zc, "new-browser", store)
+
+        state: dict[str, Any] = {
+            "store": store,
+            "zc": old_zc,
+            "browser": "old-browser",
+        }
+        _swap_browser_sync(  # must not raise
+            state,
+            store_key="store",
+            zc_key="zc",
+            browser_key="browser",
+            start_fn=fake_start,
+        )
+        assert state["zc"] is new_zc
+
+
+class TestRebrowseLoopAsync:
+    """The asyncio rebrowse loop used by build_app lifespan."""
+
+    def test_zero_interval_blocks_until_stop_no_swap(self) -> None:
+        import asyncio
+
+        from holo.discover import _rebrowse_loop
+
+        call_count = {"n": 0}
+
+        def fake_start(store=None):  # noqa: ANN001
+            call_count["n"] += 1
+            return (object(), object(), store)
+
+        async def go() -> None:
+            stop = asyncio.Event()
+            state: dict[str, Any] = {"store": object(), "zc": None, "browser": None}
+            task = asyncio.create_task(
+                _rebrowse_loop(
+                    state,
+                    interval_s=0,
+                    stop_event=stop,
+                    store_key="store",
+                    zc_key="zc",
+                    browser_key="browser",
+                    start_fn=fake_start,
+                )
+            )
+            # Give the loop a moment, then stop. No swap should fire.
+            await asyncio.sleep(0.05)
+            stop.set()
+            await asyncio.wait_for(task, timeout=1.0)
+
+        asyncio.run(go())
+        assert call_count["n"] == 0
+
+    def test_fires_one_swap_per_interval(self) -> None:
+        import asyncio
+
+        from holo.discover import SessionStore, _rebrowse_loop
+
+        store = SessionStore()
+        swap_count = {"n": 0}
+
+        def fake_start(store=None):  # noqa: ANN001
+            swap_count["n"] += 1
+
+            class _Z:
+                def close(self) -> None:
+                    pass
+
+            return (_Z(), object(), store)
+
+        async def go() -> None:
+            stop = asyncio.Event()
+            state: dict[str, Any] = {
+                "store": store,
+                "zc": None,
+                "browser": None,
+            }
+            task = asyncio.create_task(
+                _rebrowse_loop(
+                    state,
+                    interval_s=0.05,  # 50ms — fast for the test
+                    stop_event=stop,
+                    store_key="store",
+                    zc_key="zc",
+                    browser_key="browser",
+                    start_fn=fake_start,
+                )
+            )
+            await asyncio.sleep(0.18)  # ≈ 3 intervals
+            stop.set()
+            await asyncio.wait_for(task, timeout=1.0)
+
+        asyncio.run(go())
+        # 3 ± 1 swaps. Exact count is timing-dependent; require ≥ 2 so
+        # the test fails closed if the loop never runs.
+        assert swap_count["n"] >= 2
+
+
+class TestEnsurePopulated:
+    """Empty-cache safety net: kick a rebrowse + brief wait when empty."""
+
+    def test_no_op_when_store_non_empty(self) -> None:
+        import asyncio
+
+        from holo.discover import SessionStore, _ensure_populated
+
+        store = SessionStore()
+        s = parse_txt(_txt(), "holo-x")
+        assert s is not None
+        store.upsert(s)
+
+        called = {"n": 0}
+
+        def fake_start(store=None):  # noqa: ANN001
+            called["n"] += 1
+            return (object(), object(), store)
+
+        async def go() -> None:
+            state: dict[str, Any] = {"store": store, "zc": None, "browser": None}
+            await _ensure_populated(
+                state,
+                asyncio.Lock(),
+                store_key="store",
+                zc_key="zc",
+                browser_key="browser",
+                start_fn=fake_start,
+                wait_s=0.0,
+            )
+
+        asyncio.run(go())
+        assert called["n"] == 0
+
+    def test_swaps_when_store_empty(self) -> None:
+        import asyncio
+
+        from holo.discover import SessionStore, _ensure_populated
+
+        store = SessionStore()
+        new_zc = type(
+            "_Z", (), {"close": lambda self: None}
+        )()
+
+        def fake_start(store=None):  # noqa: ANN001
+            # Simulate a record arriving via the new browser's listener.
+            s = parse_txt(_txt(session="post-rebrowse"), "holo-post")
+            assert s is not None
+            store.upsert(s)
+            return (new_zc, object(), store)
+
+        async def go() -> None:
+            state: dict[str, Any] = {"store": store, "zc": None, "browser": None}
+            await _ensure_populated(
+                state,
+                asyncio.Lock(),
+                store_key="store",
+                zc_key="zc",
+                browser_key="browser",
+                start_fn=fake_start,
+                wait_s=0.0,
+            )
+
+        asyncio.run(go())
+        snap = store.snapshot()
+        assert len(snap) == 1
+        assert snap[0]["instance"] == "holo-post"
+
+
+class TestDiscoverHandleRebrowse:
+    """DiscoverHandle: periodic swap via daemon thread."""
+
+    def _stub_zc(self) -> object:
+        class _Z:
+            def __init__(self) -> None:
+                self.close_called = False
+
+            def close(self) -> None:
+                self.close_called = True
+
+        return _Z()
+
+    def test_zero_interval_starts_no_rebrowse_thread(self) -> None:
+        from unittest.mock import patch
+
+        from holo.discover import DiscoverHandle, SessionStore
+
+        store = SessionStore()
+        zc = self._stub_zc()
+        with patch(
+            "holo.discover._start_browser",
+            return_value=(zc, None, store),
+        ):
+            h = DiscoverHandle(rebrowse_interval_s=0)
+            h.start()
+            try:
+                assert h._rebrowser is None
+            finally:
+                h.stop()
+
+    def test_swap_browser_preserves_store(self) -> None:
+        from unittest.mock import patch
+
+        from holo.discover import DiscoverHandle, SessionStore
+
+        zc1 = self._stub_zc()
+        zc2 = self._stub_zc()
+        zcs = [zc1, zc2]
+        passed_stores: list[Any] = []
+
+        def fake_start(store=None):  # noqa: ANN001
+            passed_stores.append(store)
+            # First call: handle.start() — no store yet, allocate one.
+            # Subsequent call: handle._swap_browser() — reuse passed store.
+            actual_store = store if store is not None else SessionStore()
+            return (zcs.pop(0), None, actual_store)
+
+        with patch(
+            "holo.discover._start_browser", side_effect=fake_start
+        ):
+            h = DiscoverHandle(rebrowse_interval_s=0)  # disable thread
+            h.start()
+            initial_store = h._store
+            h._swap_browser()
+
+            # Swap passed the existing store to _start_browser, kept it
+            # on the handle, and closed the old zc.
+            assert passed_stores[0] is None  # initial start
+            assert passed_stores[1] is initial_store  # swap reuses
+            assert h._store is initial_store
+            assert h._zc is zc2
+            assert zc1.close_called is True
+            h.stop()
