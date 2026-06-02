@@ -26,6 +26,10 @@ def test_ide_runs_java_as_subprocess(monkeypatch, tmp_path):
     as a CHILD subprocess (not exec) so macOS TCC attributes the IDE's
     mouse / keyboard simulation back to the parent `holo` process,
     inheriting the user's existing Accessibility grant.
+
+    The TCC-correctness invariant we guard:
+      - subprocess.run is called with `[java, "-jar", jar]`
+      - `cli` module must NOT import `os` (would re-enable execvp path)
     """
     jar = tmp_path / "sikulixide-2.0.5.jar"
     jar.write_bytes(b"fake jar")
@@ -47,12 +51,14 @@ def test_ide_runs_java_as_subprocess(monkeypatch, tmp_path):
 
     monkeypatch.setattr(cli.subprocess, "run", fake_run)
 
-    # os.execvp must NOT be called — that would replace holo's TCC
-    # identity with java and silently lose the Accessibility grant.
-    def must_not_exec(*a, **kw):
-        raise AssertionError("os.execvp must not be called from holo ide")
-
-    monkeypatch.setattr(cli.os, "execvp", must_not_exec)
+    # Regression guard: if someone re-introduces `os.execvp` here, they
+    # have to re-add `import os` first — fail the test on `import os`
+    # alone so we catch the regression on review, not in production.
+    assert not hasattr(cli, "os"), (
+        "`os` must not be imported in holo.cli — re-adding it implies "
+        "someone may have brought back the execvp path, which silently "
+        "breaks macOS TCC inheritance for `holo ide`."
+    )
 
     rc = cli._cmd_ide()
     assert rc == 0
