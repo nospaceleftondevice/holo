@@ -93,9 +93,28 @@ def _prompt_tmux_command() -> str | None:
     return None
 
 
-def _build_args(*, announce_ip: str | None, announce_command: str | None) -> list[str]:
+def _prompt_enable_screen() -> bool:
+    """Ask whether to enable SikuliX-backed screen / template / app_activate
+    tools. Default no — the JVM cost and 128 MB jar download aren't worth
+    paying for agents that only do browser / capability routing."""
+    print("Enable --screen tools? (screen capture, template matching, app_activate)")
+    print("  Requires OpenJDK 11+ and downloads the SikuliX jar (~128 MB)")
+    print("  on first use; pre-warm with `holo install-screen`.")
+    ans = input("Enable --screen? [y/N]: ").strip().lower()
+    return ans in ("y", "yes")
+
+
+def _build_args(
+    *,
+    enable_screen: bool,
+    announce_ip: str | None,
+    announce_command: str | None,
+) -> list[str]:
     """Compose the `holo mcp ...` arg list for the generated config."""
-    args = ["mcp", "--no-bookmarklet", "--announce"]
+    args = ["mcp", "--no-bookmarklet"]
+    if enable_screen:
+        args.append("--screen")
+    args.append("--announce")
     if announce_ip:
         args += ["--announce-ip", announce_ip]
     if announce_command:
@@ -145,6 +164,9 @@ def run(cli: str, *, force: bool = False, cwd: Path | None = None) -> int:
     print(f"holo init {cli} — will write {target}")
     print()
 
+    enable_screen = _prompt_enable_screen()
+    print()
+
     try:
         ips = _enumerate_ips()
     except Exception as e:  # noqa: BLE001 — enumeration is best-effort
@@ -154,7 +176,11 @@ def run(cli: str, *, force: bool = False, cwd: Path | None = None) -> int:
     announce_ip = _prompt_announce_ip(ips)
     announce_command = _prompt_tmux_command()
 
-    args = _build_args(announce_ip=announce_ip, announce_command=announce_command)
+    args = _build_args(
+        enable_screen=enable_screen,
+        announce_ip=announce_ip,
+        announce_command=announce_command,
+    )
     _write_claude_config(target, args)
 
     print()
