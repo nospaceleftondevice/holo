@@ -1361,6 +1361,8 @@ Commands:
   screen <verb>           smoke-test the SikuliX-backed screen tools directly
   install-screen          pre-download the SikuliX jar into the user cache
   install-bookmarklet     download the bookmarklet page and open it
+  upgrade                 check GitHub for a newer release and install it
+                          in place at this binary's current path
 
 Options:
   -h, --help              show this help and exit
@@ -1392,10 +1394,27 @@ def _value_flag(rest: list[str], flag: str) -> str | None | object:
     return value
 
 
+def _print_update_notice_if_any() -> None:
+    """Append a one-line `Update available: …` notice after the help
+    screen when a newer release is on GitHub. Silent on cache miss,
+    network failure, or dev install — the help command must always
+    succeed.
+    """
+    try:
+        from holo import upgrade
+        latest = upgrade.check_for_update(timeout=1.0)
+    except Exception:  # noqa: BLE001 - help must never fail
+        return
+    if latest:
+        print()
+        print(f"Update available: {latest} — run `holo upgrade`")
+
+
 def main(argv: list[str] | None = None) -> int:
     args = argv if argv is not None else sys.argv[1:]
     if not args:
         _print_help()
+        _print_update_notice_if_any()
         return 0
     cmd = args[0]
     rest = args[1:]
@@ -1546,6 +1565,9 @@ def main(argv: list[str] | None = None) -> int:
         return _cmd_cert(rest)
     if cmd == "tunnel":
         return _cmd_tunnel(rest)
+    if cmd == "upgrade":
+        from holo import upgrade as upgrade_mod
+        return upgrade_mod.run_upgrade(force="--force" in rest)
     if cmd in COMMANDS:
         return COMMANDS[cmd]()
     print(
