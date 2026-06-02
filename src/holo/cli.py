@@ -16,7 +16,6 @@ Subcommands:
 
 from __future__ import annotations
 
-import os
 import subprocess
 import sys
 import time
@@ -585,11 +584,14 @@ def _cmd_ide() -> int:
     """Launch the SikuliX IDE (`java -jar sikulixide-*.jar`).
 
     Downloads the jar on first use (same path as `holo install-screen`)
-    so this is one self-contained command. On POSIX we `os.execvp` into
-    java — holo's process is replaced by the JVM, the IDE owns the
-    terminal session, and there's no orphan parent process hanging
-    around. On Windows we fall back to `subprocess.run` since exec
-    semantics differ.
+    so this is one self-contained command. Spawns the JVM as a child
+    subprocess of holo (NOT exec'd in-place): macOS TCC attributes
+    Accessibility / Screen-Recording / Input-Monitoring permission
+    checks to the responsible parent process, so the Accessibility
+    grant the user has already given to the `holo` binary covers the
+    SikuliX IDE too. `os.execvp` would replace holo's identity with
+    `java` and silently lose all permissions — the IDE window would
+    still appear but mouse / keyboard simulation would not work.
     """
     import shutil
 
@@ -634,9 +636,7 @@ def _cmd_ide() -> int:
         print()  # finish the progress line
 
     argv = [java, "-jar", str(jar_path)]
-    if sys.platform == "win32":
-        return subprocess.run(argv).returncode
-    os.execvp(java, argv)
+    return subprocess.run(argv).returncode
 
 
 def _cmd_install_bookmarklet(rest: list[str]) -> int:

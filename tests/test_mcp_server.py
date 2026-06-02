@@ -407,6 +407,7 @@ class TestShutdownAndBuild:
                 "holo_fetch_capabilities",
                 "holo_tunnel_up",
                 "holo_tunnel_down",
+                "holo_launch_ide",
             }
         finally:
             holo.shutdown()
@@ -473,6 +474,186 @@ class TestShutdownAndBuild:
                 d.calibrate(timeout=0.1)
         finally:
             d.shutdown()
+
+
+class TestHoloLaunchIDE:
+    """`holo_launch_ide` spawns the SikuliX IDE as a CHILD of the MCP
+    server so macOS Accessibility / Screen-Recording grants on the
+    `holo` binary cover the IDE. Tests mock subprocess.Popen + the jar
+    resolver so no JVM actually starts."""
+
+    def _patch_launch_path(self, monkeypatch, *, java="/opt/homebrew/bin/java", jar_path=None):
+        import shutil
+
+        from holo import bridge
+
+        if jar_path is None:
+            jar_path = "/cache/sikulixide-2.0.5.jar"
+        monkeypatch.setattr(shutil, "which", lambda binary: java if binary == "java" else None)
+        monkeypatch.setattr(bridge, "ensure_jar", lambda **kw: jar_path)
+
+    def test_happy_path_returns_pid_jar_java(self, monkeypatch):
+        self._patch_launch_path(monkeypatch)
+
+        captured = {}
+
+        class FakeProc:
+            pid = 12345
+
+            def __init__(self, argv, *a, **kw):
+                captured["argv"] = list(argv)
+                captured["kwargs"] = kw
+
+            def poll(self):
+                return None
+
+        import subprocess as _sub
+        monkeypatch.setattr(_sub, "Popen", FakeProc)
+
+        server = HoloMCPServer()
+        try:
+            out = server.holo_launch_ide()
+            assert out == {
+                "pid": 12345,
+                "jar": "/cache/sikulixide-2.0.5.jar",
+                "java": "/opt/homebrew/bin/java",
+                "already_running": False,
+            }
+            # CRITICAL: no start_new_session=True — that would force
+            # macOS to re-evaluate TCC against `java` and break the
+            # parent-process inheritance the user expects.
+            assert "start_new_session" not in captured["kwargs"]
+            assert captured["argv"] == [
+                "/opt/homebrew/bin/java", "-jar", "/cache/sikulixide-2.0.5.jar",
+            ]
+        finally:
+            server.shutdown()
+
+    def test_second_call_returns_already_running(self, monkeypatch):
+        self._patch_launch_path(monkeypatch)
+
+        call_count = {"n": 0}
+
+        class FakeProc:
+            pid = 99
+
+            def __init__(self, *a, **kw):
+                call_count["n"] += 1
+
+            def poll(self):
+                return None  # still alive
+
+        import subprocess as _sub
+        monkeypatch.setattr(_sub, "Popen", FakeProc)
+
+        server = HoloMCPServer()
+        try:
+            first = server.holo_launch_ide()
+            second = server.holo_launch_ide()
+            assert first["already_running"] is False
+            assert second["already_running"] is True
+            assert second["pid"] == first["pid"]
+            assert call_count["n"] == 1  # only spawned once
+        finally:
+            server.shutdown()
+
+    def test_relaunch_after_ide_died(self, monkeypatch):
+        """If the user closed the IDE between calls, the next call
+        should spawn a fresh JVM instead of returning a stale PID."""
+        self._patch_launch_path(monkeypatch)
+
+        alive = {"value": True}
+        spawn_count = {"n": 0}
+
+        class FakeProc:
+            def __init__(self, *a, **kw):
+                spawn_count["n"] += 1
+                self.pid = 1000 + spawn_count["n"]
+
+            def poll(self):
+                return None if alive["value"] else 0
+
+        import subprocess as _sub
+        monkeypatch.setattr(_sub, "Popen", FakeProc)
+
+        server = HoloMCPServer()
+        try:
+            first = server.holo_launch_ide()
+            alive["value"] = False  # simulate IDE quit
+            second = server.holo_launch_ide()
+            assert first["pid"] == 1001
+            assert second["pid"] == 1002
+            assert second["already_running"] is False
+            assert spawn_count["n"] == 2
+        finally:
+            server.shutdown()
+
+    def test_raises_when_java_missing(self, monkeypatch):
+        import shutil
+        monkeypatch.setattr(shutil, "which", lambda _: None)
+
+        server = HoloMCPServer()
+        try:
+            with pytest.raises(RuntimeError, match="`java` not on PATH"):
+                server.holo_launch_ide()
+        finally:
+            server.shutdown()
+
+    def test_raises_on_bridge_error(self, monkeypatch):
+        import shutil
+
+        from holo import bridge
+        monkeypatch.setattr(shutil, "which", lambda _: "/opt/homebrew/bin/java")
+
+        def boom(**kw):
+            raise bridge.BridgeMissingError("jar fetch blocked")
+
+        monkeypatch.setattr(bridge, "ensure_jar", boom)
+
+        server = HoloMCPServer()
+        try:
+            with pytest.raises(RuntimeError, match="jar fetch blocked"):
+                server.holo_launch_ide()
+        finally:
+            server.shutdown()
+
+    def test_shutdown_terminates_running_ide(self, monkeypatch):
+        self._patch_launch_path(monkeypatch)
+
+        events = []
+
+        class FakeProc:
+            pid = 7777
+            _alive = True
+
+            def __init__(self, *a, **kw):
+                pass
+
+            def poll(self):
+                return None if self._alive else 0
+
+            def terminate(self):
+                events.append("terminate")
+                self._alive = False
+
+            def wait(self, timeout=None):
+                events.append(("wait", timeout))
+                return 0
+
+            def kill(self):
+                events.append("kill")
+
+        import subprocess as _sub
+        monkeypatch.setattr(_sub, "Popen", FakeProc)
+
+        server = HoloMCPServer()
+        server.holo_launch_ide()
+        server.shutdown()
+        # On clean shutdown we send terminate, then wait, then move on.
+        assert "terminate" in events
+        assert any(isinstance(e, tuple) and e[0] == "wait" for e in events)
+        # No second shutdown call should fail.
+        server.shutdown()
 
 
 class TestScreenTools:
