@@ -16,6 +16,7 @@ Subcommands:
 
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
 import time
@@ -578,6 +579,64 @@ def _cmd_install_screen() -> int:
     print(f"✓ cached at {path}")
     print(f"  size:   {path.stat().st_size} bytes (pinned: {SIKULI_JAR_BYTES})")
     return 0
+
+
+def _cmd_ide() -> int:
+    """Launch the SikuliX IDE (`java -jar sikulixide-*.jar`).
+
+    Downloads the jar on first use (same path as `holo install-screen`)
+    so this is one self-contained command. On POSIX we `os.execvp` into
+    java — holo's process is replaced by the JVM, the IDE owns the
+    terminal session, and there's no orphan parent process hanging
+    around. On Windows we fall back to `subprocess.run` since exec
+    semantics differ.
+    """
+    import shutil
+
+    from holo.bridge import (
+        SIKULI_JAR_NAME,
+        SIKULI_JAR_URL,
+        BridgeMissingError,
+        ensure_jar,
+    )
+
+    java = shutil.which("java")
+    if java is None:
+        print(
+            "holo ide: `java` not on PATH. Install OpenJDK 11+ "
+            "(e.g. `brew install openjdk@21`) and re-run.",
+            file=sys.stderr,
+        )
+        return 1
+
+    last_pct = {"value": -1}
+
+    def on_progress(read: int, total: int) -> None:
+        if not total:
+            return
+        pct = int(100 * read / total)
+        if pct != last_pct["value"]:
+            last_pct["value"] = pct
+            sys.stdout.write(
+                f"\rholo ide — fetching {SIKULI_JAR_NAME}: {pct:3d}%  "
+                f"({read / 1_048_576:.1f} / {total / 1_048_576:.1f} MiB)"
+            )
+            sys.stdout.flush()
+
+    try:
+        jar_path = ensure_jar(on_progress=on_progress)
+    except BridgeMissingError as e:
+        if last_pct["value"] >= 0:
+            print()
+        print(f"holo ide: {e}\n  source: {SIKULI_JAR_URL}", file=sys.stderr)
+        return 1
+    if last_pct["value"] >= 0:
+        print()  # finish the progress line
+
+    argv = [java, "-jar", str(jar_path)]
+    if sys.platform == "win32":
+        return subprocess.run(argv).returncode
+    os.execvp(java, argv)
 
 
 def _cmd_install_bookmarklet(rest: list[str]) -> int:
@@ -1276,6 +1335,7 @@ COMMANDS = {
     "focus": _cmd_focus,
     "mcp": _cmd_mcp,
     "install-screen": _cmd_install_screen,
+    "ide": _cmd_ide,
 }
 
 
@@ -1361,6 +1421,8 @@ Commands:
   screen <verb>           smoke-test the SikuliX-backed screen tools directly
   install-screen          pre-download the SikuliX jar into the user cache
   install-bookmarklet     download the bookmarklet page and open it
+  ide                     launch the SikuliX IDE (downloads the jar on
+                          first use); requires `java` on PATH
   init <cli> [--force]    scaffold an MCP config file for the given CLI in
                           the current directory. Currently supports:
                           `claude` (writes .mcp.json). Prompts for
