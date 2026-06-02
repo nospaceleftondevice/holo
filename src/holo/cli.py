@@ -1361,6 +1361,11 @@ Commands:
   screen <verb>           smoke-test the SikuliX-backed screen tools directly
   install-screen          pre-download the SikuliX jar into the user cache
   install-bookmarklet     download the bookmarklet page and open it
+  init <cli> [--force]    scaffold an MCP config file for the given CLI in
+                          the current directory. Currently supports:
+                          `claude` (writes .mcp.json). Prompts for
+                          --announce-ip (auto-detected) and, when tmux is
+                          on PATH, a tmux-attach --announce-command.
   upgrade                 check GitHub for a newer release and install it
                           in place at this binary's current path
 
@@ -1565,6 +1570,14 @@ def main(argv: list[str] | None = None) -> int:
         return _cmd_cert(rest)
     if cmd == "tunnel":
         return _cmd_tunnel(rest)
+    if cmd == "init":
+        if not rest:
+            sys.stderr.write(
+                "holo init: missing CLI argument (e.g. `holo init claude`)\n"
+            )
+            return 2
+        from holo import init_config
+        return init_config.run(rest[0], force="--force" in rest[1:])
     if cmd == "upgrade":
         from holo import upgrade as upgrade_mod
         return upgrade_mod.run_upgrade(force="--force" in rest)
