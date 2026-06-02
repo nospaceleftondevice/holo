@@ -153,6 +153,18 @@ class HoloMCPServer:
         self._tunnel: Any | None = None
         self._tunnel_lock = threading.Lock()
 
+        # SikuliX IDE process (Phase: `holo_launch_ide` tool). Tracked
+        # at server scope so re-invocation while the IDE is still up
+        # returns the existing PID instead of stacking multiple JVMs.
+        # Spawned as a CHILD of the MCP server (not detached) so the
+        # macOS Accessibility / Screen-Recording grant on the `holo`
+        # binary covers the IDE's java.awt.Robot calls — detaching
+        # via start_new_session would force a separate TCC prompt for
+        # `java` and silently break mouse simulation until the user
+        # granted it.
+        self._ide_proc: Any | None = None
+        self._ide_lock = threading.Lock()
+
         # Auto-tunnel watcher (Phase 5b). When enabled, opens one
         # reverse tunnel per discovered CloudCity and keeps the
         # session announce's tunnel_ports map in sync. Skipped
@@ -212,6 +224,18 @@ class HoloMCPServer:
                 except Exception:  # noqa: BLE001 — shutdown must not raise
                     pass
                 self._tunnel = None
+        with self._ide_lock:
+            if self._ide_proc is not None:
+                try:
+                    if self._ide_proc.poll() is None:
+                        self._ide_proc.terminate()
+                        try:
+                            self._ide_proc.wait(timeout=3.0)
+                        except Exception:  # noqa: BLE001
+                            self._ide_proc.kill()
+                except Exception:  # noqa: BLE001 — shutdown must not raise
+                    pass
+                self._ide_proc = None
         # Stop the announcer first so the LAN sees a Goodbye while the
         # capabilities server is still up — minimizes the window where
         # a discoverer could see the broadcast but get a connection
@@ -921,6 +945,63 @@ class HoloMCPServer:
                     pass
             return {"closed": True}
 
+    def holo_launch_ide(self) -> dict[str, Any]:
+        """Launch the SikuliX IDE as a child of this MCP server.
+
+        Idempotent at server scope: if a previous launch is still
+        running, returns its PID with ``already_running=True`` instead
+        of stacking multiple JVMs. Returns immediately — the IDE is a
+        long-lived GUI process, not awaited.
+
+        Returns
+        -------
+        ``{"pid": int, "jar": str, "java": str, "already_running": bool}``
+        """
+        import shutil
+        import subprocess
+
+        from holo.bridge import BridgeMissingError, ensure_jar
+
+        with self._ide_lock:
+            if self._ide_proc is not None and self._ide_proc.poll() is None:
+                return {
+                    "pid": self._ide_proc.pid,
+                    "jar": getattr(self._ide_proc, "_holo_jar", ""),
+                    "java": getattr(self._ide_proc, "_holo_java", ""),
+                    "already_running": True,
+                }
+
+            java = shutil.which("java")
+            if java is None:
+                raise RuntimeError(
+                    "holo_launch_ide: `java` not on PATH. Install "
+                    "OpenJDK 11+ (e.g. `brew install openjdk@21`) on "
+                    "the host running the holo daemon."
+                )
+            try:
+                jar_path = ensure_jar()
+            except BridgeMissingError as e:
+                raise RuntimeError(f"holo_launch_ide: {e}") from e
+
+            argv = [java, "-jar", str(jar_path)]
+            # No start_new_session: keep the JVM in holo's process tree
+            # so macOS TCC stays attributed to the `holo` binary. The
+            # IDE will be HUP'd if the MCP server exits — acceptable
+            # because the typical flow is "agent opens IDE, user uses
+            # it inside the same Claude Code session, user closes IDE
+            # or session". stdin/stdout/stderr inherit from holo —
+            # SikuliX's GUI noise goes wherever holo's stderr does.
+            proc = subprocess.Popen(argv)
+            proc._holo_jar = str(jar_path)  # type: ignore[attr-defined]
+            proc._holo_java = java  # type: ignore[attr-defined]
+            self._ide_proc = proc
+            return {
+                "pid": proc.pid,
+                "jar": str(jar_path),
+                "java": java,
+                "already_running": False,
+            }
+
 
 def _match_session(
     sessions: list[dict[str, Any]], identifier: str
@@ -1396,6 +1477,27 @@ def build_server(
     )
     def holo_tunnel_down() -> dict[str, Any]:
         return holo.holo_tunnel_down()
+
+    @mcp.tool(
+        description=(
+            "Launch the SikuliX IDE on the host running this holo "
+            "daemon. Spawns `java -jar sikulixide-*.jar` as a child of "
+            "the MCP server so macOS Accessibility / Screen-Recording "
+            "permissions granted to the `holo` binary cover the IDE's "
+            "mouse / keyboard simulation. Lazy-downloads the SikuliX "
+            "jar on first call (same path as `holo install-screen`). "
+            "Idempotent: a second call while the IDE is still running "
+            "returns the existing PID with `already_running=true` "
+            "instead of stacking JVMs. Returns "
+            "`{pid, jar, java, already_running}`. Raises if `java` "
+            "isn't on PATH or the jar can't be fetched. Use this when "
+            "the user asks to design templates, capture screen "
+            "regions interactively, or otherwise wants the SikuliX "
+            "IDE up on their machine."
+        )
+    )
+    def holo_launch_ide() -> dict[str, Any]:
+        return holo.holo_launch_ide()
 
     return mcp, holo
 
