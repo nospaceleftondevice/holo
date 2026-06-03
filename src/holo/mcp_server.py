@@ -432,6 +432,10 @@ class HoloMCPServer:
             x, y, direction=direction, steps=steps
         )
 
+    def screen_move(self, x: int, y: int) -> dict[str, Any]:
+        """Move the cursor to (x, y) — no click, no scroll, no key."""
+        return self._input_target().mouse_move(x, y)
+
     def screen_shot(
         self, region: dict[str, int] | None = None
     ) -> dict[str, Any]:
@@ -1239,6 +1243,18 @@ def build_server(
         x: int, y: int, direction: str = "down", steps: int = 3
     ) -> dict[str, Any]:
         return holo.screen_scroll(x, y, direction=direction, steps=steps)
+
+    @mcp.tool(
+        description=(
+            "Move the cursor to (x, y) WITHOUT clicking, scrolling, or "
+            "pressing any keys. Useful for triggering hover-only UI "
+            "(tooltips, menus that open on mouseenter, reveal-on-hover "
+            "toolbars) so you can take a screenshot and decide where to "
+            "click next. Returns {moved: true, x, y}."
+        )
+    )
+    def screen_move(x: int, y: int) -> dict[str, Any]:
+        return holo.screen_move(x, y)
 
     @mcp.tool(
         description=(

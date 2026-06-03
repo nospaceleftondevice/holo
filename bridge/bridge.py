@@ -261,6 +261,35 @@ def handle_screen_scroll(params):
     }
 
 
+def handle_screen_move(params):
+    # Move the cursor to (x, y) without clicking, scrolling, or
+    # pressing any modifiers. Useful for triggering hover-only UI
+    # (tooltips, menu reveals, dropdowns that open on mouseenter)
+    # before deciding where to click. SikuliX's module-level
+    # `hover(target)` moves the cursor and waits the configured
+    # MoveMouseDelay (default 0.5s); we drop that delay to zero for
+    # one call so the move is effectively instant.
+    x = int(params["x"])
+    y = int(params["y"])
+    location = Location(x, y)
+    # Settings.MoveMouseDelay is the post-move pause. Save and restore
+    # so we don't change global SikuliX behavior for other ops in the
+    # same bridge process.
+    try:
+        from org.sikuli.basics import Settings
+        prev = Settings.MoveMouseDelay
+        Settings.MoveMouseDelay = 0
+        try:
+            sikuli.hover(location)
+        finally:
+            Settings.MoveMouseDelay = prev
+    except ImportError:
+        # SikuliX not on classpath (impossible in production; defensive
+        # for the syntax-check-with-CPython case). Just hover.
+        sikuli.hover(location)
+    return {"moved": True, "x": x, "y": y}
+
+
 HANDLERS = {
     "ping": handle_ping,
     "app.activate": handle_app_activate,
@@ -272,6 +301,7 @@ HANDLERS = {
     "screen.find_image_path": handle_screen_find_image_path,
     "screen.user_capture": handle_screen_user_capture,
     "screen.scroll": handle_screen_scroll,
+    "screen.move": handle_screen_move,
 }
 
 

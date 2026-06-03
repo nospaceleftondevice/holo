@@ -248,6 +248,19 @@ class BridgeClient:
         # Avoid clashing with the `type` builtin in callers' namespaces.
         return self.request("screen.type", {"text": text})
 
+    def mouse_move(self, x: float, y: float) -> dict[str, Any]:
+        """Move the cursor to (x, y) without clicking or scrolling.
+
+        Useful for hover-only UI (tooltips, dropdown menus that open
+        on mouseenter, reveal-on-hover toolbars) where you want the
+        cursor positioned before deciding whether to click. Returns
+        ``{"moved": True, "x", "y"}``.
+        """
+        return self.request(
+            "screen.move",
+            {"x": int(x), "y": int(y)},
+        )
+
     def scroll(
         self,
         x: float,

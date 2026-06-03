@@ -306,6 +306,9 @@ class RemoteHoloBackend:
             {"x": x, "y": y, "direction": direction, "steps": steps},
         )
 
+    def mouse_move(self, x: int, y: int) -> dict[str, Any]:
+        return self._call("screen_move", {"x": x, "y": y})
+
     def activate(self, name: str) -> dict[str, Any]:
         return self._call("app_activate", {"name": name})
 
