@@ -128,6 +128,10 @@ class _StubBridge:
             "steps": steps,
         }
 
+    def mouse_move(self, x, y):
+        self.calls.append(("mouse_move", {"x": x, "y": y}))
+        return {"moved": True, "x": x, "y": y}
+
     def screenshot(self, *, region=None, timeout=15.0):
         self.calls.append(("screenshot", {"region": region}))
         return self.next_screenshot
@@ -384,6 +388,7 @@ class TestShutdownAndBuild:
                 "screen_type",
                 "screen_key",
                 "screen_scroll",
+                "screen_move",
                 "screen_shot",
                 "screen_find_image",
                 "screen_user_capture",
@@ -442,6 +447,7 @@ class TestShutdownAndBuild:
                 "app_activate",
                 "screen_click",
                 "screen_scroll",
+                "screen_move",
                 "screen_shot",
                 "browser_navigate",
                 "browser_execute_js",
@@ -509,6 +515,7 @@ class TestShutdownAndBuild:
                 "screen_key",
                 "screen_type",
                 "screen_scroll",
+                "screen_move",
                 "app_activate",
             }.issubset(names)
         finally:
@@ -739,6 +746,12 @@ class TestInputProxyRouting:
         assert any(call[0] == "scroll" for call in remote.calls)
         assert not any(call[0] == "scroll" for call in bridge.calls)
 
+    def test_screen_move_routes_to_remote_when_proxy_set(self):
+        server, bridge, remote = self._make_server_with_proxy()
+        server.screen_move(123, 456)
+        assert any(call[0] == "mouse_move" for call in remote.calls)
+        assert not any(call[0] == "mouse_move" for call in bridge.calls)
+
     def test_app_activate_routes_to_remote_when_proxy_set(self):
         server, bridge, remote = self._make_server_with_proxy()
         server.app_activate("Google Chrome")
@@ -810,11 +823,13 @@ class TestInputProxyRouting:
         server.screen_key("enter")
         server.screen_type("x")
         server.app_activate("Finder")
+        server.screen_move(50, 60)
         bridge_methods = [call[0] for call in bridge.calls]
         assert "click" in bridge_methods
         assert "key" in bridge_methods
         assert "type_text" in bridge_methods
         assert "activate" in bridge_methods
+        assert "mouse_move" in bridge_methods
 
 
 class TestRemoteScreenRouting:
@@ -1084,6 +1099,12 @@ class TestScreenTools:
             "scroll",
             {"x": 50, "y": 60, "direction": "up", "steps": 10},
         )
+
+    def test_screen_move_calls_bridge_mouse_move(self, server_with_bridge):
+        server, bridge = server_with_bridge
+        out = server.screen_move(333, 444)
+        assert out == {"moved": True, "x": 333, "y": 444}
+        assert bridge.calls[-1] == ("mouse_move", {"x": 333, "y": 444})
 
     def test_screen_find_image_decodes_needle(self, server_with_bridge):
         import base64

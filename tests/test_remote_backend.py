@@ -167,6 +167,18 @@ def test_scroll_with_explicit_args(started_backend):
     )
 
 
+def test_mouse_move_calls_screen_move(started_backend):
+    sess = _FakeClientSession._current
+    sess.canned["screen_move"] = _FakeCallToolResult(
+        structuredContent={"moved": True, "x": 123, "y": 456}
+    )
+
+    result = started_backend.mouse_move(123, 456)
+
+    assert result == {"moved": True, "x": 123, "y": 456}
+    assert sess.calls == [("screen_move", {"x": 123, "y": 456})]
+
+
 def test_activate_calls_app_activate(started_backend):
     started_backend.activate("Google Chrome")
     sess = _FakeClientSession._current
