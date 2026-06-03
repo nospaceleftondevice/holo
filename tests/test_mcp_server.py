@@ -475,6 +475,44 @@ class TestShutdownAndBuild:
         finally:
             d.shutdown()
 
+    def test_no_browser_omits_browser_tools(self):
+        """`--no-browser` drops every browser_* AppleScript tool.
+        Suits the input-only peer in the split-input-proxy topology
+        (the machine that's just driving SikuliX on behalf of a
+        corporate-locked peer) — it never needs Chrome control."""
+        import asyncio
+
+        mcp, holo = build_server(no_browser=True)
+        try:
+            tools = asyncio.run(mcp.list_tools())
+            names = {t.name for t in tools}
+            browser_tools = {
+                "browser_navigate",
+                "browser_new_tab",
+                "browser_close_active_tab",
+                "browser_activate_tab",
+                "browser_list_tabs",
+                "browser_read_active_url",
+                "browser_read_active_title",
+                "browser_reload",
+                "browser_back",
+                "browser_forward",
+                "browser_execute_js",
+            }
+            assert names.isdisjoint(browser_tools), (
+                f"browser tools should be omitted: {names & browser_tools}"
+            )
+            # Sanity: input-side tools still load.
+            assert {
+                "screen_click",
+                "screen_key",
+                "screen_type",
+                "screen_scroll",
+                "app_activate",
+            }.issubset(names)
+        finally:
+            holo.shutdown()
+
 
 class TestHoloLaunchIDE:
     """`holo_launch_ide` spawns the SikuliX IDE as a CHILD of the MCP
@@ -654,6 +692,128 @@ class TestHoloLaunchIDE:
         assert any(isinstance(e, tuple) and e[0] == "wait" for e in events)
         # No second shutdown call should fail.
         server.shutdown()
+
+
+class TestInputProxyRouting:
+    """When `input_proxy` is set, the five input ops (click / key /
+    type / scroll / activate) MUST route to the remote backend; capture
+    ops MUST stay on the local SikuliX bridge. This is the heart of
+    the split-input-proxy topology — getting it wrong silently means
+    input ops fire on the wrong machine."""
+
+    def _make_server_with_proxy(self) -> tuple[HoloMCPServer, _StubBridge, Any]:
+        """Build a HoloMCPServer with a fake bridge AND a fake remote-input
+        attached on the daemon, so we can assert which one each tool
+        method targets."""
+        bridge = _StubBridge()
+        remote = _StubBridge()  # same API, different recorder
+
+        server = HoloMCPServer()
+        fake = _FakeDaemon(bridge=bridge)
+        fake._remote_input = remote  # populate the routing target
+        server._daemon = fake
+        return server, bridge, remote
+
+    def test_screen_click_routes_to_remote_when_proxy_set(self):
+        server, bridge, remote = self._make_server_with_proxy()
+        server.screen_click(100, 200)
+        assert any(call[0] == "click" for call in remote.calls)
+        assert not any(call[0] == "click" for call in bridge.calls)
+
+    def test_screen_key_routes_to_remote_when_proxy_set(self):
+        server, bridge, remote = self._make_server_with_proxy()
+        server.screen_key("cmd+s")
+        assert any(call[0] == "key" for call in remote.calls)
+        assert not any(call[0] == "key" for call in bridge.calls)
+
+    def test_screen_type_routes_to_remote_when_proxy_set(self):
+        server, bridge, remote = self._make_server_with_proxy()
+        server.screen_type("hello")
+        assert any(call[0] == "type_text" for call in remote.calls)
+        assert not any(call[0] == "type_text" for call in bridge.calls)
+
+    def test_screen_scroll_routes_to_remote_when_proxy_set(self):
+        server, bridge, remote = self._make_server_with_proxy()
+        server.screen_scroll(10, 20, direction="up", steps=5)
+        assert any(call[0] == "scroll" for call in remote.calls)
+        assert not any(call[0] == "scroll" for call in bridge.calls)
+
+    def test_app_activate_routes_to_remote_when_proxy_set(self):
+        server, bridge, remote = self._make_server_with_proxy()
+        server.app_activate("Google Chrome")
+        assert any(call[0] == "activate" for call in remote.calls)
+        assert not any(call[0] == "activate" for call in bridge.calls)
+
+    def test_screen_shot_stays_local_when_proxy_set(self):
+        """Capture MUST remain local — sending pixels over the wire on
+        every screenshot would be slow and defeats the whole point of
+        the topology (capture works locally, only input is blocked)."""
+        server, bridge, remote = self._make_server_with_proxy()
+        server.screen_shot()
+        assert any(call[0] == "screenshot" for call in bridge.calls)
+        assert not any(call[0] == "screenshot" for call in remote.calls)
+
+    def test_ui_template_click_uses_remote_input_after_local_find(self, tmp_path):
+        """`ui_template_click` is a compound: find locally on this host,
+        then click via the input target. With `input_proxy` set, the
+        click should fire on the remote, but the find / screenshot
+        underneath stays local."""
+        import struct
+        import zlib
+
+        from holo.templates import TemplateStore
+
+        def _make_png(w: int, h: int) -> bytes:
+            sig = b"\x89PNG\r\n\x1a\n"
+            def _chunk(typ: bytes, data: bytes) -> bytes:
+                crc = zlib.crc32(typ + data) & 0xFFFFFFFF
+                return struct.pack(">I", len(data)) + typ + data + struct.pack(">I", crc)
+            ihdr = struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0)
+            raw = b"".join(b"\x00" + b"\x00\x00\x00" * w for _ in range(h))
+            return (
+                sig + _chunk(b"IHDR", ihdr)
+                + _chunk(b"IDAT", zlib.compress(raw))
+                + _chunk(b"IEND", b"")
+            )
+
+        store = TemplateStore(root=tmp_path / "templates")
+        bridge = _StubBridge()
+        remote = _StubBridge()
+        # Pre-populate a template so find succeeds.
+        store.add_variant("save_button", "chrome", _make_png(8, 8), similarity=0.85)
+
+        server = HoloMCPServer(templates=store)
+        fake = _FakeDaemon(bridge=bridge)
+        fake._remote_input = remote
+        server._daemon = fake
+
+        out = server.ui_template_click("save_button", app="chrome")
+        assert out["clicked"] is True
+
+        # find_image_path runs on the local bridge…
+        assert any(call[0] == "find_image_path" for call in bridge.calls)
+        # …click fires on the remote.
+        assert any(call[0] == "click" for call in remote.calls)
+        assert not any(call[0] == "click" for call in bridge.calls)
+
+    def test_no_proxy_routes_to_local_bridge(self):
+        """Sanity / regression: without `input_proxy`, every op stays on
+        the local bridge."""
+        bridge = _StubBridge()
+        server = HoloMCPServer()
+        fake = _FakeDaemon(bridge=bridge)
+        fake._remote_input = None
+        server._daemon = fake
+
+        server.screen_click(1, 2)
+        server.screen_key("enter")
+        server.screen_type("x")
+        server.app_activate("Finder")
+        bridge_methods = [call[0] for call in bridge.calls]
+        assert "click" in bridge_methods
+        assert "key" in bridge_methods
+        assert "type_text" in bridge_methods
+        assert "activate" in bridge_methods
 
 
 class TestScreenTools:

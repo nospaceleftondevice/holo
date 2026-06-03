@@ -24,6 +24,8 @@ but never gets populated, and `calibrate()` raises.
 
 from __future__ import annotations
 
+from typing import Any
+
 from holo.bridge import BridgeClient, BridgeError, BridgeMissingError
 from holo.channel import Channel
 from holo.registry import ChannelRegistry
@@ -37,6 +39,7 @@ class Daemon:
         hide_qr: bool = False,
         enable_screen: bool = False,
         no_bookmarklet: bool = False,
+        input_proxy: tuple[str, int] | None = None,
     ) -> None:
         self.hide_qr = hide_qr
         self.enable_screen = enable_screen
@@ -49,6 +52,21 @@ class Daemon:
             self.ws_server.start()
         self._bridge: BridgeClient | None = None
         self._bridge_attempted: bool = False
+
+        # Remote input proxy: when set, the input methods (click, key,
+        # type_text, scroll, activate) route to a `holo mcp --listen`
+        # on another host. Capture (screenshot, find_image, etc.)
+        # stays on the local SikuliX bridge — this is the split-machine
+        # topology where the local Mac can read its screen but
+        # corporate policy blocks event injection, and a peer machine
+        # has a Screen Sharing client connected so its mouse / kbd
+        # events relay back to the local display.
+        self._remote_input: Any = None
+        if input_proxy is not None:
+            from holo.remote_input import RemoteInputBackend
+            backend = RemoteInputBackend(input_proxy[0], input_proxy[1])
+            backend.start()  # raises on failure — fail fast at boot
+            self._remote_input = backend
 
     @property
     def bridge(self) -> BridgeClient | None:
@@ -91,3 +109,9 @@ class Daemon:
         if self._bridge is not None:
             self._bridge.stop()
             self._bridge = None
+        if self._remote_input is not None:
+            try:
+                self._remote_input.stop()
+            except Exception:  # noqa: BLE001 — shutdown must not raise
+                pass
+            self._remote_input = None
