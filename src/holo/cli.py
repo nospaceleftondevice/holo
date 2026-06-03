@@ -1445,6 +1445,11 @@ Commands:
   screen <verb>           smoke-test the SikuliX-backed screen tools directly
   install-screen          pre-download the SikuliX jar into the user cache
   install-bookmarklet     download the bookmarklet page and open it
+  install-remote HOST     SCP this machine's holo binary + cached
+                          SikuliX jar to a peer Mac (user@host) over
+                          SSH and install them at ~/bin/holo + the
+                          standard cache. For air-gapped install of the
+                          input-proxy peer. Requires `ssh HOST` to work.
   ide                     launch the SikuliX IDE (downloads the jar on
                           first use); requires `java` on PATH
   init <cli> [--force]    scaffold an MCP config file for the given CLI in
@@ -1700,6 +1705,15 @@ def main(argv: list[str] | None = None) -> int:
             return 2
         from holo import init_config
         return init_config.run(rest[0], force="--force" in rest[1:])
+    if cmd == "install-remote":
+        if not rest:
+            sys.stderr.write(
+                "holo install-remote: missing HOST "
+                "(e.g. `holo install-remote user@machine-b`)\n"
+            )
+            return 2
+        from holo import install_remote
+        return install_remote.run(rest[0])
     if cmd == "upgrade":
         from holo import upgrade as upgrade_mod
         return upgrade_mod.run_upgrade(force="--force" in rest)
