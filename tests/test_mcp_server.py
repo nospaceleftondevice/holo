@@ -386,6 +386,7 @@ class TestShutdownAndBuild:
                 "screen_scroll",
                 "screen_shot",
                 "screen_find_image",
+                "screen_user_capture",
                 "browser_navigate",
                 "browser_new_tab",
                 "browser_close_active_tab",
@@ -814,6 +815,204 @@ class TestInputProxyRouting:
         assert "key" in bridge_methods
         assert "type_text" in bridge_methods
         assert "activate" in bridge_methods
+
+
+class TestRemoteScreenRouting:
+    """Symmetric to TestInputProxyRouting. When `remote_screen` is set,
+    the capture ops (screen_shot / screen_find_image / screen_user_capture
+    / ui_template_find / ui_template_capture) MUST route to the remote;
+    input ops (click / key / type / scroll / activate) MUST stay local.
+
+    `ui_template_click` is the cross-cutting compound: find goes to the
+    capture target, click goes to the input target — they can target
+    different machines independently."""
+
+    def _make_server_with_screen_proxy(self) -> tuple[HoloMCPServer, _StubBridge, Any]:
+        bridge = _StubBridge()
+        remote = _StubBridge()
+        server = HoloMCPServer()
+        fake = _FakeDaemon(bridge=bridge)
+        fake._remote_screen = remote
+        server._daemon = fake
+        return server, bridge, remote
+
+    def test_screen_shot_routes_to_remote_when_proxy_set(self):
+        server, bridge, remote = self._make_server_with_screen_proxy()
+        server.screen_shot()
+        assert any(call[0] == "screenshot" for call in remote.calls)
+        assert not any(call[0] == "screenshot" for call in bridge.calls)
+
+    def test_screen_find_image_routes_to_remote_when_proxy_set(self):
+        import base64 as _b64
+        server, bridge, remote = self._make_server_with_screen_proxy()
+        needle_b64 = _b64.b64encode(b"\x89PNGfake").decode("ascii")
+        server.screen_find_image(needle_b64)
+        assert any(call[0] == "find_image" for call in remote.calls)
+        assert not any(call[0] == "find_image" for call in bridge.calls)
+
+    def test_screen_user_capture_routes_to_remote_when_proxy_set(self):
+        server, bridge, remote = self._make_server_with_screen_proxy()
+        server.screen_user_capture(prompt="select me")
+        assert any(call[0] == "user_capture" for call in remote.calls)
+        assert not any(call[0] == "user_capture" for call in bridge.calls)
+
+    def test_screen_click_stays_local_when_only_screen_proxy_set(self):
+        """`--remote-screen` MUST NOT affect input — clicks fire on the
+        local bridge unless `--input-proxy` is ALSO set. Same the other
+        way around."""
+        server, bridge, remote = self._make_server_with_screen_proxy()
+        server.screen_click(1, 2)
+        assert any(call[0] == "click" for call in bridge.calls)
+        assert not any(call[0] == "click" for call in remote.calls)
+
+    def test_ui_template_find_uses_capture_target(self, tmp_path):
+        """The find inside ui_template_find should hit the remote when
+        remote_screen is set (the template file is read locally and the
+        bytes are sent to the remote for matching against its screen)."""
+        import struct
+        import zlib
+
+        from holo.templates import TemplateStore
+
+        def _make_png(w: int, h: int) -> bytes:
+            sig = b"\x89PNG\r\n\x1a\n"
+            def _chunk(typ: bytes, data: bytes) -> bytes:
+                crc = zlib.crc32(typ + data) & 0xFFFFFFFF
+                return struct.pack(">I", len(data)) + typ + data + struct.pack(">I", crc)
+            ihdr = struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0)
+            raw = b"".join(b"\x00" + b"\x00\x00\x00" * w for _ in range(h))
+            return (
+                sig
+                + _chunk(b"IHDR", ihdr)
+                + _chunk(b"IDAT", zlib.compress(raw))
+                + _chunk(b"IEND", b"")
+            )
+
+        store = TemplateStore(root=tmp_path / "templates")
+        store.add_variant("kebab", "chrome", _make_png(8, 8), similarity=0.85)
+        bridge = _StubBridge()
+        remote = _StubBridge()
+        server = HoloMCPServer(templates=store)
+        fake = _FakeDaemon(bridge=bridge)
+        fake._remote_screen = remote
+        server._daemon = fake
+
+        server.ui_template_find("kebab", app="chrome")
+
+        # find_image_path went to the remote, NOT the local bridge.
+        assert any(call[0] == "find_image_path" for call in remote.calls)
+        assert not any(call[0] == "find_image_path" for call in bridge.calls)
+
+    def test_ui_template_click_splits_capture_and_input_across_remotes(self, tmp_path):
+        """The big integration assertion: with both proxies set, find
+        runs on the screen target and click runs on the input target.
+        If they're different machines, BOTH must see exactly one of
+        their respective ops."""
+        import struct
+        import zlib
+
+        from holo.templates import TemplateStore
+
+        def _make_png(w: int, h: int) -> bytes:
+            sig = b"\x89PNG\r\n\x1a\n"
+            def _chunk(typ: bytes, data: bytes) -> bytes:
+                crc = zlib.crc32(typ + data) & 0xFFFFFFFF
+                return struct.pack(">I", len(data)) + typ + data + struct.pack(">I", crc)
+            ihdr = struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0)
+            raw = b"".join(b"\x00" + b"\x00\x00\x00" * w for _ in range(h))
+            return (
+                sig
+                + _chunk(b"IHDR", ihdr)
+                + _chunk(b"IDAT", zlib.compress(raw))
+                + _chunk(b"IEND", b"")
+            )
+
+        store = TemplateStore(root=tmp_path / "templates")
+        store.add_variant("kebab", "chrome", _make_png(8, 8), similarity=0.85)
+        bridge = _StubBridge()
+        input_remote = _StubBridge()
+        screen_remote = _StubBridge()
+        server = HoloMCPServer(templates=store)
+        fake = _FakeDaemon(bridge=bridge)
+        fake._remote_input = input_remote
+        fake._remote_screen = screen_remote
+        server._daemon = fake
+
+        out = server.ui_template_click("kebab", app="chrome")
+        assert out["clicked"] is True
+
+        # find on the screen target, click on the input target — local
+        # bridge gets neither.
+        assert any(c[0] == "find_image_path" for c in screen_remote.calls)
+        assert not any(c[0] == "find_image_path" for c in input_remote.calls)
+        assert not any(c[0] == "find_image_path" for c in bridge.calls)
+        assert any(c[0] == "click" for c in input_remote.calls)
+        assert not any(c[0] == "click" for c in screen_remote.calls)
+        assert not any(c[0] == "click" for c in bridge.calls)
+
+
+class TestDaemonBackendSharing:
+    """When `input_proxy == remote_screen` (same host:port), the Daemon
+    constructs ONE RemoteHoloBackend and assigns it to both
+    `_remote_input` and `_remote_screen` — saves a connect subprocess +
+    a JVM-init-worth of latency. When they differ, two backends. The
+    test checks both code paths use the same RemoteHoloBackend
+    constructor injected via monkeypatch — no real network."""
+
+    def _fake_backend(self):
+        class _FakeBackend:
+            instances: list[Any] = []
+            def __init__(self, host, port):
+                self.host = host
+                self.port = port
+                self.started = False
+                self.stopped = False
+                _FakeBackend.instances.append(self)
+            def start(self):
+                self.started = True
+            def stop(self):
+                self.stopped = True
+        return _FakeBackend
+
+    def test_same_host_port_shares_one_backend(self, monkeypatch):
+        from holo import remote_backend
+        from holo.daemon import Daemon
+
+        Fake = self._fake_backend()
+        monkeypatch.setattr(remote_backend, "RemoteHoloBackend", Fake)
+
+        d = Daemon(
+            no_bookmarklet=True,
+            input_proxy=("host", 7081),
+            remote_screen=("host", 7081),
+        )
+        try:
+            assert len(Fake.instances) == 1
+            assert d._remote_input is d._remote_screen is Fake.instances[0]
+        finally:
+            d.shutdown()
+        # stop called exactly once on the shared instance.
+        assert Fake.instances[0].stopped is True
+
+    def test_different_host_port_creates_two_backends(self, monkeypatch):
+        from holo import remote_backend
+        from holo.daemon import Daemon
+
+        Fake = self._fake_backend()
+        monkeypatch.setattr(remote_backend, "RemoteHoloBackend", Fake)
+
+        d = Daemon(
+            no_bookmarklet=True,
+            input_proxy=("input-host", 7081),
+            remote_screen=("screen-host", 7081),
+        )
+        try:
+            assert len(Fake.instances) == 2
+            assert d._remote_input is not d._remote_screen
+            assert d._remote_input.host == "input-host"
+            assert d._remote_screen.host == "screen-host"
+        finally:
+            d.shutdown()
 
 
 class TestScreenTools:
