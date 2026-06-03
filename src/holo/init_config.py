@@ -123,15 +123,58 @@ def _prompt_input_proxy() -> str | None:
     )
     print(
         "  but a peer machine has a Screen Sharing client to this host. "
-        "Capture stays local."
+        "Capture stays local"
+    )
+    print(
+        "  unless you also set --remote-screen."
     )
     raw = input(
-        "Remote HOST:PORT (blank to skip): "
+        "Remote HOST:PORT for --input-proxy (blank to skip): "
     ).strip()
     if not raw:
         return None
     if ":" not in raw:
         print(f"  Invalid HOST:PORT {raw!r} — skipping --input-proxy")
+        return None
+    return raw
+
+
+def _prompt_remote_screen() -> str | None:
+    """Ask whether to route screen-capture ops to a remote holo daemon.
+
+    Symmetric to `_prompt_input_proxy`. Strict skip semantics: blank
+    Enter always means "don't set --remote-screen". To proxy capture
+    to the same peer as input, type the same HOST:PORT — holo shares
+    one MCP connection internally when both flags match.
+
+    Returns ``"host:port"`` if confirmed, else None.
+    """
+    print(
+        "Route screen-capture ops (screen_shot / find_image / "
+        "ui_template_*) to a remote holo?"
+    )
+    print(
+        "  Use this when this host can't capture its own screen (e.g. "
+        "Claude Code"
+    )
+    print(
+        "  lacks Screen Recording) but a peer mirroring this host's "
+        "display via"
+    )
+    print(
+        "  Screen Sharing can. If you set both --input-proxy and "
+        "--remote-screen"
+    )
+    print(
+        "  to the same host, holo shares one MCP connection."
+    )
+    raw = input(
+        "Remote HOST:PORT for --remote-screen (blank to skip): "
+    ).strip()
+    if not raw:
+        return None
+    if ":" not in raw:
+        print(f"  Invalid HOST:PORT {raw!r} — skipping --remote-screen")
         return None
     return raw
 
@@ -142,6 +185,7 @@ def _build_args(
     announce_ip: str | None,
     announce_command: str | None,
     input_proxy: str | None,
+    remote_screen: str | None,
 ) -> list[str]:
     """Compose the `holo mcp ...` arg list for the generated config."""
     args = ["mcp", "--no-bookmarklet"]
@@ -149,6 +193,8 @@ def _build_args(
         args.append("--screen")
     if input_proxy:
         args += ["--input-proxy", input_proxy]
+    if remote_screen:
+        args += ["--remote-screen", remote_screen]
     args.append("--announce")
     if announce_ip:
         args += ["--announce-ip", announce_ip]
@@ -203,6 +249,8 @@ def run(cli: str, *, force: bool = False, cwd: Path | None = None) -> int:
     print()
     input_proxy = _prompt_input_proxy()
     print()
+    remote_screen = _prompt_remote_screen()
+    print()
 
     try:
         ips = _enumerate_ips()
@@ -218,6 +266,7 @@ def run(cli: str, *, force: bool = False, cwd: Path | None = None) -> int:
         announce_ip=announce_ip,
         announce_command=announce_command,
         input_proxy=input_proxy,
+        remote_screen=remote_screen,
     )
     _write_claude_config(target, args)
 

@@ -52,6 +52,7 @@ class HoloMCPServer:
         no_bookmarklet: bool = False,
         no_browser: bool = False,
         input_proxy: tuple[str, int] | None = None,
+        remote_screen: tuple[str, int] | None = None,
         templates: TemplateStore | None = None,
         announce: bool = False,
         announce_session: str | None = None,
@@ -69,6 +70,7 @@ class HoloMCPServer:
         self.no_bookmarklet = no_bookmarklet
         self.no_browser = no_browser
         self.input_proxy = input_proxy
+        self.remote_screen = remote_screen
         self._daemon: Daemon | None = None
         self._daemon_lock = threading.Lock()
         # Template cache lives across daemon restarts — it's a pure
@@ -208,6 +210,7 @@ class HoloMCPServer:
                     enable_screen=self.enable_screen,
                     no_bookmarklet=self.no_bookmarklet,
                     input_proxy=self.input_proxy,
+                    remote_screen=self.remote_screen,
                 )
             return self._daemon
 
@@ -366,14 +369,35 @@ class HoloMCPServer:
         / activate).
 
         Prefers the remote input proxy when `--input-proxy HOST:PORT`
-        is set: corporate-locked machines can capture their own screen
-        but can't inject events, and the proxy points at a peer holo
-        on a machine that can. Falls back to the local SikuliX bridge
-        otherwise. The two backends present identical input
-        signatures, so the call sites are unchanged.
+        (or `--remote-input`) is set: corporate-locked machines can
+        capture their own screen but can't inject events, and the proxy
+        points at a peer holo on a machine that can. Falls back to the
+        local SikuliX bridge otherwise. The two backends present
+        identical input signatures, so the call sites are unchanged.
         """
         daemon = self.daemon
         remote = getattr(daemon, "_remote_input", None)
+        if remote is not None:
+            return remote
+        return self._require_bridge()
+
+    def _capture_target(self) -> Any:
+        """Return the backend for screen-capture ops (screenshot /
+        find_image / find_image_path / user_capture).
+
+        Prefers the remote-screen proxy when `--remote-screen HOST:PORT`
+        is set: useful when this host can't do screen capture (e.g.
+        Claude Code is the responsible TCC process and lacks Screen
+        Recording) but a peer can — typically a peer that mirrors this
+        host's display via Screen Sharing, so a capture on the peer
+        actually shows the local user's working content.
+
+        Symmetric to `_input_target`. When both proxies target the same
+        host, the same backend instance is returned for both — see
+        ``Daemon._backends`` for the sharing logic.
+        """
+        daemon = self.daemon
+        remote = getattr(daemon, "_remote_screen", None)
         if remote is not None:
             return remote
         return self._require_bridge()
@@ -414,7 +438,7 @@ class HoloMCPServer:
         """Capture the screen (or a region) and return base64 PNG + size."""
         import base64 as _b64
 
-        png = self._require_bridge().screenshot(region=region)
+        png = self._capture_target().screenshot(region=region)
         return {
             "image": _b64.b64encode(png).decode("ascii"),
             "format": "png",
@@ -434,9 +458,22 @@ class HoloMCPServer:
             needle_bytes = _b64.b64decode(needle, validate=True)
         except Exception as e:
             raise ValueError("needle must be base64-encoded PNG") from e
-        return self._require_bridge().find_image(
+        return self._capture_target().find_image(
             needle_bytes, region=region, score=score
         )
+
+    def screen_user_capture(
+        self, prompt: str = "", timeout: float = 60.0
+    ) -> dict[str, Any]:
+        """Run the interactive drag-rectangle capture; return the dragged
+        rect's PNG (or a cancel record).
+
+        Exposed as a top-level tool primarily so `--remote-screen`'s
+        ``RemoteHoloBackend.user_capture`` has something to call on the
+        peer. Local callers normally hit this through
+        ``ui_template_capture`` instead.
+        """
+        return self._capture_target().user_capture(prompt=prompt, timeout=timeout)
 
     # ---- UI template cache ----------------------------------------------
     #
@@ -468,11 +505,11 @@ class HoloMCPServer:
         new image is appended as another variant (idle / hover / etc.).
         Returns the saved index entry.
         """
-        bridge = self._require_bridge()
+        capture = self._capture_target()
         if region is not None:
-            png = bridge.screenshot(region=region)
+            png = capture.screenshot(region=region)
         else:
-            result = bridge.user_capture(prompt=prompt, timeout=timeout)
+            result = capture.user_capture(prompt=prompt, timeout=timeout)
             if result.get("cancelled"):
                 # Surface as a non-error response — agent re-prompts user.
                 return {
@@ -514,9 +551,9 @@ class HoloMCPServer:
         # `get` is checked again because `variant_paths` raises before
         # we reach this; we know it exists.
         score = float(entry["similarity"]) if entry else 0.85
-        bridge = self._require_bridge()
+        capture = self._capture_target()
         for p in paths:
-            match = bridge.find_image_path(str(p), region=region, score=score)
+            match = capture.find_image_path(str(p), region=region, score=score)
             if match is not None:
                 self.templates.touch(label, app)
                 return {**match, "variant": p.name}
@@ -1072,6 +1109,7 @@ def build_server(
     no_bookmarklet: bool = False,
     no_browser: bool = False,
     input_proxy: tuple[str, int] | None = None,
+    remote_screen: tuple[str, int] | None = None,
     announce: bool = False,
     announce_session: str | None = None,
     announce_user: str | None = None,
@@ -1105,6 +1143,7 @@ def build_server(
         no_bookmarklet=no_bookmarklet,
         no_browser=no_browser,
         input_proxy=input_proxy,
+        remote_screen=remote_screen,
         announce=announce,
         announce_session=announce_session,
         announce_user=announce_user,
@@ -1224,6 +1263,23 @@ def build_server(
         score: float = 0.7,
     ) -> dict[str, Any] | None:
         return holo.screen_find_image(needle, region=region, score=score)
+
+    @mcp.tool(
+        description=(
+            "Run the interactive drag-rectangle capture and return the "
+            "selected region's PNG. Returns `{image: base64, x, y, "
+            "width, height}` on success or `{cancelled: true, reason}` "
+            "if the user pressed Esc. Primarily exists so the "
+            "split-machine `--remote-screen` topology can run the drag "
+            "UI on a peer; local callers should usually use "
+            "`ui_template_capture` instead, which also stores the "
+            "result in the named-template cache."
+        )
+    )
+    def screen_user_capture(
+        prompt: str = "", timeout: float = 60.0
+    ) -> dict[str, Any]:
+        return holo.screen_user_capture(prompt=prompt, timeout=timeout)
 
     # ---- UI template cache --------------------------------------------------
     #
@@ -1579,6 +1635,7 @@ def run(
     no_bookmarklet: bool = False,
     no_browser: bool = False,
     input_proxy: tuple[str, int] | None = None,
+    remote_screen: tuple[str, int] | None = None,
     announce: bool = False,
     announce_session: str | None = None,
     announce_user: str | None = None,
@@ -1596,6 +1653,7 @@ def run(
         no_bookmarklet=no_bookmarklet,
         no_browser=no_browser,
         input_proxy=input_proxy,
+        remote_screen=remote_screen,
         announce=announce,
         announce_session=announce_session,
         announce_user=announce_user,
@@ -1624,6 +1682,7 @@ def run_tcp(
     no_bookmarklet: bool = False,
     no_browser: bool = False,
     input_proxy: tuple[str, int] | None = None,
+    remote_screen: tuple[str, int] | None = None,
     announce: bool = False,
     announce_session: str | None = None,
     announce_user: str | None = None,
@@ -1653,6 +1712,7 @@ def run_tcp(
         no_bookmarklet=no_bookmarklet,
         no_browser=no_browser,
         input_proxy=input_proxy,
+        remote_screen=remote_screen,
         announce=announce,
         announce_session=announce_session,
         announce_user=announce_user,

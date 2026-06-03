@@ -288,6 +288,7 @@ def _cmd_mcp(
     no_bookmarklet: bool = False,
     no_browser: bool = False,
     input_proxy: tuple[str, int] | None = None,
+    remote_screen: tuple[str, int] | None = None,
     listen_port: int | None = None,
     announce: bool = False,
     announce_session: str | None = None,
@@ -343,7 +344,14 @@ def _cmd_mcp(
         if input_proxy is not None:
             lines.append(
                 f"Input proxy: events route to remote holo at "
-                f"{input_proxy[0]}:{input_proxy[1]} (--input-proxy)"
+                f"{input_proxy[0]}:{input_proxy[1]} (--input-proxy / --remote-input)"
+            )
+        if remote_screen is not None:
+            same = input_proxy == remote_screen
+            tag = " (shared connection)" if same else ""
+            lines.append(
+                f"Screen proxy: captures route to remote holo at "
+                f"{remote_screen[0]}:{remote_screen[1]} (--remote-screen){tag}"
             )
         if announce:
             label_bits = []
@@ -398,6 +406,7 @@ def _cmd_mcp(
             no_bookmarklet=no_bookmarklet,
             no_browser=no_browser,
             input_proxy=input_proxy,
+            remote_screen=remote_screen,
             **announce_kwargs,
         )
         return 0
@@ -411,6 +420,7 @@ def _cmd_mcp(
         no_bookmarklet=no_bookmarklet,
         no_browser=no_browser,
         input_proxy=input_proxy,
+        remote_screen=remote_screen,
         **announce_kwargs,
     )
     return 0
@@ -1362,7 +1372,8 @@ Commands:
   demo [--manual] [--hide-qr] [--screen]
                           end-to-end smoke test against the in-page agent
   mcp [--listen PORT] [--hide-qr] [--screen] [--no-bookmarklet]
-      [--no-browser] [--input-proxy HOST:PORT]
+      [--no-browser] [--input-proxy HOST:PORT | --remote-input HOST:PORT]
+      [--remote-screen HOST:PORT]
       [--announce] [--announce-session NAME] [--announce-user NAME]
       [--announce-ssh-user NAME] [--announce-ip A,B,C]
       [--announce-capabilities] [--announce-command "CMD"]
@@ -1373,13 +1384,25 @@ Commands:
                           --no-browser      drop browser_* AppleScript tools
                                             (input-only peer in split topology)
                           --input-proxy HOST:PORT  route screen_click/screen_key/
-                                            screen_type/screen_scroll/app_activate
-                                            to a remote holo at HOST:PORT (use
-                                            this when corporate policy blocks
-                                            local mouse/keyboard injection but a
-                                            peer machine with a Screen Sharing
-                                            client to this host can inject for
-                                            you). Capture stays local.
+                          (or --remote-input)        screen_type/screen_scroll/
+                                            app_activate to a remote holo at
+                                            HOST:PORT (use when corporate policy
+                                            blocks local mouse/keyboard
+                                            injection but a peer with a Screen
+                                            Sharing client to this host can
+                                            inject for you). Capture stays local
+                                            unless --remote-screen is also set.
+                          --remote-screen HOST:PORT  route screen_shot /
+                                            screen_find_image / ui_template_*
+                                            capture ops to a remote holo at
+                                            HOST:PORT (use when this host can't
+                                            do screen capture and a peer can —
+                                            typically a peer mirroring this
+                                            host's display via Screen Sharing
+                                            so its capture IS your screen).
+                                            When both proxies target the same
+                                            host, holo shares one MCP
+                                            connection.
                           --announce        broadcast session via mDNS
                           --announce-session NAME    logical session id
                           --announce-user NAME       display label (default: $USER)
@@ -1630,39 +1653,55 @@ def main(argv: list[str] | None = None) -> int:
             else None
         )
 
-        input_proxy_raw = _value_flag(rest, "--input-proxy")
-        if input_proxy_raw is _MISSING_ARG:
-            sys.stderr.write(
-                "holo mcp: --input-proxy requires a HOST:PORT value\n"
-            )
-            return 2
-        input_proxy: tuple[str, int] | None = None
-        if isinstance(input_proxy_raw, str):
-            if ":" not in input_proxy_raw:
-                sys.stderr.write(
-                    f"holo mcp: --input-proxy {input_proxy_raw!r} must be "
-                    "HOST:PORT\n"
-                )
+        def _parse_endpoint_flag(name: str) -> tuple[str, int] | None | int:
+            """Return the parsed (host, port), None if absent, or an int
+            exit code (2) on validation error (caller propagates)."""
+            raw = _value_flag(rest, name)
+            if raw is _MISSING_ARG:
+                sys.stderr.write(f"holo mcp: {name} requires a HOST:PORT value\n")
                 return 2
-            host, _, port_s = input_proxy_raw.rpartition(":")
+            if not isinstance(raw, str):
+                return None
+            if ":" not in raw:
+                sys.stderr.write(f"holo mcp: {name} {raw!r} must be HOST:PORT\n")
+                return 2
+            host, _, port_s = raw.rpartition(":")
             try:
-                ip_port = int(port_s)
+                port = int(port_s)
             except ValueError:
-                sys.stderr.write(
-                    f"holo mcp: --input-proxy port {port_s!r} not an integer\n"
-                )
+                sys.stderr.write(f"holo mcp: {name} port {port_s!r} not an integer\n")
                 return 2
-            if not (0 < ip_port < 65536):
-                sys.stderr.write(
-                    f"holo mcp: --input-proxy port {ip_port} out of range\n"
-                )
+            if not (0 < port < 65536):
+                sys.stderr.write(f"holo mcp: {name} port {port} out of range\n")
                 return 2
             if not host:
-                sys.stderr.write(
-                    "holo mcp: --input-proxy host is empty\n"
-                )
+                sys.stderr.write(f"holo mcp: {name} host is empty\n")
                 return 2
-            input_proxy = (host, ip_port)
+            return (host, port)
+
+        # --input-proxy is the original flag; --remote-input is the alias
+        # that lines up with --remote-screen. Accept either, reject both
+        # together (since they'd compete for the same kwarg).
+        input_proxy: tuple[str, int] | None = None
+        for flag in ("--input-proxy", "--remote-input"):
+            parsed = _parse_endpoint_flag(flag)
+            if parsed == 2:
+                return 2
+            if parsed is not None:
+                if input_proxy is not None:
+                    sys.stderr.write(
+                        "holo mcp: --input-proxy and --remote-input are "
+                        "aliases — pass only one\n"
+                    )
+                    return 2
+                input_proxy = parsed  # type: ignore[assignment]
+
+        remote_screen: tuple[str, int] | None = None
+        rs_parsed = _parse_endpoint_flag("--remote-screen")
+        if rs_parsed == 2:
+            return 2
+        if rs_parsed is not None:
+            remote_screen = rs_parsed  # type: ignore[assignment]
 
         return _cmd_mcp(
             hide_qr="--hide-qr" in rest,
@@ -1670,6 +1709,7 @@ def main(argv: list[str] | None = None) -> int:
             no_bookmarklet="--no-bookmarklet" in rest,
             no_browser="--no-browser" in rest,
             input_proxy=input_proxy,
+            remote_screen=remote_screen,
             listen_port=listen_port,
             announce=announce,
             announce_session=announce_session,

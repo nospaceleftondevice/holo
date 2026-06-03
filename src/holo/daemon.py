@@ -40,6 +40,7 @@ class Daemon:
         enable_screen: bool = False,
         no_bookmarklet: bool = False,
         input_proxy: tuple[str, int] | None = None,
+        remote_screen: tuple[str, int] | None = None,
     ) -> None:
         self.hide_qr = hide_qr
         self.enable_screen = enable_screen
@@ -53,20 +54,34 @@ class Daemon:
         self._bridge: BridgeClient | None = None
         self._bridge_attempted: bool = False
 
-        # Remote input proxy: when set, the input methods (click, key,
-        # type_text, scroll, activate) route to a `holo mcp --listen`
-        # on another host. Capture (screenshot, find_image, etc.)
-        # stays on the local SikuliX bridge — this is the split-machine
-        # topology where the local Mac can read its screen but
-        # corporate policy blocks event injection, and a peer machine
-        # has a Screen Sharing client connected so its mouse / kbd
-        # events relay back to the local display.
+        # Remote proxies: each routes a subset of bridge methods to a
+        # `holo mcp --listen` on another host instead of the local
+        # SikuliX bridge. `_remote_input` covers click/key/type/
+        # scroll/activate; `_remote_screen` covers screenshot/
+        # find_image/find_image_path/user_capture. Either can be unset
+        # (None) → those ops use the local bridge.
+        #
+        # When both proxies target the same host:port, share one
+        # backend instance (one MCP connection, one connect
+        # subprocess). The set is small (`_backends` is keyed by
+        # (host, port)) — only ever 1 or 2 entries.
         self._remote_input: Any = None
-        if input_proxy is not None:
-            from holo.remote_input import RemoteInputBackend
-            backend = RemoteInputBackend(input_proxy[0], input_proxy[1])
-            backend.start()  # raises on failure — fail fast at boot
-            self._remote_input = backend
+        self._remote_screen: Any = None
+        self._backends: dict[tuple[str, int], Any] = {}
+        if input_proxy is not None or remote_screen is not None:
+            from holo.remote_backend import RemoteHoloBackend
+
+            def _get(endpoint: tuple[str, int]) -> Any:
+                if endpoint not in self._backends:
+                    b = RemoteHoloBackend(endpoint[0], endpoint[1])
+                    b.start()  # fail fast at boot if remote unreachable
+                    self._backends[endpoint] = b
+                return self._backends[endpoint]
+
+            if input_proxy is not None:
+                self._remote_input = _get(input_proxy)
+            if remote_screen is not None:
+                self._remote_screen = _get(remote_screen)
 
     @property
     def bridge(self) -> BridgeClient | None:
@@ -109,9 +124,12 @@ class Daemon:
         if self._bridge is not None:
             self._bridge.stop()
             self._bridge = None
-        if self._remote_input is not None:
+        # Stop each unique backend once (input + screen may share).
+        for backend in self._backends.values():
             try:
-                self._remote_input.stop()
+                backend.stop()
             except Exception:  # noqa: BLE001 — shutdown must not raise
                 pass
-            self._remote_input = None
+        self._backends.clear()
+        self._remote_input = None
+        self._remote_screen = None
