@@ -78,9 +78,11 @@ After editing `bookmarklet/core.js` you must rebuild **and** re-drag the bookmar
 
 `src/holo/mcp_server.py` exposes a `FastMCP` server with the channel + screen tools (`calibrate`, `list_channels`, `drop_channel`, `ping`, `read_global`, `send_command`, `bookmarklet_query`, plus `app_activate`, `screen_*` when `--screen` is on, plus `browser_*` AppleScript ops). `HoloMCPServer` owns one lazily-constructed `Daemon` and translates `CalibrationError` / `CommandError` into MCP-style runtime errors.
 
-Two flags tailor the surface:
+Four flags tailor the surface:
 - `--screen` (kwarg `enable_screen`) — registers SikuliX-backed tools (`screen_*`, `app_activate`, `ui_template_*`). Off by default; opt-in keeps the JVM cost off the table for browser-only agents.
 - `--no-bookmarklet` (kwarg `no_bookmarklet`) — skips the WSServer entirely and drops the seven channel-dependent tool registrations (`calibrate`, `list_channels`, `drop_channel`, `ping`, `read_global`, `send_command`, `bookmarklet_query`). Suits agents that never touch the bookmarklet (Slack-only orchestrator, AppleScript-only nav). `Daemon.calibrate()` raises in this mode; channel methods on `HoloMCPServer` still exist defensively but the tools aren't exposed.
+- `--no-browser` (kwarg `no_browser`) — drops the eleven `browser_*` AppleScript tools (`browser_navigate` / `_new_tab` / `_close_active_tab` / `_activate_tab` / `_list_tabs` / `_read_active_url` / `_read_active_title` / `_reload` / `_back` / `_forward` / `_execute_js`). Used by the input-only peer in the split-input-proxy topology where Chrome control is irrelevant.
+- `--input-proxy HOST:PORT` (kwarg `input_proxy=(host, port)`) — routes the five input ops (`screen_click`, `screen_key`, `screen_type`, `screen_scroll`, `app_activate`) to a remote `holo mcp --listen` instead of the local SikuliX bridge. Capture (`screen_shot`, `find_image`, `ui_template_*` find/capture) stays local. See **Split-input proxy** below.
 
 Plus separate orthogonal capabilities:
 - `--announce` (kwargs `announce`, `announce_session`, `announce_user`, `announce_ssh_user`) — broadcasts an mDNS service record (`_holo-session._tcp.local.`) so a companion desktop app on the same LAN can discover live sessions. See **Session announcement** below.
@@ -197,6 +199,20 @@ curl -H "X-Holo-Caps-Token: <token from above>" http://127.0.0.1:<caps_port>/cap
 **MCP tool surface for the read side** (always exposed, no `--bookmarklet`/`--screen` dependency): `holo_discover_sessions(wait_s=0)` returns sessions from a continuously-running mDNS cache — instant, no per-call browse delay; `holo_fetch_capabilities(instance, timeout_s=5)` accepts an instance label / session / host (matched in that order via `_match_session`), reads the target from the cache, picks the first reachable IP from the broadcast list, and returns `{instance, host, session, ip_used, capabilities}`. Both are how an agent connected to one holo session does capability-aware routing — without them, `--announce-capabilities` is invisible to the agent and only useful via `holo discover` + `curl` from the user's shell.
 
 **Persistent discovery cache.** `HoloMCPServer.__init__` always starts a `DiscoverHandle` (zeroconf browser + `SessionStore` + stale sweeper, always-on, regardless of `--announce`) so the two read-side tools answer instantly. The cache populates over the first ~2-3 s of mDNS solicitation; agents that just spawned a daemon and want to immediately query it can pass `wait_s=1.5` to `holo_discover_sessions` as a grace period. mDNS startup failure (no network, multicast disabled) is logged and downgrades to "discover_sessions returns empty / fetch_capabilities raises" — never kills the MCP server.
+
+## Split-input proxy (`--input-proxy HOST:PORT`)
+
+Corporate macOS lockdowns commonly disable `java.awt.Robot` / `CGEvent`-based event injection (Accessibility TCC blocked by MDM profile) while leaving `screencapture` / SikuliX capture functional. The split-input topology works around this: capture stays on the locked machine A (where it's still allowed), and input is proxied to peer machine B which has the corporate Mac's screen shared in via macOS Screen Sharing.app. B's local SikuliX/Robot fires events on B's display; Screen Sharing.app's input forwarding path relays them back to A. Holo is unaware of the screen-sharing protocol — the viewer's job is to mirror events, period.
+
+Wiring:
+- **Machine B (input relay):** `holo mcp --screen --no-bookmarklet --no-browser --listen 7081`. Stock holo deployment. macOS Screen Sharing.app on B must be foreground, fullscreen, 1:1 mapping, "pass all keys" enabled so the events fire inside the viewer's coordinate space.
+- **Machine A (locked, runs the agent):** `holo mcp --input-proxy 192.168.1.50:7081`. Daemon constructs a `RemoteInputBackend` (`src/holo/remote_input.py`) at startup; failure-to-connect fails fast at boot rather than at first click.
+
+`HoloMCPServer._input_target()` returns `daemon._remote_input or daemon.bridge` — five input ops (`screen_click`, `screen_key`, `screen_type`, `screen_scroll`, `app_activate`) plus `ui_template_click`'s post-find click route through the helper. Every capture call still uses `_require_bridge()` and stays local. `ui_template_click` is a compound: find runs on A, click on B.
+
+`RemoteInputBackend` is a sync facade over the official `mcp` Python SDK's async `ClientSession`. It spawns `holo connect HOST:PORT` as a child subprocess (reusing the existing stdio↔TCP bridge with the magic-prefix handshake), wraps that subprocess's stdio in the SDK's `stdio_client`, runs an asyncio loop on a dedicated daemon thread, and exposes sync methods whose signatures match `BridgeClient`'s. Tool calls go through `asyncio.run_coroutine_threadsafe`. Method names map 1:1 to MCP tool names on the remote (`click` → `screen_click`, `activate` → `app_activate`, etc.). The MCP SDK's `StructuredContent` is preferred for return-value unwrapping; falls back to parsing the first text block as JSON. `isError=true` tool results raise `RemoteInputError` with the remote's error text.
+
+Trust model: the magic-prefix handshake gates connections to B's `--listen` port; same-LAN attackers who can hit the port can drive input on A through this channel. Don't expose `holo mcp --listen` outside trusted segments. Coordinate space is assumed 1:1 between A's display and B's viewer (Screen Sharing.app default); HiDPI / scaling mismatches would need a translation factor not yet implemented.
 
 ## UI template cache (desktop DOM analog)
 

@@ -286,6 +286,8 @@ def _cmd_mcp(
     hide_qr: bool = False,
     enable_screen: bool = False,
     no_bookmarklet: bool = False,
+    no_browser: bool = False,
+    input_proxy: tuple[str, int] | None = None,
     listen_port: int | None = None,
     announce: bool = False,
     announce_session: str | None = None,
@@ -336,6 +338,13 @@ def _cmd_mcp(
             lines.append("Screen tools: SikuliX bridge enabled")
         if no_bookmarklet:
             lines.append("Bookmarklet channel: disabled (--no-bookmarklet)")
+        if no_browser:
+            lines.append("Browser AppleScript tools: disabled (--no-browser)")
+        if input_proxy is not None:
+            lines.append(
+                f"Input proxy: events route to remote holo at "
+                f"{input_proxy[0]}:{input_proxy[1]} (--input-proxy)"
+            )
         if announce:
             label_bits = []
             if announce_session:
@@ -387,6 +396,8 @@ def _cmd_mcp(
             hide_qr=hide_qr,
             enable_screen=enable_screen,
             no_bookmarklet=no_bookmarklet,
+            no_browser=no_browser,
+            input_proxy=input_proxy,
             **announce_kwargs,
         )
         return 0
@@ -398,6 +409,8 @@ def _cmd_mcp(
         hide_qr=hide_qr,
         enable_screen=enable_screen,
         no_bookmarklet=no_bookmarklet,
+        no_browser=no_browser,
+        input_proxy=input_proxy,
         **announce_kwargs,
     )
     return 0
@@ -1349,6 +1362,7 @@ Commands:
   demo [--manual] [--hide-qr] [--screen]
                           end-to-end smoke test against the in-page agent
   mcp [--listen PORT] [--hide-qr] [--screen] [--no-bookmarklet]
+      [--no-browser] [--input-proxy HOST:PORT]
       [--announce] [--announce-session NAME] [--announce-user NAME]
       [--announce-ssh-user NAME] [--announce-ip A,B,C]
       [--announce-capabilities] [--announce-command "CMD"]
@@ -1356,6 +1370,16 @@ Commands:
                           run the MCP server over stdio (or TCP with --listen)
                           --screen          enable screen / template / app_activate tools
                           --no-bookmarklet  drop channel tools; no WS server
+                          --no-browser      drop browser_* AppleScript tools
+                                            (input-only peer in split topology)
+                          --input-proxy HOST:PORT  route screen_click/screen_key/
+                                            screen_type/screen_scroll/app_activate
+                                            to a remote holo at HOST:PORT (use
+                                            this when corporate policy blocks
+                                            local mouse/keyboard injection but a
+                                            peer machine with a Screen Sharing
+                                            client to this host can inject for
+                                            you). Capture stays local.
                           --announce        broadcast session via mDNS
                           --announce-session NAME    logical session id
                           --announce-user NAME       display label (default: $USER)
@@ -1601,10 +1625,46 @@ def main(argv: list[str] | None = None) -> int:
             else None
         )
 
+        input_proxy_raw = _value_flag(rest, "--input-proxy")
+        if input_proxy_raw is _MISSING_ARG:
+            sys.stderr.write(
+                "holo mcp: --input-proxy requires a HOST:PORT value\n"
+            )
+            return 2
+        input_proxy: tuple[str, int] | None = None
+        if isinstance(input_proxy_raw, str):
+            if ":" not in input_proxy_raw:
+                sys.stderr.write(
+                    f"holo mcp: --input-proxy {input_proxy_raw!r} must be "
+                    "HOST:PORT\n"
+                )
+                return 2
+            host, _, port_s = input_proxy_raw.rpartition(":")
+            try:
+                ip_port = int(port_s)
+            except ValueError:
+                sys.stderr.write(
+                    f"holo mcp: --input-proxy port {port_s!r} not an integer\n"
+                )
+                return 2
+            if not (0 < ip_port < 65536):
+                sys.stderr.write(
+                    f"holo mcp: --input-proxy port {ip_port} out of range\n"
+                )
+                return 2
+            if not host:
+                sys.stderr.write(
+                    "holo mcp: --input-proxy host is empty\n"
+                )
+                return 2
+            input_proxy = (host, ip_port)
+
         return _cmd_mcp(
             hide_qr="--hide-qr" in rest,
             enable_screen="--screen" in rest,
             no_bookmarklet="--no-bookmarklet" in rest,
+            no_browser="--no-browser" in rest,
+            input_proxy=input_proxy,
             listen_port=listen_port,
             announce=announce,
             announce_session=announce_session,

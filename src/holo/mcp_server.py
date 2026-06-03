@@ -50,6 +50,8 @@ class HoloMCPServer:
         hide_qr: bool = False,
         enable_screen: bool = False,
         no_bookmarklet: bool = False,
+        no_browser: bool = False,
+        input_proxy: tuple[str, int] | None = None,
         templates: TemplateStore | None = None,
         announce: bool = False,
         announce_session: str | None = None,
@@ -65,6 +67,8 @@ class HoloMCPServer:
         self.hide_qr = hide_qr
         self.enable_screen = enable_screen
         self.no_bookmarklet = no_bookmarklet
+        self.no_browser = no_browser
+        self.input_proxy = input_proxy
         self._daemon: Daemon | None = None
         self._daemon_lock = threading.Lock()
         # Template cache lives across daemon restarts — it's a pure
@@ -203,6 +207,7 @@ class HoloMCPServer:
                     hide_qr=self.hide_qr,
                     enable_screen=self.enable_screen,
                     no_bookmarklet=self.no_bookmarklet,
+                    input_proxy=self.input_proxy,
                 )
             return self._daemon
 
@@ -341,7 +346,12 @@ class HoloMCPServer:
     # ---- screen / SikuliX tools (no sid; drives whatever's foreground) ----
 
     def _require_bridge(self) -> Any:
-        """Return the daemon's SikuliX bridge or raise a clean error."""
+        """Return the daemon's SikuliX bridge or raise a clean error.
+
+        Used by capture-only paths (screenshot, find_image, user_capture)
+        that must run on this host. Input ops use :meth:`_input_target`
+        instead — they can route to a remote daemon via `--input-proxy`.
+        """
         bridge = self.daemon.bridge
         if bridge is None:
             raise RuntimeError(
@@ -351,23 +361,40 @@ class HoloMCPServer:
             )
         return bridge
 
+    def _input_target(self) -> Any:
+        """Return the backend for input ops (click / key / type / scroll
+        / activate).
+
+        Prefers the remote input proxy when `--input-proxy HOST:PORT`
+        is set: corporate-locked machines can capture their own screen
+        but can't inject events, and the proxy points at a peer holo
+        on a machine that can. Falls back to the local SikuliX bridge
+        otherwise. The two backends present identical input
+        signatures, so the call sites are unchanged.
+        """
+        daemon = self.daemon
+        remote = getattr(daemon, "_remote_input", None)
+        if remote is not None:
+            return remote
+        return self._require_bridge()
+
     def app_activate(self, name: str) -> dict[str, Any]:
         """Bring an application to the foreground by name."""
-        return self._require_bridge().activate(name)
+        return self._input_target().activate(name)
 
     def screen_click(
         self, x: int, y: int, modifiers: list[str] | None = None
     ) -> dict[str, Any]:
         """Click at screen coordinates, optionally holding modifiers."""
-        return self._require_bridge().click(x, y, modifiers=modifiers or [])
+        return self._input_target().click(x, y, modifiers=modifiers or [])
 
     def screen_type(self, text: str) -> dict[str, Any]:
         """Type a literal string into whatever has keyboard focus."""
-        return self._require_bridge().type_text(text)
+        return self._input_target().type_text(text)
 
     def screen_key(self, combo: str) -> dict[str, Any]:
         """Send a key combo, e.g. 'cmd+v', 'enter', 'shift+tab'."""
-        return self._require_bridge().key(combo)
+        return self._input_target().key(combo)
 
     def screen_scroll(
         self,
@@ -377,7 +404,7 @@ class HoloMCPServer:
         steps: int = 3,
     ) -> dict[str, Any]:
         """Move to (x, y) and emit `steps` mouse-wheel events."""
-        return self._require_bridge().scroll(
+        return self._input_target().scroll(
             x, y, direction=direction, steps=steps
         )
 
@@ -522,7 +549,7 @@ class HoloMCPServer:
             )
         cx = int(match["x"] + match["width"] / 2)
         cy = int(match["y"] + match["height"] / 2)
-        self._require_bridge().click(cx, cy)
+        self._input_target().click(cx, cy)
         return {
             "clicked": True,
             "x": cx,
@@ -1043,6 +1070,8 @@ def build_server(
     hide_qr: bool = False,
     enable_screen: bool = False,
     no_bookmarklet: bool = False,
+    no_browser: bool = False,
+    input_proxy: tuple[str, int] | None = None,
     announce: bool = False,
     announce_session: str | None = None,
     announce_user: str | None = None,
@@ -1074,6 +1103,8 @@ def build_server(
         hide_qr=hide_qr,
         enable_screen=enable_screen,
         no_bookmarklet=no_bookmarklet,
+        no_browser=no_browser,
+        input_proxy=input_proxy,
         announce=announce,
         announce_session=announce_session,
         announce_user=announce_user,
@@ -1287,81 +1318,87 @@ def build_server(
     # Prefer these over keystroke automation (`app_activate` + `screen_key`)
     # for any browser navigation — they're synchronous and don't fight
     # macOS focus.
+    #
+    # Gated by `no_browser=False` so input-only deployments (the
+    # `holo mcp --screen --no-bookmarklet --no-browser --listen` peer
+    # in the split-input-proxy topology) don't expose tools that the
+    # agent on the other side never reaches anyway.
 
-    @mcp.tool(
-        description=(
-            "Set the URL of Chrome's active tab in the front window. "
-            "Reliable navigation without keystroke simulation (macOS only)."
+    if not no_browser:
+        @mcp.tool(
+            description=(
+                "Set the URL of Chrome's active tab in the front window. "
+                "Reliable navigation without keystroke simulation (macOS only)."
+            )
         )
-    )
-    def browser_navigate(url: str) -> dict[str, Any]:
-        return holo.browser_navigate(url)
+        def browser_navigate(url: str) -> dict[str, Any]:
+            return holo.browser_navigate(url)
 
-    @mcp.tool(
-        description=(
-            "Open a new tab in Chrome's front window. "
-            "If `url` is omitted, the tab opens to the New Tab page."
+        @mcp.tool(
+            description=(
+                "Open a new tab in Chrome's front window. "
+                "If `url` is omitted, the tab opens to the New Tab page."
+            )
         )
-    )
-    def browser_new_tab(url: str | None = None) -> dict[str, Any]:
-        return holo.browser_new_tab(url)
+        def browser_new_tab(url: str | None = None) -> dict[str, Any]:
+            return holo.browser_new_tab(url)
 
-    @mcp.tool(description="Close the active tab of Chrome's front window.")
-    def browser_close_active_tab() -> dict[str, Any]:
-        return holo.browser_close_active_tab()
+        @mcp.tool(description="Close the active tab of Chrome's front window.")
+        def browser_close_active_tab() -> dict[str, Any]:
+            return holo.browser_close_active_tab()
 
-    @mcp.tool(
-        description=(
-            "Make tab `index` (1-based) the active tab of Chrome's front "
-            "window and bring Chrome to the foreground."
+        @mcp.tool(
+            description=(
+                "Make tab `index` (1-based) the active tab of Chrome's front "
+                "window and bring Chrome to the foreground."
+            )
         )
-    )
-    def browser_activate_tab(index: int) -> dict[str, Any]:
-        return holo.browser_activate_tab(index)
+        def browser_activate_tab(index: int) -> dict[str, Any]:
+            return holo.browser_activate_tab(index)
 
-    @mcp.tool(
-        description=(
-            "List tabs in Chrome's front window. Returns "
-            "{tabs: [{id, title, url, index}], active: index}."
+        @mcp.tool(
+            description=(
+                "List tabs in Chrome's front window. Returns "
+                "{tabs: [{id, title, url, index}], active: index}."
+            )
         )
-    )
-    def browser_list_tabs() -> dict[str, Any]:
-        return holo.browser_list_tabs()
+        def browser_list_tabs() -> dict[str, Any]:
+            return holo.browser_list_tabs()
 
-    @mcp.tool(description="Read the URL of Chrome's active tab.")
-    def browser_read_active_url() -> dict[str, Any]:
-        return holo.browser_read_active_url()
+        @mcp.tool(description="Read the URL of Chrome's active tab.")
+        def browser_read_active_url() -> dict[str, Any]:
+            return holo.browser_read_active_url()
 
-    @mcp.tool(description="Read the title of Chrome's active tab.")
-    def browser_read_active_title() -> dict[str, Any]:
-        return holo.browser_read_active_title()
+        @mcp.tool(description="Read the title of Chrome's active tab.")
+        def browser_read_active_title() -> dict[str, Any]:
+            return holo.browser_read_active_title()
 
-    @mcp.tool(description="Reload Chrome's active tab.")
-    def browser_reload() -> dict[str, Any]:
-        return holo.browser_reload()
+        @mcp.tool(description="Reload Chrome's active tab.")
+        def browser_reload() -> dict[str, Any]:
+            return holo.browser_reload()
 
-    @mcp.tool(description="Navigate back in Chrome's active tab history.")
-    def browser_back() -> dict[str, Any]:
-        return holo.browser_back()
+        @mcp.tool(description="Navigate back in Chrome's active tab history.")
+        def browser_back() -> dict[str, Any]:
+            return holo.browser_back()
 
-    @mcp.tool(description="Navigate forward in Chrome's active tab history.")
-    def browser_forward() -> dict[str, Any]:
-        return holo.browser_forward()
+        @mcp.tool(description="Navigate forward in Chrome's active tab history.")
+        def browser_forward() -> dict[str, Any]:
+            return holo.browser_forward()
 
-    @mcp.tool(
-        description=(
-            "Run a JS expression in Chrome's active tab via AppleScript "
-            "and return its stringified result. Use this for arbitrary "
-            "DOM queries (`document.querySelector('button')?.innerText`, "
-            "`JSON.stringify(...)`, etc). "
-            "Requires Chrome's 'Allow JavaScript from Apple Events' "
-            "toggle (View → Developer); if disabled, the error message "
-            "will say so — fall back to `bookmarklet_query` against a "
-            "calibrated channel for CSP-safe DOM access."
+        @mcp.tool(
+            description=(
+                "Run a JS expression in Chrome's active tab via AppleScript "
+                "and return its stringified result. Use this for arbitrary "
+                "DOM queries (`document.querySelector('button')?.innerText`, "
+                "`JSON.stringify(...)`, etc). "
+                "Requires Chrome's 'Allow JavaScript from Apple Events' "
+                "toggle (View → Developer); if disabled, the error message "
+                "will say so — fall back to `bookmarklet_query` against a "
+                "calibrated channel for CSP-safe DOM access."
+            )
         )
-    )
-    def browser_execute_js(js: str) -> dict[str, Any]:
-        return holo.browser_execute_js(js)
+        def browser_execute_js(js: str) -> dict[str, Any]:
+            return holo.browser_execute_js(js)
 
     if not no_bookmarklet:
         @mcp.tool(
@@ -1540,6 +1577,8 @@ def run(
     hide_qr: bool = False,
     enable_screen: bool = False,
     no_bookmarklet: bool = False,
+    no_browser: bool = False,
+    input_proxy: tuple[str, int] | None = None,
     announce: bool = False,
     announce_session: str | None = None,
     announce_user: str | None = None,
@@ -1555,6 +1594,8 @@ def run(
         hide_qr=hide_qr,
         enable_screen=enable_screen,
         no_bookmarklet=no_bookmarklet,
+        no_browser=no_browser,
+        input_proxy=input_proxy,
         announce=announce,
         announce_session=announce_session,
         announce_user=announce_user,
@@ -1581,6 +1622,8 @@ def run_tcp(
     hide_qr: bool = False,
     enable_screen: bool = False,
     no_bookmarklet: bool = False,
+    no_browser: bool = False,
+    input_proxy: tuple[str, int] | None = None,
     announce: bool = False,
     announce_session: str | None = None,
     announce_user: str | None = None,
@@ -1608,6 +1651,8 @@ def run_tcp(
         hide_qr=hide_qr,
         enable_screen=enable_screen,
         no_bookmarklet=no_bookmarklet,
+        no_browser=no_browser,
+        input_proxy=input_proxy,
         announce=announce,
         announce_session=announce_session,
         announce_user=announce_user,

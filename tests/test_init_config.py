@@ -44,7 +44,8 @@ def _input_seq(monkeypatch, answers):
 def test_writes_mcp_json_with_selected_ip_and_tmux(cwd, tty, monkeypatch):
     monkeypatch.setattr(init_config, "_enumerate_ips", lambda: ["10.0.0.5", "192.168.1.10"])
     monkeypatch.setattr(init_config.shutil, "which", lambda _: "/usr/local/bin/tmux")
-    _input_seq(monkeypatch, ["n", "2", ""])  # decline screen, pick IP #2, accept tmux default
+    # decline screen, decline input-proxy, pick IP #2, accept tmux default
+    _input_seq(monkeypatch, ["n", "", "2", ""])
 
     rc = init_config.run("claude")
     assert rc == 0
@@ -62,7 +63,8 @@ def test_writes_mcp_json_with_selected_ip_and_tmux(cwd, tty, monkeypatch):
 def test_writes_mcp_json_without_tmux(cwd, tty, monkeypatch):
     monkeypatch.setattr(init_config, "_enumerate_ips", lambda: ["10.0.0.5"])
     monkeypatch.setattr(init_config.shutil, "which", lambda _: None)
-    _input_seq(monkeypatch, ["n", "1"])  # decline screen, pick the only IP
+    # decline screen, decline input-proxy, pick the only IP
+    _input_seq(monkeypatch, ["n", "", "1"])
 
     rc = init_config.run("claude")
     assert rc == 0
@@ -77,8 +79,8 @@ def test_writes_mcp_json_without_tmux(cwd, tty, monkeypatch):
 def test_manual_ip_entry(cwd, tty, monkeypatch):
     monkeypatch.setattr(init_config, "_enumerate_ips", lambda: ["10.0.0.5"])
     monkeypatch.setattr(init_config.shutil, "which", lambda _: None)
-    # decline screen, "enter manually", then IP
-    _input_seq(monkeypatch, ["n", "2", "192.168.50.50"])
+    # decline screen, decline input-proxy, "enter manually", then IP
+    _input_seq(monkeypatch, ["n", "", "2", "192.168.50.50"])
 
     rc = init_config.run("claude")
     assert rc == 0
@@ -90,7 +92,8 @@ def test_manual_ip_entry(cwd, tty, monkeypatch):
 def test_manual_ip_supports_trailing_dot_prefix(cwd, tty, monkeypatch):
     monkeypatch.setattr(init_config, "_enumerate_ips", lambda: [])
     monkeypatch.setattr(init_config.shutil, "which", lambda _: None)
-    _input_seq(monkeypatch, ["n", "1", "192.168.1."])  # decline screen, manual entry, prefix
+    # decline screen, decline input-proxy, manual entry, prefix
+    _input_seq(monkeypatch, ["n", "", "1", "192.168.1."])
 
     rc = init_config.run("claude")
     assert rc == 0
@@ -104,7 +107,8 @@ def test_manual_ip_supports_trailing_dot_prefix(cwd, tty, monkeypatch):
 def test_skip_ip_omits_flag(cwd, tty, monkeypatch):
     monkeypatch.setattr(init_config, "_enumerate_ips", lambda: ["10.0.0.5"])
     monkeypatch.setattr(init_config.shutil, "which", lambda _: None)
-    _input_seq(monkeypatch, ["n", "3"])  # decline screen, skip option
+    # decline screen, decline input-proxy, skip option
+    _input_seq(monkeypatch, ["n", "", "3"])
 
     rc = init_config.run("claude")
     assert rc == 0
@@ -115,7 +119,8 @@ def test_skip_ip_omits_flag(cwd, tty, monkeypatch):
 def test_decline_tmux_omits_announce_command(cwd, tty, monkeypatch):
     monkeypatch.setattr(init_config, "_enumerate_ips", lambda: ["10.0.0.5"])
     monkeypatch.setattr(init_config.shutil, "which", lambda _: "/usr/local/bin/tmux")
-    _input_seq(monkeypatch, ["n", "1", "n"])  # decline screen, pick IP #1, decline tmux
+    # decline screen, decline input-proxy, pick IP #1, decline tmux
+    _input_seq(monkeypatch, ["n", "", "1", "n"])
 
     rc = init_config.run("claude")
     assert rc == 0
@@ -128,7 +133,8 @@ def test_decline_tmux_omits_announce_command(cwd, tty, monkeypatch):
 def test_enable_screen_adds_flag(cwd, tty, monkeypatch):
     monkeypatch.setattr(init_config, "_enumerate_ips", lambda: ["10.0.0.5"])
     monkeypatch.setattr(init_config.shutil, "which", lambda _: None)
-    _input_seq(monkeypatch, ["y", "1"])  # enable screen, pick IP #1
+    # enable screen, decline input-proxy, pick IP #1
+    _input_seq(monkeypatch, ["y", "", "1"])
 
     rc = init_config.run("claude")
     assert rc == 0
@@ -142,7 +148,8 @@ def test_enable_screen_adds_flag(cwd, tty, monkeypatch):
 def test_screen_yes_full_word(cwd, tty, monkeypatch):
     monkeypatch.setattr(init_config, "_enumerate_ips", lambda: [])
     monkeypatch.setattr(init_config.shutil, "which", lambda _: None)
-    _input_seq(monkeypatch, ["yes", "2"])  # enable screen, skip IP
+    # enable screen, decline input-proxy, skip IP
+    _input_seq(monkeypatch, ["yes", "", "2"])
 
     rc = init_config.run("claude")
     assert rc == 0
@@ -154,7 +161,8 @@ def test_screen_empty_answer_defaults_off(cwd, tty, monkeypatch):
     """Default is no — bare Enter must NOT enable --screen."""
     monkeypatch.setattr(init_config, "_enumerate_ips", lambda: ["10.0.0.5"])
     monkeypatch.setattr(init_config.shutil, "which", lambda _: None)
-    _input_seq(monkeypatch, ["", "1"])  # bare Enter, pick IP
+    # bare Enter (decline screen), decline input-proxy, pick IP
+    _input_seq(monkeypatch, ["", "", "1"])
 
     rc = init_config.run("claude")
     assert rc == 0
@@ -162,12 +170,49 @@ def test_screen_empty_answer_defaults_off(cwd, tty, monkeypatch):
     assert "--screen" not in entry["args"]
 
 
+# --- --input-proxy prompt ------------------------------------------------
+
+def test_input_proxy_adds_flag(cwd, tty, monkeypatch):
+    """A non-empty HOST:PORT answer adds --input-proxy to the args."""
+    monkeypatch.setattr(init_config, "_enumerate_ips", lambda: ["10.0.0.5"])
+    monkeypatch.setattr(init_config.shutil, "which", lambda _: None)
+    # decline screen, accept proxy at 192.168.1.50:7081, pick IP
+    _input_seq(monkeypatch, ["n", "192.168.1.50:7081", "1"])
+
+    rc = init_config.run("claude")
+    assert rc == 0
+    entry = json.loads((cwd / ".mcp.json").read_text())["mcpServers"]["holo"]
+    assert entry["args"] == [
+        "mcp", "--no-bookmarklet",
+        "--input-proxy", "192.168.1.50:7081",
+        "--announce",
+        "--announce-ip", "10.0.0.5",
+    ]
+
+
+def test_input_proxy_invalid_format_skipped(cwd, tty, monkeypatch, capsys):
+    """A non-empty answer without a colon is rejected with a clear message
+    and the flag is omitted (not a hard error — the rest of the wizard
+    still completes)."""
+    monkeypatch.setattr(init_config, "_enumerate_ips", lambda: ["10.0.0.5"])
+    monkeypatch.setattr(init_config.shutil, "which", lambda _: None)
+    # decline screen, malformed proxy, pick IP
+    _input_seq(monkeypatch, ["n", "not-a-hostport", "1"])
+
+    rc = init_config.run("claude")
+    assert rc == 0
+    entry = json.loads((cwd / ".mcp.json").read_text())["mcpServers"]["holo"]
+    assert "--input-proxy" not in entry["args"]
+    assert "Invalid HOST:PORT" in capsys.readouterr().out
+
+
 # --- input validation ----------------------------------------------------
 
 def test_retries_on_non_integer_then_out_of_range(cwd, tty, monkeypatch, capsys):
     monkeypatch.setattr(init_config, "_enumerate_ips", lambda: ["10.0.0.5"])
     monkeypatch.setattr(init_config.shutil, "which", lambda _: None)
-    _input_seq(monkeypatch, ["n", "abc", "99", "1"])  # decline screen, then garbage, OOB, valid
+    # decline screen, decline input-proxy, then garbage, OOB, valid
+    _input_seq(monkeypatch, ["n", "", "abc", "99", "1"])
 
     rc = init_config.run("claude")
     assert rc == 0
@@ -179,7 +224,8 @@ def test_retries_on_non_integer_then_out_of_range(cwd, tty, monkeypatch, capsys)
 def test_manual_entry_retries_on_empty(cwd, tty, monkeypatch, capsys):
     monkeypatch.setattr(init_config, "_enumerate_ips", lambda: [])
     monkeypatch.setattr(init_config.shutil, "which", lambda _: None)
-    _input_seq(monkeypatch, ["n", "1", "", "10.0.0.5"])  # decline screen, manual, empty, retry
+    # decline screen, decline input-proxy, manual, empty, retry
+    _input_seq(monkeypatch, ["n", "", "1", "", "10.0.0.5"])
 
     rc = init_config.run("claude")
     assert rc == 0
@@ -208,7 +254,8 @@ def test_force_overwrites_existing(cwd, tty, monkeypatch):
     existing.write_text('{"mcpServers": {"old": {"command": "x"}}}')
     monkeypatch.setattr(init_config, "_enumerate_ips", lambda: ["10.0.0.5"])
     monkeypatch.setattr(init_config.shutil, "which", lambda _: None)
-    _input_seq(monkeypatch, ["n", "1"])  # decline screen, pick IP #1
+    # decline screen, decline input-proxy, pick IP #1
+    _input_seq(monkeypatch, ["n", "", "1"])
 
     rc = init_config.run("claude", force=True)
     assert rc == 0
@@ -240,7 +287,8 @@ def test_unsupported_cli(cwd, capsys):
 def test_respects_explicit_cwd(tmp_path, tty, monkeypatch):
     monkeypatch.setattr(init_config, "_enumerate_ips", lambda: [])
     monkeypatch.setattr(init_config.shutil, "which", lambda _: None)
-    _input_seq(monkeypatch, ["n", "2"])  # decline screen, skip option
+    # decline screen, decline input-proxy, skip option
+    _input_seq(monkeypatch, ["n", "", "2"])
 
     target_dir = tmp_path / "elsewhere"
     target_dir.mkdir()

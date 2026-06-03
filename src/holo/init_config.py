@@ -104,16 +104,51 @@ def _prompt_enable_screen() -> bool:
     return ans in ("y", "yes")
 
 
+def _prompt_input_proxy() -> str | None:
+    """Ask whether to route mouse/keyboard ops to a remote holo daemon.
+
+    Used when corporate policy blocks local event injection (e.g.
+    `java.awt.Robot` rejected by Accessibility TCC) but a peer machine
+    with a Screen Sharing client to this host can inject for you.
+
+    Returns ``"host:port"`` if confirmed, else None.
+    """
+    print(
+        "Route input ops (click / key / type / scroll / app_activate) "
+        "to a remote holo?"
+    )
+    print(
+        "  Use this when local mouse / keyboard injection is blocked by "
+        "corporate policy"
+    )
+    print(
+        "  but a peer machine has a Screen Sharing client to this host. "
+        "Capture stays local."
+    )
+    raw = input(
+        "Remote HOST:PORT (blank to skip): "
+    ).strip()
+    if not raw:
+        return None
+    if ":" not in raw:
+        print(f"  Invalid HOST:PORT {raw!r} — skipping --input-proxy")
+        return None
+    return raw
+
+
 def _build_args(
     *,
     enable_screen: bool,
     announce_ip: str | None,
     announce_command: str | None,
+    input_proxy: str | None,
 ) -> list[str]:
     """Compose the `holo mcp ...` arg list for the generated config."""
     args = ["mcp", "--no-bookmarklet"]
     if enable_screen:
         args.append("--screen")
+    if input_proxy:
+        args += ["--input-proxy", input_proxy]
     args.append("--announce")
     if announce_ip:
         args += ["--announce-ip", announce_ip]
@@ -166,6 +201,8 @@ def run(cli: str, *, force: bool = False, cwd: Path | None = None) -> int:
 
     enable_screen = _prompt_enable_screen()
     print()
+    input_proxy = _prompt_input_proxy()
+    print()
 
     try:
         ips = _enumerate_ips()
@@ -180,6 +217,7 @@ def run(cli: str, *, force: bool = False, cwd: Path | None = None) -> int:
         enable_screen=enable_screen,
         announce_ip=announce_ip,
         announce_command=announce_command,
+        input_proxy=input_proxy,
     )
     _write_claude_config(target, args)
 
