@@ -410,7 +410,12 @@ class TestCLIDiscover:
             run_oneshot.return_value = 0
             rc = main(["discover", "--json"])
         assert rc == 0
-        run_oneshot.assert_called_once_with(wait_s=DEFAULT_JSON_WAIT_S)
+        run_oneshot.assert_called_once_with(
+            wait_s=DEFAULT_JSON_WAIT_S,
+            resource_tags=None,
+            resource_names=None,
+            fetch_paths=False,
+        )
 
     def test_json_passes_explicit_wait(self) -> None:
         from holo.cli import main
@@ -418,7 +423,12 @@ class TestCLIDiscover:
         with patch("holo.discover.run_oneshot") as run_oneshot:
             run_oneshot.return_value = 0
             main(["discover", "--json", "--wait", "10"])
-        run_oneshot.assert_called_once_with(wait_s=10.0)
+        run_oneshot.assert_called_once_with(
+            wait_s=10.0,
+            resource_tags=None,
+            resource_names=None,
+            fetch_paths=False,
+        )
 
     def test_tail_calls_run_tail(self) -> None:
         from holo.cli import main
@@ -426,7 +436,11 @@ class TestCLIDiscover:
         with patch("holo.discover.run_tail") as run_tail:
             run_tail.return_value = 0
             main(["discover", "--tail", "--stale-after", "60"])
-        run_tail.assert_called_once_with(stale_after_s=60.0)
+        run_tail.assert_called_once_with(
+            stale_after_s=60.0,
+            resource_tags=None,
+            resource_names=None,
+        )
 
     def test_serve_calls_run_serve_with_cors(self) -> None:
         from holo.cli import main

@@ -62,6 +62,7 @@ class HoloMCPServer:
         announce_port: int = 0,
         announce_capabilities: bool = False,
         announce_command: str | None = None,
+        announce_resources: list[Any] | None = None,
         auto_tunnel: bool = False,
         auto_tunnel_backend: str | None = None,
     ) -> None:
@@ -91,7 +92,10 @@ class HoloMCPServer:
                 from holo.capabilities_server import CapabilitiesServer
 
                 probe = CapabilitiesProbe()
-                self._caps_server = CapabilitiesServer(probe=probe)
+                self._caps_server = CapabilitiesServer(
+                    probe=probe,
+                    resources=announce_resources,
+                )
                 self._caps_server.start()
                 caps_port = self._caps_server.actual_port
                 caps_token = self._caps_server.token
@@ -118,6 +122,7 @@ class HoloMCPServer:
                     caps_port=caps_port,
                     caps_token=caps_token,
                     remote_command=announce_command,
+                    resources=announce_resources,
                 )
                 self._announcer.start()
             except Exception as e:  # noqa: BLE001 — surface and continue
@@ -1122,6 +1127,7 @@ def build_server(
     announce_port: int = 0,
     announce_capabilities: bool = False,
     announce_command: str | None = None,
+    announce_resources: list[Any] | None = None,
     auto_tunnel: bool = False,
     auto_tunnel_backend: str | None = None,
 ) -> tuple[FastMCP, HoloMCPServer]:
@@ -1156,6 +1162,7 @@ def build_server(
         announce_port=announce_port,
         announce_capabilities=announce_capabilities,
         announce_command=announce_command,
+        announce_resources=announce_resources,
         auto_tunnel=auto_tunnel,
         auto_tunnel_backend=auto_tunnel_backend,
     )
@@ -1659,6 +1666,7 @@ def run(
     announce_ips: list[str] | None = None,
     announce_capabilities: bool = False,
     announce_command: str | None = None,
+    announce_resources: list[Any] | None = None,
     auto_tunnel: bool = False,
     auto_tunnel_backend: str | None = None,
 ) -> None:
@@ -1677,6 +1685,7 @@ def run(
         announce_ips=announce_ips,
         announce_capabilities=announce_capabilities,
         announce_command=announce_command,
+        announce_resources=announce_resources,
         auto_tunnel=auto_tunnel,
         auto_tunnel_backend=auto_tunnel_backend,
     )
@@ -1706,6 +1715,7 @@ def run_tcp(
     announce_ips: list[str] | None = None,
     announce_capabilities: bool = False,
     announce_command: str | None = None,
+    announce_resources: list[Any] | None = None,
     auto_tunnel: bool = False,
     auto_tunnel_backend: str | None = None,
     stop_event: threading.Event | None = None,
@@ -1737,6 +1747,7 @@ def run_tcp(
         announce_port=port,
         announce_capabilities=announce_capabilities,
         announce_command=announce_command,
+        announce_resources=announce_resources,
         auto_tunnel=auto_tunnel,
         auto_tunnel_backend=auto_tunnel_backend,
     )
