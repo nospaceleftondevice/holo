@@ -74,6 +74,18 @@ class HoloMCPServer:
         self.remote_screen = remote_screen
         self._daemon: Daemon | None = None
         self._daemon_lock = threading.Lock()
+
+        # Per-host resources for the Phase 2 exec primitive. Stored as a
+        # name-keyed map so the holo_exec_in_resource MCP tool can look
+        # them up cheaply. Empty when no --announce-resource was passed;
+        # the tool is then NOT registered on the surface (see
+        # build_server).
+        from holo.announce import Resource as _Resource
+
+        self._resources: tuple[_Resource, ...] = tuple(announce_resources or ())
+        self._resource_by_name: dict[str, _Resource] = {
+            r.name: r for r in self._resources
+        }
         # Template cache lives across daemon restarts — it's a pure
         # filesystem store, not bound to any JVM/browser session.
         self.templates = templates if templates is not None else TemplateStore()
@@ -1075,6 +1087,65 @@ class HoloMCPServer:
                 "already_running": False,
             }
 
+    def exec_in_resource(
+        self,
+        resource: str,
+        body: str,
+        env: dict[str, str] | None = None,
+        timeout_s: int = 60,
+    ) -> dict[str, Any]:
+        """Phase 2.A exec primitive — validate, spawn, batch output frames.
+
+        Looks up the resource by name on this daemon's announced
+        resources, runs the body through
+        :func:`holo.resources_exec.exec_in_resource`, and returns a
+        single dict with the collected ``frames`` + terminal status.
+
+        Failure modes (returned as ``{"error": "...", ...}``, never
+        raised — MCP clients see a structured response either way):
+
+          - ``unknown-resource``: ``resource`` doesn't match any announced
+            resource on this daemon. Response includes the known names.
+          - ``body-rejected``: static parse failed (disallowed command,
+            absolute path, traversal). ``message`` names the offender.
+          - ``exec-setup``: a declared cap binary isn't on the daemon's
+            PATH at call time, or the resource path doesn't exist.
+
+        Success returns ``{"frames": [...], "exit": int, "duration_ms":
+        int, "timed_out": bool}`` where ``frames`` is a list of
+        ``{"fd": "stdout"|"stderr", "data": str}`` entries in arrival
+        order across both streams.
+        """
+        from holo.resources_exec import BodyRejected
+        from holo.resources_exec import exec_in_resource as _exec
+
+        r = self._resource_by_name.get(resource)
+        if r is None:
+            return {
+                "error": "unknown-resource",
+                "resource": resource,
+                "known": sorted(self._resource_by_name),
+            }
+        frames: list[dict[str, Any]] = []
+        try:
+            result = _exec(
+                r,
+                body,
+                env=env,
+                timeout_s=timeout_s,
+                on_frame=frames.append,
+            )
+        except BodyRejected as e:
+            return {"error": "body-rejected", "message": str(e)}
+        except FileNotFoundError as e:
+            return {"error": "exec-setup", "message": str(e)}
+        return {
+            "frames": frames,
+            "exit": result.exit_code,
+            "duration_ms": result.duration_ms,
+            "timed_out": result.timed_out,
+        }
+
 
 def _match_session(
     sessions: list[dict[str, Any]], identifier: str
@@ -1614,6 +1685,34 @@ def build_server(
     )
     def holo_launch_ide() -> dict[str, Any]:
         return holo.holo_launch_ide()
+
+    # Phase 2.A exec primitive. Registered ONLY when at least one
+    # resource is announced — without any resources the tool has
+    # nothing to act on, so leaving it off the surface keeps clients
+    # from discovering an exec entry point that always errors.
+    if holo._resources:
+        @mcp.tool(
+            description=(
+                "Run a shell body inside the scope of a declared "
+                "resource on this daemon. The body must use only "
+                "commands listed in the resource's caps=exec:... "
+                "allowlist, and may not use absolute paths or '..'. "
+                "cwd is pinned to the resource path; HOLO_HOST, "
+                "HOLO_RESOURCE, HOLO_RESOURCE_PATH are injected into "
+                "env. Output is batched into a frames list, each "
+                "frame {fd: 'stdout'|'stderr', data: str}; the "
+                "response includes exit, duration_ms, and timed_out."
+            )
+        )
+        def holo_exec_in_resource(
+            resource: str,
+            body: str,
+            env: dict[str, str] | None = None,
+            timeout_s: int = 60,
+        ) -> dict[str, Any]:
+            return holo.exec_in_resource(
+                resource, body, env=env, timeout_s=timeout_s
+            )
 
     return mcp, holo
 
