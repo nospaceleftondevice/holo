@@ -1087,6 +1087,35 @@ class HoloMCPServer:
                 "already_running": False,
             }
 
+    def list_resources(self) -> dict[str, Any]:
+        """Return all resources declared on this daemon.
+
+        Mirrors ``GET /v1/resources`` (capabilities_server) but
+        reached over the MCP channel rather than a separate HTTPS
+        roundtrip. Tai's ``on`` keyword dispatch uses this — the
+        auto-tunnel is already authed and warm; a parallel HTTP call
+        would duplicate trust machinery.
+
+        Returns ``{"resources": [{name, path, tags, caps,
+        allow_principals}, ...]}``. Empty list when no resources are
+        declared (the tool is registered only when at least one is,
+        so this only fires for declared daemons).
+        """
+        return {
+            "resources": [
+                {
+                    "name": r.name,
+                    "path": r.path,
+                    "tags": list(r.tags),
+                    "caps": list(r.caps),
+                    # Surfaced for tools that want to render the
+                    # intended ACL. NOT enforced in v1 — see Resource.
+                    "allow_principals": list(r.allow_principals),
+                }
+                for r in self._resources
+            ],
+        }
+
     def exec_in_resource(
         self,
         resource: str,
@@ -1686,11 +1715,25 @@ def build_server(
     def holo_launch_ide() -> dict[str, Any]:
         return holo.holo_launch_ide()
 
-    # Phase 2.A exec primitive. Registered ONLY when at least one
-    # resource is announced — without any resources the tool has
-    # nothing to act on, so leaving it off the surface keeps clients
-    # from discovering an exec entry point that always errors.
+    # Phase 2 resource tools. Registered ONLY when at least one
+    # resource is announced — without any resources the tools have
+    # nothing to act on, so leaving them off the surface keeps clients
+    # from discovering entry points that always error.
     if holo._resources:
+        @mcp.tool(
+            description=(
+                "Return the full per-resource records declared on "
+                "this daemon: name, path, tags, caps, "
+                "allow_principals. Tai's `on` keyword uses this to "
+                "resolve `{holo:tag=X}` selectors over the auto-"
+                "tunnel; mirrors `GET /v1/resources` on the "
+                "capabilities HTTP endpoint. allow_principals is "
+                "informational only in v1 (see docs/resources.md)."
+            )
+        )
+        def holo_list_resources() -> dict[str, Any]:
+            return holo.list_resources()
+
         @mcp.tool(
             description=(
                 "Run a shell body inside the scope of a declared "

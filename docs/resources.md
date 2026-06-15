@@ -53,7 +53,7 @@ This doc fixes the six load-bearing design decisions before either side starts c
 │      ▼                                                          │
 │   ┌─ enforce ─────────────────────────────────────┐             │
 │   │ • cert chain valid + fresh                    │             │
-│   │ • principal allowed in resources.yml          │             │
+│   │ • principal allowed in resources.toml (v2)    │             │
 │   │ • body parse: only `caps=exec:…` heads        │             │
 │   │ • body parse: no abs paths / `..` in args     │             │
 │   └─────────────┬─────────────────────────────────┘             │
@@ -118,27 +118,29 @@ Reuse the existing holo cert chain. The daemon validates the peer's chain agains
 
 ### Per-resource ACL
 
-The daemon's `~/.holo/resources.yml` is the source of truth for which resources exist and who may exec in them:
+> **v1 status: declarative only, not enforced.**
+>
+> Implementation discovered that holo's cert architecture provides a single fixed principal (`lando`, from `tunnel.py`) at the SSH/CloudCity layer and **no per-call identity** at the MCP layer where `holo_exec_in_resource` runs. `allow_principals` is parsed, surfaced through `/v1/resources` and `holo_list_resources`, and logged informationally — but **the cert chain on the MCP channel is the only access gate that actually fires in v1.** Multi-principal use needs either (a) backend changes so signed certs carry per-user principals + CloudCity sshd `AuthorizedPrincipalsCommand`, or (b) SSH→MCP plumbing so the MCP layer sees `SSH_USER_AUTH`-style info per call. Both are multi-week projects deferred to a later phase. The intent is locked in here so v1 daemons can already declare the ACL they want and operators can pre-author config; when enforcement lands it reads the same field.
 
-```yaml
-# ~/.holo/resources.yml
-resources:
-  movies:
-    path: /Volumes/movies
-    tags: [video-files, archive]
-    caps: [exec:ffprobe, exec:python3, exec:find, exec:awk, readonly]
-    allow_principals:
-      - alice@laptop
-      - "*@home-lan"
-  private-photos:
-    path: /Users/me/Photos
-    tags: [photos]
-    caps: [exec:ffprobe]
-    allow_principals:
-      - alice@laptop
+The daemon's resource config lives at `~/.config/holo/resources.toml` (TOML, stdlib `tomllib` — chosen over YAML to avoid adding PyYAML as a dependency; `~/.config/holo/` is where `holo cert` already keeps state):
+
+```toml
+# ~/.config/holo/resources.toml
+
+[resources.movies]
+path = "/Volumes/movies"
+tags = ["video-files", "archive"]
+caps = ["exec:ffprobe", "exec:python3", "exec:find", "exec:awk", "readonly"]
+allow_principals = ["alice@laptop", "*@home-lan"]   # parsed, not enforced (v1)
+
+[resources.private-photos]
+path = "/Users/me/Photos"
+tags = ["photos"]
+caps = ["exec:ffprobe"]
+allow_principals = ["alice@laptop"]                 # parsed, not enforced (v1)
 ```
 
-`--announce-resource 'name=…,path=…,tags=…,caps=…'` on the CLI is the smoke-test path; YAML is for any daemon running for more than 10 minutes. Principal grammar (`alice@laptop`, `*@home-lan`) maps to cert subject fields — exact shape pending a look at what `holo cert` actually encodes (see Open Implementation Details).
+`--announce-resource 'name=…;path=…;tags=…;caps=…;allow_principals=…'` on the CLI is the smoke-test path; the TOML file (via `--resources-config PATH`) is for any daemon running for more than 10 minutes. The two are **mutually exclusive** — declare resources in one place. Principal grammar (`alice@laptop`, `*@home-lan`) is illustrative; the realistic enforcement layer needs decisions about cert subjects (see Open Implementation Details #1).
 
 ### Binary-name allowlist
 
@@ -349,7 +351,7 @@ Mild collision risk: `on` could shadow a user-defined function or alias of the s
 
 These are decisions deferred to the implementation phase, not Phase 0 — but flagged here so they don't ambush the implementer.
 
-1. **Principal grammar in `resources.yml`.** `alice@laptop`, `*@home-lan`, etc. depend on what holo certs actually encode in their subject. Confirm against `holo cert` output before committing to a string format. If cert subjects are opaque UUIDs, fall back to "list of cert fingerprints" — less ergonomic but workable.
+1. **Principal grammar + the multi-principal enforcement story.** Phase 2.B investigation confirmed: current holo certs encode a single fixed principal (`lando`) and provide no per-call identity at the MCP layer. So v1 ships `allow_principals` as a *declarative* surface — parsed into `Resource.allow_principals`, served from `/v1/resources` and `holo_list_resources`, but **not enforced.** Real enforcement needs one of: (a) backend signs certs with per-user principals + CloudCity sshd `AuthorizedPrincipalsCommand` maps principal → resources (auth at the SSH layer, before MCP), or (b) plumb `SSH_USER_AUTH`-style info from sshd → holo daemon → MCP per-call (auth at the MCP layer). Option (b) keeps the YAML/TOML as the source of truth; option (a) moves authority to the backend. Either is a multi-week project that's out of scope for Phase 2.B but in scope for a future v2 phase. Until then, the cert chain on the MCP channel is the only gate that fires.
 2. **Bash AST parser inside the daemon.** Daemon is Python; options are `bashlex` (maintained but not heavily) or a hand-rolled tokenizer. Either is fine; confirm dependency choice when Phase 2 starts. The parser doesn't need to handle every bash edge case — it only needs to enumerate `simple_command` heads and detect absolute-path / `..` args.
 3. **Per-resource UID lifecycle (L2).** Who creates `holo-resource-NAME` users? Manual setup, or a `holo resources init` subcommand that provisions them on Darwin (`sysadminctl`) and Linux (`useradd`)? Either is fine; the answer doesn't affect the L2 contract.
 4. **MCP channel multiplexing.** `holo_exec_in_resource` is a streaming call. If a single channel handles multiple concurrent in-flight exec streams (script does `parallel` over per-host calls), the framing needs request IDs. MCP already supports this; just confirm.
