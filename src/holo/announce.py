@@ -170,16 +170,29 @@ class Resource:
       - each tag / cap non-empty and comma-free (commas would break
         the TXT comma-join encoding)
 
-    Caps are stored as opaque strings — Phase 1 publishes them; Phase 2
-    enforces them. No syntactic check on ``exec:NAME`` / ``readonly`` /
+    Caps are stored as opaque strings — Phase 1 publishes them; Phase 2.A
+    enforces the ``exec:NAME`` ones at exec time (allowlist via static
+    parse + PATH pinning). No syntactic check on ``readonly`` /
     ``uid:NAME`` shape yet, so an experimental cap can be announced
     without an announcer-side allowlist edit.
+
+    ``allow_principals`` is a documented intent surface for Phase 2.B:
+    "only these principals may exec in this resource." **It is NOT
+    enforced in v1.** The holo cert architecture today uses a single
+    fixed principal (``lando``) at the SSH layer and provides no
+    per-call identity to the MCP layer where exec runs. The field is
+    parsed, surfaced via ``/v1/resources`` / ``holo_list_resources``,
+    and logged informationally — but the cert chain on the MCP channel
+    is the only access gate that actually fires. Multi-principal use
+    needs a real identity story (cert subjects with per-user
+    principals, plumbed SSH→MCP — both deferred).
     """
 
     name: str
     path: str
     tags: tuple[str, ...] = field(default_factory=tuple)
     caps: tuple[str, ...] = field(default_factory=tuple)
+    allow_principals: tuple[str, ...] = field(default_factory=tuple)
 
     def __post_init__(self) -> None:
         if not self.name:
@@ -211,6 +224,16 @@ class Resource:
                 raise ValueError(
                     f"resource {self.name!r}: cap {c!r} may not contain ','"
                 )
+        for p in self.allow_principals:
+            if not p:
+                raise ValueError(
+                    f"resource {self.name!r}: empty principal"
+                )
+            if "," in p:
+                raise ValueError(
+                    f"resource {self.name!r}: principal {p!r} may not "
+                    "contain ','"
+                )
 
 
 def parse_resource_spec(spec: str) -> Resource:
@@ -218,12 +241,12 @@ def parse_resource_spec(spec: str) -> Resource:
 
     SPEC syntax: semicolon-separated ``key=value`` pairs.
 
-      name=<str>;path=<str>;tags=<csv>;caps=<csv>
+      name=<str>;path=<str>;tags=<csv>;caps=<csv>;allow_principals=<csv>
 
     Semicolon was picked over comma at the top level because ``tags=``
-    and ``caps=`` themselves carry comma lists — a single-level
-    comma-split is ambiguous (where does ``tags=`` end?). Inside
-    ``tags=`` and ``caps=``, commas separate entries.
+    / ``caps=`` / ``allow_principals=`` themselves carry comma lists —
+    a single-level comma-split is ambiguous (where does ``tags=`` end?).
+    Inside the list fields, commas separate entries.
 
     Whitespace around keys, values, and list entries is stripped.
     Unknown keys raise — silently dropping them would let typos
@@ -234,8 +257,12 @@ def parse_resource_spec(spec: str) -> Resource:
         parse_resource_spec(
             'name=movies;path=/Volumes/movies;'
             'tags=video-files,archive;'
-            'caps=exec:ffprobe,exec:python3,readonly'
+            'caps=exec:ffprobe,exec:python3,readonly;'
+            'allow_principals=alice@laptop,bob@office'
         )
+
+    Note: ``allow_principals`` is parsed and surfaced but **not
+    enforced in v1** — see :class:`Resource` for the why.
     """
     if not spec or not spec.strip():
         raise ValueError("resource spec is empty")
@@ -258,7 +285,7 @@ def parse_resource_spec(spec: str) -> Resource:
             )
         fields[key] = value
 
-    allowed = {"name", "path", "tags", "caps"}
+    allowed = {"name", "path", "tags", "caps", "allow_principals"}
     unknown = set(fields) - allowed
     if unknown:
         raise ValueError(
@@ -274,6 +301,7 @@ def parse_resource_spec(spec: str) -> Resource:
         path=fields.get("path", ""),
         tags=_csv(fields.get("tags", "")),
         caps=_csv(fields.get("caps", "")),
+        allow_principals=_csv(fields.get("allow_principals", "")),
     )
 
 

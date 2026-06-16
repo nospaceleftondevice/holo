@@ -355,12 +355,14 @@ class TestResourcesEndpoint:
             "path": "/Volumes/movies",
             "tags": ["video-files", "archive"],
             "caps": ["exec:ffprobe", "readonly"],
+            "allow_principals": [],
         }
         assert p == {
             "name": "photos",
             "path": "/Photos",
             "tags": ["photos"],
             "caps": [],
+            "allow_principals": [],
         }
 
     def test_unauthorized_without_token(self, caps_server_factory) -> None:
@@ -386,7 +388,13 @@ class TestFetchResourceDetail:
         }
         detail = fetch_resource_detail(session)
         assert detail == [
-            {"name": "m", "path": "/v", "tags": ["t"], "caps": ["exec:ffprobe"]}
+            {
+                "name": "m",
+                "path": "/v",
+                "tags": ["t"],
+                "caps": ["exec:ffprobe"],
+                "allow_principals": [],
+            }
         ]
 
     def test_returns_none_when_no_caps_port(self) -> None:

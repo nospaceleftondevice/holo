@@ -244,6 +244,10 @@ class CapabilitiesServer:
                         "path": r.path,
                         "tags": list(r.tags),
                         "caps": list(r.caps),
+                        # Surfaced for tools that want to render the
+                        # intended ACL. NOT enforced in v1 — see
+                        # Resource docstring.
+                        "allow_principals": list(r.allow_principals),
                     }
                     for r in self.resources
                 ],

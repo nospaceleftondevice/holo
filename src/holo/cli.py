@@ -1453,6 +1453,7 @@ Commands:
       [--announce-ssh-user NAME] [--announce-ip A,B,C]
       [--announce-capabilities] [--announce-command "CMD"]
       [--announce-resource "name=…;path=…;tags=…;caps=…"]...
+      [--resources-config PATH]
       [--auto-tunnel] [--auto-tunnel-backend URL]
                           run the MCP server over stdio (or TCP with --listen)
                           --screen          enable screen / template / app_activate tools
@@ -1513,12 +1514,26 @@ Commands:
                                                        path=/Volumes/movies
                                                        tags=video-files,archive
                                                        caps=exec:ffprobe,readonly
+                                                       allow_principals=alice@laptop
                                                      TXT broadcasts only the tag
                                                      union + name list; full
                                                      records (path, caps) are
                                                      fetched over the same auth as
                                                      --announce-capabilities. See
                                                      docs/resources.md.
+                          --resources-config PATH    load resources from a TOML
+                                                     file instead of --announce-
+                                                     resource flags. Format:
+                                                       [resources.movies]
+                                                       path = "/Volumes/movies"
+                                                       tags = ["video-files"]
+                                                       caps = ["exec:ffprobe"]
+                                                       allow_principals = ["alice"]
+                                                     Mutually exclusive with
+                                                     --announce-resource. See
+                                                     ~/.config/holo/resources.toml
+                                                     for the canonical default
+                                                     location.
                           --auto-tunnel              open reverse SSH forwards into
                                                      every discovered CloudCity
                                                      (one tunnel per CC); the
@@ -1697,6 +1712,7 @@ def main(argv: list[str] | None = None) -> int:
         announce_ip_raw = _value_flag(rest, "--announce-ip")
         announce_command_raw = _value_flag(rest, "--announce-command")
         announce_resource_raw = _all_values_flag(rest, "--announce-resource")
+        resources_config_raw = _value_flag(rest, "--resources-config")
         announce = "--announce" in rest
         announce_capabilities = "--announce-capabilities" in rest
         auto_tunnel = "--auto-tunnel" in rest
@@ -1725,14 +1741,15 @@ def main(argv: list[str] | None = None) -> int:
                 isinstance(announce_resource_raw, list)
                 and announce_resource_raw
             )
+            or resources_config_raw is not None
             or auto_tunnel
             or auto_tunnel_backend_raw is not None
         ):
             sys.stderr.write(
                 "holo mcp: --announce-session/--announce-user/"
                 "--announce-ssh-user/--announce-ip/--announce-capabilities/"
-                "--announce-command/--announce-resource/--auto-tunnel/"
-                "--auto-tunnel-backend require --announce\n"
+                "--announce-command/--announce-resource/--resources-config/"
+                "--auto-tunnel/--auto-tunnel-backend require --announce\n"
             )
             return 2
         if announce_session is _MISSING_ARG:
@@ -1755,6 +1772,23 @@ def main(argv: list[str] | None = None) -> int:
         if announce_resource_raw is _MISSING_ARG:
             sys.stderr.write(
                 "holo mcp: --announce-resource requires a value\n"
+            )
+            return 2
+        if resources_config_raw is _MISSING_ARG:
+            sys.stderr.write(
+                "holo mcp: --resources-config requires a path\n"
+            )
+            return 2
+        if (
+            isinstance(announce_resource_raw, list)
+            and announce_resource_raw
+            and isinstance(resources_config_raw, str)
+        ):
+            sys.stderr.write(
+                "holo mcp: --announce-resource and --resources-config "
+                "are mutually exclusive — declare resources in one "
+                "place. Move CLI specs into the TOML file (see "
+                "docs/resources.md) or drop the file.\n"
             )
             return 2
         if auto_tunnel_backend_raw is _MISSING_ARG:
@@ -1796,6 +1830,19 @@ def main(argv: list[str] | None = None) -> int:
                     return 2
                 seen_names.add(res.name)
                 announce_resources.append(res)
+        elif isinstance(resources_config_raw, str):
+            from holo.resources_config import (
+                ResourcesConfigError,
+                load_resources_toml,
+            )
+
+            try:
+                announce_resources = list(
+                    load_resources_toml(resources_config_raw)
+                )
+            except ResourcesConfigError as e:
+                sys.stderr.write(f"holo mcp: {e}\n")
+                return 2
 
         auto_tunnel_backend = (
             auto_tunnel_backend_raw
