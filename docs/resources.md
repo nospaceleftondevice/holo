@@ -306,6 +306,8 @@ Subscription is lazy-init'd on first `on`, not at shell startup — a tai shell 
 
 ## Tai-side surface — the `on` keyword
 
+> **Runnable reference**: Phase 3.A–3.E shipped the `on` keyword end-to-end in tai. See [`tai/docs/on-keyword.md`](https://github.com/tai-shell/tai/blob/main/docs/on-keyword.md) for the runnable spec (grammar, modes, `$ON_HOSTS`, env vars, examples) and [`tai/examples/holo-on/`](https://github.com/tai-shell/tai/tree/main/examples/holo-on) for working scripts. The rest of this section captures the **design intent** as ratified during Phase 0.
+
 The keyword is **`on`**, not `@`. `@` stays reserved for AI agent dispatch ("prompt → reply"). Overloading `@` for shell-on-remote would make scripts ambiguous to read at a glance — the two semantics deserve visually distinct constructs. `@@` was the runner-up but lingers in the `@` family; `dispatch` was ruled out because the codebase already uses "dispatch" terminology for `@` itself (`agent_dispatch.c`, `pool-dispatch-operator.md`).
 
 Grammar is reused verbatim from `@`:
